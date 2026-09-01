@@ -5,10 +5,11 @@ require contained `unsafe` code. Keep that surface small and reviewable.
 
 ## Current inventory
 
-No implementation `unsafe` code exists in this repository.
+Safe crates forbid `unsafe`. Boundary crates deny `unsafe_op_in_unsafe_fn`.
 
-Safe crates forbid `unsafe`. The `backend`, `backend-jsc`, and `abi` crates are
-reserved as future boundary crates and deny `unsafe_op_in_unsafe_fn`.
+`rustjsi-backend-jsc` contains a feature-gated experimental binding to the macOS
+JavaScriptCore C API. Its unsafe surface is limited to raw declarations, calls,
+callback argument views, and active-entry recovery.
 
 ## Required documentation
 
