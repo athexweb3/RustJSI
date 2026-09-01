@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[files]
+extend-exclude = [
+    "target/",
+    "Cargo.lock",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+
+[default.extend-identifiers]
+RustJSI = "RustJSI"
+rustjsi = "rustjsi"
+athexweb3 = "athexweb3"
+JSI = "JSI"
+JSC = "JSC"
+MSRV = "MSRV"
+SBOM = "SBOM"
+OpenSSF = "OpenSSF"
+nextest = "nextest"
+zizmor = "zizmor"
+lychee = "lychee"
+Sigstore = "Sigstore"
+TurboModule = "TurboModule"
+UniFFI = "UniFFI"
+XCFramework = "XCFramework"
+Prefabs = "Prefabs"
+runtimeCell = "runtimeCell"
+
+[default.extend-words]
+jsi = "jsi"
+hermes = "hermes"
+bindgen = "bindgen"
+repr = "repr"
+codegen = "codegen"
+testkit = "testkit"
+powerset = "powerset"
+unforgeable = "unforgeable"
+typestate = "typestate"
+autolinking = "autolinking"
+serde = "serde"
+napi = "napi"
+miri = "miri"
+clippy = "clippy"
+rustfmt = "rustfmt"
+rustup = "rustup"
+rustc = "rustc"
+lcov = "lcov"
+sarif = "sarif"
+semver = "semver"
+reentrancy = "reentrancy"
+finalizer = "finalizer"
+finalizers = "finalizers"
+endian = "endian"
+monomorphize = "monomorphize"
+monomorphization = "monomorphization"
+backpressure = "backpressure"
+idempotent = "idempotent"
+unwinding = "unwinding"
+deinit = "deinit"

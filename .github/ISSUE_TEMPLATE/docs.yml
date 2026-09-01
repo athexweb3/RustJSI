@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Documentation issue
+description: Public documentation ambiguity, broken link, or contributor-doc defect.
+labels: ["documentation"]
+body:
+  - type: textarea
+    id: location
+    attributes:
+      label: Location
+      description: Public file path and section.
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - ambiguity or contradiction
+        - missing link between public docs and crate docs
+        - broken relative link
+        - contributor / governance doc
+        - typo (non-normative)
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Describe the ambiguity, contradiction, or expected improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested resolution

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+verbose = "on"
+progress = false
+include_fragments = true
+insecure = false
+max_retries = 2
+timeout = 20
+
+accept = ["200", "204", "206", "429"]
+
+exclude_path = [
+    "^\\.docs",
+    "^target",
+    "^LICENSE-APACHE$",
+]
+
+exclude = [
+    '^https://github\.com/.*/RustJSI',
+]

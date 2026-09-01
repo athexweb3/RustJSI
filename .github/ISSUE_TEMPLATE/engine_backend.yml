@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Engine / backend compatibility report
+description: Engine, host, or backend capability mismatch — not a silent fallback request.
+labels: ["backend", "engine"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report unsupported engine behavior, capability mismatches, and fallback decisions here.
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine or host
+      options:
+        - JavaScriptCore
+        - V8
+        - Hermes
+        - deterministic test backend
+        - other / unspecified
+        - standalone embed host
+        - attached host (describe)
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: Engine, OS, architecture, Rust toolchain, and host version.
+    validations:
+      required: true
+  - type: textarea
+    id: capability
+    attributes:
+      label: Capability
+      description: Which backend capability, host behavior, or ABI negotiation failed? Link public evidence if available.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected contract
+      description: What behavior does the contract require?
+    validations:
+      required: true

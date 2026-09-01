@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Bug report
+description: Unexpected behavior in the scaffold, tooling, CI, or a later implementation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a vulnerability or soundness issue, use the appropriate private reporting channel instead of a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Exact commands, crate, git revision, and toolchain (`rustc -vV`).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include logs. Redact secrets.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - workspace / tooling / CI
+        - documentation
+        - rustjsi-core
+        - rustjsi-runtime
+        - rustjsi-host
+        - rustjsi-embed
+        - rustjsi-backend
+        - rustjsi-backend-jsc
+        - rustjsi-abi
+        - rustjsi-module
+        - rustjsi-ir
+        - rustjsi-codegen
+        - rustjsi-testkit
+        - unspecified
+    validations:
+      required: true
+  - type: textarea
+    id: extras
+    attributes:
+      label: Additional context
+      description: OS, host, engine, relevant feature, or related design discussion.

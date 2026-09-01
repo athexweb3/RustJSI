@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Soundness / safety report
+description: Possible undefined behavior, invariant violation, or unsafe-API hole.
+labels: ["soundness", "safety"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not submit unresolved vulnerabilities as public issues. See [SECURITY.md](../../SECURITY.md).
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Disclosure check
+      options:
+        - label: I have read SECURITY.md and this report is appropriate for a public issue.
+          required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Invariant
+      description: Which safety, lifetime, thread, ownership, or ABI assumption is at risk?
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What can a safe caller do, and what is the resulting hazard?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction or reasoning
+      description: Code, compile-fail expectation, or proof sketch.
+    validations:
+      required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Primary crate
+      options:
+        - rustjsi-core
+        - rustjsi-runtime
+        - rustjsi-host
+        - rustjsi-embed
+        - rustjsi-backend
+        - rustjsi-backend-jsc
+        - rustjsi-abi
+        - rustjsi-module
+        - rustjsi-ir
+        - rustjsi-codegen
+        - rustjsi-testkit
+        - documentation / spec
+        - unspecified
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Memory unsafety, use-after-free, stale runtime access, data race, secret leakage, availability, or other.
+    validations:
+      required: true

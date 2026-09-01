@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+- name: bug
+  color: "d73a4a"
+  description: Unexpected behavior in tooling, docs, or implementation
+
+- name: soundness
+  color: "b60205"
+  description: Possible undefined behavior or invariant violation
+
+- name: safety
+  color: "b60205"
+  description: Unsafe-code policy, FFI, or safety-critical path
+
+- name: architecture
+  color: "5319e7"
+  description: Specification or crate-boundary change
+
+- name: rfc
+  color: "5319e7"
+  description: Public design proposal
+
+- name: backend
+  color: "1d76db"
+  description: Engine backend contract or implementation
+
+- name: engine
+  color: "1d76db"
+  description: JSC / V8 / Hermes / host engine behavior
+
+- name: documentation
+  color: "0075ca"
+  description: Spec, README, or contributor documentation
+
+- name: ci
+  color: "0e8a16"
+  description: GitHub Actions, justfile, or local tooling
+
+- name: supply-chain
+  color: "e4e669"
+  description: cargo-deny, Dependabot, provenance, SBOM
+
+- name: breaking-change
+  color: "d93f0b"
+  description: Compatibility break on a version axis
+
+- name: good first issue
+  color: "7057ff"
+  description: Bounded task for a new contributor
+
+- name: needs-design
+  color: "fbca04"
+  description: Needs an agreed public design before merge
