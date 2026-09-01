@@ -2,8 +2,8 @@
 
 use rustjsi_backend::{
     BACKEND_CONTRACT_VERSION, BackendBase, BackendError, BackendException, BackendManifest,
-    BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope, OwnershipTransferError,
-    RootScope, ValueKind,
+    BackendScope, BorrowedBufferScope, Capability, CapabilitySet, OwnedExternalBufferScope,
+    OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -227,7 +227,9 @@ impl BackendBase for ModelBackend {
     fn manifest(&self) -> BackendManifest {
         BackendManifest::new(
             BACKEND_CONTRACT_VERSION,
-            CapabilitySet::only(Capability::StrongRoots).with(Capability::OwnedExternalBuffers),
+            CapabilitySet::only(Capability::StrongRoots)
+                .with(Capability::OwnedExternalBuffers)
+                .with(Capability::BorrowedBufferBytes),
         )
     }
 
@@ -308,6 +310,8 @@ impl ModelScope<'_> {
 }
 
 impl BackendScope for ModelScope<'_> {
+    type Backend = ModelBackend;
+
     type Value<'value>
         = ModelValue<'value>
     where
@@ -400,13 +404,15 @@ impl BackendScope for ModelScope<'_> {
     }
 }
 
-impl RootScope for ModelScope<'_> {
+impl RootBackend for ModelBackend {
     type Root = ModelRoot;
+}
 
+impl RootScope for ModelScope<'_> {
     fn persist<'value>(
         &'value self,
         value: Self::Value<'value>,
-    ) -> Result<Self::Root, BackendError> {
+    ) -> Result<ModelRoot, BackendError> {
         self.validate(value)?;
         let (slot, generation) = self.backend.state.borrow_mut().roots.insert(value.id);
         Ok(ModelRoot {
@@ -416,7 +422,7 @@ impl RootScope for ModelScope<'_> {
         })
     }
 
-    fn resolve(&self, root: Self::Root) -> Result<Self::Value<'_>, BackendError> {
+    fn resolve(&self, root: ModelRoot) -> Result<Self::Value<'_>, BackendError> {
         if root.backend != self.backend.id {
             return Err(BackendError::WrongBackend);
         }
@@ -433,7 +439,7 @@ impl RootScope for ModelScope<'_> {
         Ok(self.handle(id))
     }
 
-    fn release(&self, root: Self::Root) -> Result<(), BackendError> {
+    fn release(&self, root: ModelRoot) -> Result<(), BackendError> {
         if root.backend != self.backend.id {
             return Err(BackendError::WrongBackend);
         }
@@ -451,11 +457,6 @@ impl RootScope for ModelScope<'_> {
 }
 
 impl OwnedExternalBufferScope for ModelScope<'_> {
-    type BufferView<'view>
-        = ModelBufferView<'view>
-    where
-        Self: 'view;
-
     fn externalize(
         &self,
         owner: Box<[u8]>,
@@ -486,6 +487,13 @@ impl OwnedExternalBufferScope for ModelScope<'_> {
         }
         Ok(self.insert(ModelValueEntry::External(owner)))
     }
+}
+
+impl BorrowedBufferScope for ModelScope<'_> {
+    type BufferView<'view>
+        = ModelBufferView<'view>
+    where
+        Self: 'view;
 
     fn buffer_bytes<'view>(
         &'view self,
@@ -577,7 +585,12 @@ impl<T> SlotMap<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjsi_backend::{BackendBase, BackendScope, OwnedExternalBufferScope, RootScope};
+    use crate::{
+        verify_base_values, verify_external_buffer_identity, verify_strong_root_round_trip,
+    };
+    use rustjsi_backend::{
+        BackendBase, BackendScope, BorrowedBufferScope, OwnedExternalBufferScope, RootScope,
+    };
 
     #[test]
     fn evaluation_outcomes_are_exact_and_ordered() {
@@ -590,6 +603,14 @@ mod tests {
         assert!((scope.as_number(answer).unwrap() - 42.0).abs() < f64::EPSILON);
         let error = scope.evaluate("ignored", "model.js").unwrap_err();
         assert!(matches!(error, BackendError::Exception(_)));
+    }
+
+    #[test]
+    fn reusable_conformance_cases_pass_the_model() {
+        let mut backend = ModelBackend::new();
+        verify_base_values(&mut backend).unwrap();
+        verify_strong_root_round_trip(&mut backend).unwrap();
+        verify_external_buffer_identity(&mut backend).unwrap();
     }
 
     #[test]

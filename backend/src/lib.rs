@@ -14,7 +14,7 @@ use std::error::Error;
 use std::fmt;
 
 /// The current source-level backend contract version.
-pub const BACKEND_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1);
+pub const BACKEND_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0);
 
 /// A version of the source-level backend contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -64,6 +64,8 @@ pub enum Capability {
     OwnedExternalBuffers = 2,
     /// A deterministic or engine-provided forced-GC test hook.
     ForcedGarbageCollection = 3,
+    /// Stable, read-only byte borrows from JavaScript buffer values.
+    BorrowedBufferBytes = 4,
 }
 
 impl Capability {
@@ -79,6 +81,7 @@ impl Capability {
             Self::NativeState => "native-state",
             Self::OwnedExternalBuffers => "owned-external-buffers",
             Self::ForcedGarbageCollection => "forced-garbage-collection",
+            Self::BorrowedBufferBytes => "borrowed-buffer-bytes",
         }
     }
 }
@@ -132,11 +135,12 @@ impl CapabilitySet {
 
     /// Iterates over known capabilities in stable ID order.
     pub fn iter(self) -> impl Iterator<Item = Capability> {
-        const KNOWN: [Capability; 4] = [
+        const KNOWN: [Capability; 5] = [
             Capability::StrongRoots,
             Capability::NativeState,
             Capability::OwnedExternalBuffers,
             Capability::ForcedGarbageCollection,
+            Capability::BorrowedBufferBytes,
         ];
         KNOWN.into_iter().filter(move |item| self.contains(*item))
     }
@@ -253,6 +257,10 @@ pub enum ValueKind {
     Number,
     /// A string.
     String,
+    /// A symbol primitive.
+    Symbol,
+    /// A `BigInt` primitive.
+    BigInt,
     /// An object that is not refined further by the base contract.
     Object,
     /// A callable object.
@@ -391,6 +399,9 @@ impl Error for BackendError {
 /// obey the engine's thread and scope rules. A method may execute JavaScript,
 /// allocate, trigger GC, or re-enter unless its documentation says otherwise.
 pub trait BackendScope {
+    /// Backend instance that created this scope.
+    type Backend: BackendBase;
+
     /// Backend-private value handle confined to this scope borrow.
     type Value<'value>: Copy + fmt::Debug + Eq
     where
@@ -477,7 +488,7 @@ pub trait BackendScope {
 /// semantically different capability is a contract violation.
 pub trait BackendBase {
     /// Scope type borrowing this backend for one legal engine entry.
-    type Scope<'scope>: BackendScope
+    type Scope<'scope>: BackendScope<Backend = Self>
     where
         Self: 'scope;
 
@@ -492,6 +503,15 @@ pub trait BackendBase {
     fn open_scope(&mut self) -> Result<Self::Scope<'_>, BackendError>;
 }
 
+/// Backend-level strong-root identity for engines that support persistent roots.
+///
+/// A root crosses individual engine entries, so its type belongs to the backend
+/// instance rather than to any one scope type.
+pub trait RootBackend: BackendBase {
+    /// Backend-private, instance-bound persistent-root handle.
+    type Root: Copy + fmt::Debug + Eq;
+}
+
 /// Strong-root operations available on a capable backend scope.
 ///
 /// # Implementation contract
@@ -500,10 +520,10 @@ pub trait BackendBase {
 /// value alive after the current scope, `resolve` must reject stale and foreign
 /// handles, and `release` must be idempotently safe at the implementation's raw
 /// boundary. Engine access and destruction must occur in the legal domain.
-pub trait RootScope: BackendScope {
-    /// Backend-private persistent-root handle.
-    type Root: Copy + fmt::Debug + Eq;
-
+pub trait RootScope: BackendScope
+where
+    Self::Backend: RootBackend,
+{
     /// Creates a strong root for a scoped value.
     ///
     /// # Errors
@@ -512,21 +532,24 @@ pub trait RootScope: BackendScope {
     fn persist<'value>(
         &'value self,
         value: Self::Value<'value>,
-    ) -> Result<Self::Root, BackendError>;
+    ) -> Result<<Self::Backend as RootBackend>::Root, BackendError>;
 
     /// Resolves a root into the current scope.
     ///
     /// # Errors
     ///
     /// Rejects foreign, released, or stale roots.
-    fn resolve(&self, root: Self::Root) -> Result<Self::Value<'_>, BackendError>;
+    fn resolve(
+        &self,
+        root: <Self::Backend as RootBackend>::Root,
+    ) -> Result<Self::Value<'_>, BackendError>;
 
     /// Releases a root.
     ///
     /// # Errors
     ///
     /// Rejects foreign, already released, or stale roots.
-    fn release(&self, root: Self::Root) -> Result<(), BackendError>;
+    fn release(&self, root: <Self::Backend as RootBackend>::Root) -> Result<(), BackendError>;
 }
 
 /// Rust-owned external-buffer operations available on a capable scope.
@@ -538,11 +561,6 @@ pub trait RootScope: BackendScope {
 /// Rust aliasing and allocator provenance, and the allocation must be dropped
 /// exactly once even when finalization happens late or on another engine thread.
 pub trait OwnedExternalBufferScope: BackendScope {
-    /// A borrow of buffer bytes confined to this scope borrow.
-    type BufferView<'view>: AsRef<[u8]>
-    where
-        Self: 'view;
-
     /// Transfers exact-length Rust-owned bytes into a JavaScript buffer.
     ///
     /// Hidden copying is not permitted by this operation.
@@ -555,6 +573,22 @@ pub trait OwnedExternalBufferScope: BackendScope {
         &self,
         owner: Box<[u8]>,
     ) -> Result<Self::Value<'_>, OwnershipTransferError<Box<[u8]>>>;
+}
+
+/// Stable read-only buffer borrows available on a capable scope.
+///
+/// # Implementation contract
+///
+/// The bytes must remain valid and immutable for the entire returned view
+/// lifetime, including across any engine work the safe API permits while the
+/// view exists. A backend whose engine exposes only a temporary pointer must not
+/// implement this trait. Externalizing Rust-owned bytes does not by itself prove
+/// this separate capability.
+pub trait BorrowedBufferScope: BackendScope {
+    /// A borrow of buffer bytes confined to this scope borrow.
+    type BufferView<'view>: AsRef<[u8]>
+    where
+        Self: 'view;
 
     /// Borrows buffer bytes for no longer than this scope borrow.
     ///
@@ -579,14 +613,14 @@ mod tests {
 
         manifest
             .require(
-                ContractVersion::new(0, 1),
+                BACKEND_CONTRACT_VERSION,
                 CapabilitySet::only(Capability::StrongRoots),
             )
             .unwrap();
 
         let error = manifest
             .require(
-                ContractVersion::new(0, 1),
+                BACKEND_CONTRACT_VERSION,
                 CapabilitySet::only(Capability::NativeState),
             )
             .unwrap_err();
