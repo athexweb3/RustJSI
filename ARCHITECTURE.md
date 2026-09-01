@@ -38,8 +38,9 @@ generates static bindings for ordinary calls.
 
 ## Crate roles
 
-The root workspace is split by responsibility. The scaffold has no cross-crate
-path dependencies yet.
+The root workspace is split by responsibility. Dependencies follow the same
+direction as the runtime layers; the deterministic testkit currently consumes
+the backend contract.
 
 | Area | Crates |
 | --- | --- |
@@ -53,5 +54,5 @@ path dependencies yet.
 
 Public-contract changes will be discussed through issues and design proposals.
 
-For the current scaffold, see [`ROADMAP.md`](ROADMAP.md),
+For the current implementation stage, see [`ROADMAP.md`](ROADMAP.md),
 [`CONTRIBUTING.md`](CONTRIBUTING.md), and [`UNSAFE.md`](UNSAFE.md).

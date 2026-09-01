@@ -7,10 +7,13 @@ without treating C++ JSI, React Native, or any one engine as the core model.
 
 ## Status
 
-This workspace is unpublished. No stable API, engine backend, or performance
-result exists; all crates are `0.0.0` with `publish = false`.
+This workspace is unpublished. No stable API or supported engine backend
+exists; all crates are `0.0.0` with `publish = false`.
 
-Compiling this workspace verifies the build scaffold only.
+Current feasibility code includes a feature-gated direct integration with the
+macOS system JavaScriptCore C API, an experimental source-linked backend
+contract, and a deterministic backend/lifecycle model. These are research
+artifacts, not compatibility or production claims.
 
 ## Intended direction
 
