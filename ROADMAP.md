@@ -1,6 +1,6 @@
 # Roadmap
 
-RustJSI is at repository-bootstrap stage. Work starts with the highest-risk
+RustJSI is in feasibility work. Development starts with the highest-risk
 runtime and engine assumptions.
 
 ## Planned sequence
@@ -21,9 +21,10 @@ runtime and engine assumptions.
 
 ## Current scope
 
-The current task is to maintain a reliable build, test, documentation, and
-security foundation for the first feasibility work. It is not to publish crates
-or claim runtime compatibility, performance, or production readiness.
+The current work is validating the source-linked backend boundary and host
+lifecycle model against both a deterministic implementation and direct
+JavaScriptCore evidence. It is not ready to publish crates or claim runtime
+compatibility, general performance, or production readiness.
 
 ## Deferred work
 

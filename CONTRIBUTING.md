@@ -2,7 +2,7 @@
 
 Thanks for considering a contribution to RustJSI.
 
-The workspace is at an early scaffold stage. Please discuss new public APIs,
+The workspace is in early feasibility work. Please discuss new public APIs,
 engine integrations, asynchronous runtimes, foreign-function layers, or major
 dependencies before implementing them.
 

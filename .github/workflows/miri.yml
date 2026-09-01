@@ -42,8 +42,9 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-strict-provenance"
         run: |
-          cargo miri test \
+          cargo +nightly-2026-08-27 miri test \
             --locked \
+            -p rustjsi-backend \
             -p rustjsi-core \
             -p rustjsi-runtime \
             -p rustjsi-host \

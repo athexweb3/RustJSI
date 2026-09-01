@@ -28,7 +28,7 @@ deny:
     cargo deny check
 
 miri:
-    cargo +nightly miri test --locked -p rustjsi-core -p rustjsi-runtime -p rustjsi-host -p rustjsi-embed -p rustjsi-module -p rustjsi-ir -p rustjsi-codegen -p rustjsi-testkit
+    cargo +nightly-2026-08-27 miri test --locked -p rustjsi-backend -p rustjsi-core -p rustjsi-runtime -p rustjsi-host -p rustjsi-embed -p rustjsi-module -p rustjsi-ir -p rustjsi-codegen -p rustjsi-testkit
 
 spell:
     typos

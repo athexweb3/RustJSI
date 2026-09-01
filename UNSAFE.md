@@ -5,7 +5,11 @@ require contained `unsafe` code. Keep that surface small and reviewable.
 
 ## Current inventory
 
-Safe crates forbid `unsafe`. Boundary crates deny `unsafe_op_in_unsafe_fn`.
+Safe contract and model crates forbid `unsafe`. Engine and foreign boundary
+crates deny `unsafe_op_in_unsafe_fn`.
+
+`rustjsi-backend` contains no unsafe code. Backend implementors keep raw engine
+operations inside their own crate and satisfy the safe source-level contract.
 
 `rustjsi-backend-jsc` contains a feature-gated experimental binding to the macOS
 JavaScriptCore C API. Its unsafe surface is limited to raw declarations, calls,
