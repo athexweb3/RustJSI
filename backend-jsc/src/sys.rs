@@ -26,6 +26,7 @@ pub(crate) type FunctionCallback = Option<
 >;
 
 pub(crate) type FinalizeCallback = Option<unsafe extern "C" fn(ObjectRef)>;
+pub(crate) type TypedArrayBytesDeallocator = Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -157,6 +158,30 @@ unsafe extern "C" {
 
     #[link_name = "JSObjectSetPrivate"]
     pub(crate) fn object_set_private(object: ObjectRef, private_data: *mut c_void) -> bool;
+
+    #[link_name = "JSObjectMakeArrayBufferWithBytesNoCopy"]
+    pub(crate) fn object_make_array_buffer_with_bytes_no_copy(
+        context: ContextRef,
+        bytes: *mut c_void,
+        byte_length: usize,
+        deallocator: TypedArrayBytesDeallocator,
+        deallocator_context: *mut c_void,
+        exception: *mut ValueRef,
+    ) -> ObjectRef;
+
+    #[link_name = "JSObjectGetArrayBufferBytesPtr"]
+    pub(crate) fn object_get_array_buffer_bytes_ptr(
+        context: ContextRef,
+        object: ObjectRef,
+        exception: *mut ValueRef,
+    ) -> *mut c_void;
+
+    #[link_name = "JSObjectGetArrayBufferByteLength"]
+    pub(crate) fn object_get_array_buffer_byte_length(
+        context: ContextRef,
+        object: ObjectRef,
+        exception: *mut ValueRef,
+    ) -> usize;
 
     #[link_name = "JSObjectSetProperty"]
     pub(crate) fn object_set_property(
