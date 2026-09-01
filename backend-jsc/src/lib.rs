@@ -4,3 +4,14 @@
 
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
+
+#[cfg(all(feature = "experimental-jsc", target_os = "macos"))]
+mod experimental;
+#[cfg(all(feature = "experimental-jsc", target_os = "macos"))]
+mod sys;
+
+#[cfg(all(feature = "experimental-jsc", target_os = "macos"))]
+pub use experimental::{
+    Call, Context, HostError, HostFunction, JsError, JsException, Local, Persistent, Runtime,
+    RuntimeError, Value,
+};
