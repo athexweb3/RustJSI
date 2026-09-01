@@ -27,9 +27,6 @@ doc:
 deny:
     cargo deny check
 
-coverage:
-    cargo llvm-cov nextest --workspace --all-features --locked --no-tests=pass
-
 miri:
     cargo +nightly miri test --locked -p rustjsi-core -p rustjsi-runtime -p rustjsi-host -p rustjsi-embed -p rustjsi-module -p rustjsi-ir -p rustjsi-codegen -p rustjsi-testkit
 

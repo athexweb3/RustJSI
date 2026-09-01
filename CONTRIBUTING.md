@@ -33,7 +33,6 @@ Recommended local tools:
 | `just` | Discoverable local commands |
 | `cargo-nextest` | Workspace tests |
 | `cargo-deny` | Dependency policy |
-| `cargo-llvm-cov` | Coverage reports |
 | `typos` | Spelling checks |
 | `lychee` | Link checks |
 | `zizmor` | GitHub Actions analysis |
@@ -49,7 +48,6 @@ just test
 just test-doc
 just doc
 just deny
-just coverage
 just miri
 just ci
 just verify
