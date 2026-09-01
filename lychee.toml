@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 verbose = "on"
-progress = false
 include_fragments = "full"
 insecure = false
 max_retries = 2
