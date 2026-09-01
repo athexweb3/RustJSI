@@ -3,6 +3,7 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
+mod common;
 mod external_buffer;
 mod native_state;
 
@@ -14,8 +15,10 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
+pub use common::{JscBackend, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
 
@@ -24,6 +27,7 @@ thread_local! {
 }
 
 const INLINE_ARGUMENTS: usize = 8;
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A standalone `JavaScriptCore` runtime owned by the current thread.
 ///
@@ -109,6 +113,8 @@ pub enum RuntimeError {
     WrongRuntime,
     /// A handle no longer names a protected value.
     StaleHandle,
+    /// The process exhausted unique runtime identities.
+    IdentityExhausted,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -130,6 +136,7 @@ pub enum JsError {
 type Callback = dyn for<'call> Fn(Call<'call>) -> Result<Value, HostError> + 'static;
 
 struct Shared {
+    id: u64,
     owner: ThreadId,
     lifecycle: Cell<Lifecycle>,
     context: Cell<Option<NonNull<sys::OpaqueContext>>>,
@@ -188,6 +195,11 @@ impl Runtime {
     ///
     /// Returns [`RuntimeError::CreationFailed`] if JSC cannot create the context.
     pub fn new() -> Result<Self, RuntimeError> {
+        let id = NEXT_RUNTIME_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| RuntimeError::IdentityExhausted)?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
@@ -196,6 +208,7 @@ impl Runtime {
         let native_finalizers = Arc::new(native_state::FinalizerQueue::new());
         Ok(Self {
             shared: Rc::new(Shared {
+                id,
                 owner: thread::current().id(),
                 lifecycle: Cell::new(Lifecycle::Active),
                 context: Cell::new(Some(context)),
@@ -687,6 +700,7 @@ impl fmt::Display for RuntimeError {
             Self::WrongThread => "runtime entered from the wrong thread",
             Self::WrongRuntime => "handle belongs to another runtime",
             Self::StaleHandle => "handle is stale",
+            Self::IdentityExhausted => "runtime identity space is exhausted",
         };
         formatter.write_str(message)
     }

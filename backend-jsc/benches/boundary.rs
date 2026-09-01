@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
+    use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Runtime, Value};
     use std::hint::black_box;
     use std::time::Instant;
@@ -12,6 +13,7 @@ fn main() {
     const ITERATIONS: u32 = 1_000_000;
 
     let direct = raw::measure(WARMUP, ITERATIONS);
+    let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
     let mut rustjsi = 0.0;
@@ -37,11 +39,36 @@ fn main() {
         })
         .expect("enter JSC runtime");
 
+    let mut common_scalar = 0.0;
+    runtime
+        .with_backend(|backend| {
+            let scope = backend.open_scope().expect("open common JSC scope");
+            for _ in 0..WARMUP {
+                let value = scope.number(black_box(42.0)).expect("make number");
+                black_box(scope.as_number(value).expect("read number"));
+            }
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let value = scope.number(black_box(42.0)).expect("make number");
+                black_box(scope.as_number(value).expect("read number"));
+            }
+            let elapsed = started.elapsed();
+            common_scalar = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(ITERATIONS);
+        })
+        .expect("enter common JSC backend");
+
     println!("direct_jsc_lower_bound: {direct:.2} ns/call");
     println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
         rustjsi / direct
+    );
+    println!("direct_jsc_scalar: {direct_scalar:.2} ns/round-trip");
+    println!("rustjsi_common_scalar: {common_scalar:.2} ns/round-trip");
+    println!(
+        "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
+        common_scalar / direct_scalar
     );
 }
 
@@ -118,6 +145,37 @@ mod raw {
         // synchronous calls have returned.
         unsafe { context_release(context) };
         elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
+    pub(super) fn measure_scalar(warmup: u32, iterations: u32) -> f64 {
+        // SAFETY: The default global class is requested and checked before use.
+        let context = unsafe { context_create(ptr::null_mut()) };
+        assert!(!context.is_null(), "create direct JSC scalar context");
+
+        for _ in 0..warmup {
+            black_box(scalar_round_trip(context, black_box(42.0)));
+        }
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(scalar_round_trip(context, black_box(42.0)));
+        }
+        let elapsed = started.elapsed();
+
+        // SAFETY: This balances the successful context creation after all calls.
+        unsafe { context_release(context) };
+        elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
+    fn scalar_round_trip(context: Context, number: f64) -> f64 {
+        // SAFETY: The context remains live throughout this primitive round-trip.
+        let value = unsafe { make_number(context, number) };
+        // SAFETY: The value was created in this context immediately above.
+        assert!(unsafe { is_number(context, value) });
+        let mut exception = ptr::null();
+        // SAFETY: Strict type checking avoids coercion and captures exceptions.
+        let result = unsafe { to_number(context, value, &raw mut exception) };
+        assert!(exception.is_null(), "direct scalar conversion threw");
+        result
     }
 
     fn call(context: Context, function: Object, arguments: &[Value; 2]) -> Value {

@@ -2,6 +2,16 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
+pub(crate) const TYPE_UNDEFINED: c_int = 0;
+pub(crate) const TYPE_NULL: c_int = 1;
+pub(crate) const TYPE_BOOLEAN: c_int = 2;
+pub(crate) const TYPE_NUMBER: c_int = 3;
+pub(crate) const TYPE_STRING: c_int = 4;
+pub(crate) const TYPE_OBJECT: c_int = 5;
+pub(crate) const TYPE_SYMBOL: c_int = 6;
+pub(crate) const TYPE_BIG_INT: c_int = 7;
+pub(crate) const TYPED_ARRAY_NONE: c_int = 10;
+
 pub(crate) enum OpaqueClass {}
 pub(crate) enum OpaqueContext {}
 pub(crate) enum OpaqueString {}
@@ -110,11 +120,17 @@ unsafe extern "C" {
     #[link_name = "JSValueMakeString"]
     pub(crate) fn value_make_string(context: ContextRef, value: StringRef) -> ValueRef;
 
+    #[link_name = "JSValueGetType"]
+    pub(crate) fn value_get_type(context: ContextRef, value: ValueRef) -> c_int;
+
     #[link_name = "JSValueIsBoolean"]
     pub(crate) fn value_is_boolean(context: ContextRef, value: ValueRef) -> bool;
 
     #[link_name = "JSValueIsNumber"]
     pub(crate) fn value_is_number(context: ContextRef, value: ValueRef) -> bool;
+
+    #[link_name = "JSValueIsString"]
+    pub(crate) fn value_is_string(context: ContextRef, value: ValueRef) -> bool;
 
     #[link_name = "JSValueToBoolean"]
     pub(crate) fn value_to_boolean(context: ContextRef, value: ValueRef) -> bool;
@@ -138,6 +154,16 @@ unsafe extern "C" {
 
     #[link_name = "JSValueUnprotect"]
     pub(crate) fn value_unprotect(context: ContextRef, value: ValueRef);
+
+    #[link_name = "JSValueGetTypedArrayType"]
+    pub(crate) fn value_get_typed_array_type(
+        context: ContextRef,
+        value: ValueRef,
+        exception: *mut ValueRef,
+    ) -> c_int;
+
+    #[link_name = "JSObjectIsFunction"]
+    pub(crate) fn object_is_function(context: ContextRef, object: ObjectRef) -> bool;
 
     #[link_name = "JSObjectMakeFunctionWithCallback"]
     pub(crate) fn object_make_function_with_callback(

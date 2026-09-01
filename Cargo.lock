@@ -13,6 +13,10 @@ version = "0.0.0"
 [[package]]
 name = "rustjsi-backend-jsc"
 version = "0.0.0"
+dependencies = [
+ "rustjsi-backend",
+ "rustjsi-testkit",
+]
 
 [[package]]
 name = "rustjsi-codegen"

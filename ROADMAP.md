@@ -23,8 +23,11 @@ runtime and engine assumptions.
 
 The current work is validating the source-linked backend boundary and host
 lifecycle model against both a deterministic implementation and direct
-JavaScriptCore evidence. It is not ready to publish crates or claim runtime
-compatibility, general performance, or production readiness.
+JavaScriptCore evidence. The common JSC path currently covers scoped values,
+strict scalar reads, value classification, explicit roots, and Rust-owned
+external buffers during a standalone host-authorized entry. It is not ready to
+publish crates or claim runtime compatibility, general performance, or
+production readiness.
 
 ## Deferred work
 

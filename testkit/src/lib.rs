@@ -13,7 +13,8 @@ mod lifecycle;
 mod model;
 
 pub use conformance::{
-    verify_base_values, verify_external_buffer_identity, verify_strong_root_round_trip,
+    create_number_root, verify_base_values, verify_external_buffer_identity,
+    verify_number_root_and_release, verify_owned_external_buffer, verify_strong_root_round_trip,
 };
 pub use lifecycle::{
     Entry, Epoch, LifecycleError, LifecycleEvent, LifecycleModel, RuntimeId, RuntimeState,

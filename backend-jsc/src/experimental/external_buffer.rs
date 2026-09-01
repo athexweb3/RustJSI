@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{Context, JsError, JsString, exception_to_owned};
+use super::{Context, JsError, JsString, Shared, exception_to_owned};
 use crate::sys;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ struct ExternalOwner {
     observation: Arc<ExternalObservation>,
 }
 
-struct ExternalObservation {
+pub(super) struct ExternalObservation {
     deallocations: AtomicUsize,
     deallocator_received_origin: AtomicBool,
     deallocator_ran_on_owner: AtomicBool,
@@ -103,7 +103,7 @@ impl ExternalLedger {
         }
     }
 
-    fn reserve(&self, byte_len: usize) -> Result<(), JsError> {
+    pub(super) fn reserve(&self, byte_len: usize) -> Result<(), JsError> {
         self.live_allocations
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 (live < MAX_EXTERNAL_ALLOCATIONS).then_some(live + 1)
@@ -167,13 +167,9 @@ impl Context<'_> {
         self.shared.external_buffers.reserve(bytes.len())?;
 
         let byte_len = bytes.len();
-        let observation = Arc::new(ExternalObservation {
-            deallocations: AtomicUsize::new(0),
-            deallocator_received_origin: AtomicBool::new(false),
-            deallocator_ran_on_owner: AtomicBool::new(false),
-        });
+        let observation = new_observation();
         let (object, backing_store_matches_origin) =
-            self.make_external_object(bytes, &observation)?;
+            make_external_object(self.shared, self.raw, bytes, &observation)?;
         self.publish_external_object(&property, object)?;
 
         Ok(ExternalBuffer {
@@ -181,96 +177,6 @@ impl Context<'_> {
             byte_len,
             backing_store_matches_origin,
         })
-    }
-
-    fn make_external_object(
-        &self,
-        mut bytes: Box<[u8]>,
-        observation: &Arc<ExternalObservation>,
-    ) -> Result<(NonNull<sys::OpaqueValue>, Option<bool>), JsError> {
-        let byte_len = bytes.len();
-        let origin = bytes.as_mut_ptr();
-        let owner = Box::new(ExternalOwner {
-            bytes,
-            owner_thread: thread::current().id(),
-            ledger: Arc::clone(&self.shared.external_buffers),
-            observation: Arc::clone(observation),
-        });
-        let owner = Box::into_raw(owner);
-        let mut exception = ptr::null();
-
-        // SAFETY: `owner` contains the vector that owns `origin..origin+byte_len`.
-        // Ownership of that allocation and the non-null deallocator context is
-        // transferred to JSC for both success and exception paths, as required by
-        // the public C API contract. No Rust payload reference remains afterwards.
-        let object = unsafe {
-            sys::object_make_array_buffer_with_bytes_no_copy(
-                self.raw.as_ptr(),
-                origin.cast(),
-                byte_len,
-                Some(external_bytes_deallocator),
-                owner.cast(),
-                &raw mut exception,
-            )
-        };
-        if !exception.is_null() {
-            return Err(JsError::Exception(exception_to_owned(self.raw, exception)));
-        }
-        let object = NonNull::new(object).ok_or(JsError::Backend(
-            "JavaScriptCore returned a null external ArrayBuffer",
-        ))?;
-
-        let mut inspection_exception = ptr::null();
-        // SAFETY: `object` is a live ArrayBuffer in this active context. Length is
-        // queried before the temporary backing pointer so no JSC call follows while
-        // that pointer is being inspected.
-        let observed_len = unsafe {
-            sys::object_get_array_buffer_byte_length(
-                self.raw.as_ptr(),
-                object.as_ptr(),
-                &raw mut inspection_exception,
-            )
-        };
-        if !inspection_exception.is_null() {
-            return Err(JsError::Exception(exception_to_owned(
-                self.raw,
-                inspection_exception,
-            )));
-        }
-        if observed_len != byte_len {
-            return Err(JsError::Backend(
-                "JavaScriptCore changed the external ArrayBuffer length",
-            ));
-        }
-
-        // SAFETY: This is the final JSC call before the temporary pointer is compared
-        // and discarded. Non-empty backing stores must return a usable pointer.
-        let observed_origin = unsafe {
-            sys::object_get_array_buffer_bytes_ptr(
-                self.raw.as_ptr(),
-                object.as_ptr(),
-                &raw mut inspection_exception,
-            )
-        };
-        if !inspection_exception.is_null() {
-            return Err(JsError::Exception(exception_to_owned(
-                self.raw,
-                inspection_exception,
-            )));
-        }
-        if byte_len != 0 && observed_origin.is_null() {
-            return Err(JsError::Backend(
-                "JavaScriptCore returned a null external backing store",
-            ));
-        }
-        if byte_len != 0 && observed_origin != origin.cast() {
-            return Err(JsError::Backend(
-                "JavaScriptCore did not retain the external backing store",
-            ));
-        }
-        let backing_store_matches_origin = (byte_len != 0).then_some(true);
-
-        Ok((object, backing_store_matches_origin))
     }
 
     fn publish_external_object(
@@ -304,6 +210,105 @@ impl Context<'_> {
         }
         Ok(())
     }
+}
+
+pub(super) fn new_observation() -> Arc<ExternalObservation> {
+    Arc::new(ExternalObservation {
+        deallocations: AtomicUsize::new(0),
+        deallocator_received_origin: AtomicBool::new(false),
+        deallocator_ran_on_owner: AtomicBool::new(false),
+    })
+}
+
+pub(super) fn make_external_object(
+    shared: &Shared,
+    raw: NonNull<sys::OpaqueContext>,
+    mut bytes: Box<[u8]>,
+    observation: &Arc<ExternalObservation>,
+) -> Result<(NonNull<sys::OpaqueValue>, Option<bool>), JsError> {
+    let byte_len = bytes.len();
+    let origin = bytes.as_mut_ptr();
+    let owner = Box::new(ExternalOwner {
+        bytes,
+        owner_thread: thread::current().id(),
+        ledger: Arc::clone(&shared.external_buffers),
+        observation: Arc::clone(observation),
+    });
+    let owner = Box::into_raw(owner);
+    let mut exception = ptr::null();
+
+    // SAFETY: `owner` contains the vector that owns `origin..origin+byte_len`.
+    // Ownership of that allocation and the non-null deallocator context is
+    // transferred to JSC for both success and exception paths, as required by
+    // the public C API contract. No Rust payload reference remains afterwards.
+    let object = unsafe {
+        sys::object_make_array_buffer_with_bytes_no_copy(
+            raw.as_ptr(),
+            origin.cast(),
+            byte_len,
+            Some(external_bytes_deallocator),
+            owner.cast(),
+            &raw mut exception,
+        )
+    };
+    if !exception.is_null() {
+        return Err(JsError::Exception(exception_to_owned(raw, exception)));
+    }
+    let object = NonNull::new(object).ok_or(JsError::Backend(
+        "JavaScriptCore returned a null external ArrayBuffer",
+    ))?;
+
+    let mut inspection_exception = ptr::null();
+    // SAFETY: `object` is a live ArrayBuffer in this active context. Length is
+    // queried before the temporary backing pointer so no JSC call follows while
+    // that pointer is being inspected.
+    let observed_len = unsafe {
+        sys::object_get_array_buffer_byte_length(
+            raw.as_ptr(),
+            object.as_ptr(),
+            &raw mut inspection_exception,
+        )
+    };
+    if !inspection_exception.is_null() {
+        return Err(JsError::Exception(exception_to_owned(
+            raw,
+            inspection_exception,
+        )));
+    }
+    if observed_len != byte_len {
+        return Err(JsError::Backend(
+            "JavaScriptCore changed the external ArrayBuffer length",
+        ));
+    }
+
+    // SAFETY: This is the final JSC call before the temporary pointer is compared
+    // and discarded. Non-empty backing stores must return a usable pointer.
+    let observed_origin = unsafe {
+        sys::object_get_array_buffer_bytes_ptr(
+            raw.as_ptr(),
+            object.as_ptr(),
+            &raw mut inspection_exception,
+        )
+    };
+    if !inspection_exception.is_null() {
+        return Err(JsError::Exception(exception_to_owned(
+            raw,
+            inspection_exception,
+        )));
+    }
+    if byte_len != 0 && observed_origin.is_null() {
+        return Err(JsError::Backend(
+            "JavaScriptCore returned a null external backing store",
+        ));
+    }
+    if byte_len != 0 && observed_origin != origin.cast() {
+        return Err(JsError::Backend(
+            "JavaScriptCore did not retain the external backing store",
+        ));
+    }
+    let backing_store_matches_origin = (byte_len != 0).then_some(true);
+
+    Ok((object, backing_store_matches_origin))
 }
 
 unsafe extern "C" fn external_bytes_deallocator(
