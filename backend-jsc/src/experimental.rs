@@ -3,6 +3,7 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
+mod external_buffer;
 mod native_state;
 
 use std::cell::{Cell, RefCell};
@@ -15,6 +16,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
+pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
 
 thread_local! {
@@ -136,6 +138,7 @@ struct Shared {
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
     native_drop_panics: Cell<usize>,
+    external_buffers: Arc<external_buffer::ExternalLedger>,
 }
 
 struct HostFunctionEntry {
@@ -201,6 +204,7 @@ impl Runtime {
                 native_states: RefCell::new(native_state::NativeRegistry::default()),
                 native_finalizers,
                 native_drop_panics: Cell::new(0),
+                external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
         })
     }
@@ -1451,6 +1455,175 @@ mod tests {
         runtime.invalidate().unwrap();
     }
 
+    #[test]
+    fn external_buffer_preserves_payload_allocation_and_js_mutation() {
+        const BYTE_LEN: usize = 1024 * 1024;
+
+        let bytes = (0_u8..=u8::MAX)
+            .cycle()
+            .take(BYTE_LEN)
+            .map(|byte| byte.wrapping_mul(31).wrapping_add(7))
+            .collect::<Vec<_>>();
+        let checksum = bytes.iter().fold(0.0, |sum, byte| sum + f64::from(*byte));
+        let mut runtime = Runtime::new().unwrap();
+        let buffer = runtime
+            .with_context(|context| {
+                context
+                    .install_external_buffer("externalPayload", bytes.into_boxed_slice())
+                    .unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(buffer.byte_len(), BYTE_LEN);
+        assert_eq!(buffer.backing_store_matches_origin(), Some(true));
+
+        runtime
+            .with_context(|context| {
+                let observed = context
+                    .eval(
+                        "(() => { const view = new Uint8Array(externalPayload); let sum = 0;\
+                         for (let i = 0; i < view.length; i++) sum += view[i]; return sum; })()",
+                        "external-checksum.js",
+                    )
+                    .unwrap();
+                assert!((context.number(&observed).unwrap() - checksum).abs() < f64::EPSILON);
+
+                let mutation = context
+                    .eval(
+                        "(() => { const view = new Uint8Array(externalPayload); view[0] = 99;\
+                         view[view.length - 1] = 17; return view[0] * 256 + view[view.length - 1]; })()",
+                        "external-mutation.js",
+                    )
+                    .unwrap();
+                let mutation = context.number(&mutation).unwrap();
+                assert!((mutation - f64::from(99 * 256 + 17)).abs() < f64::EPSILON);
+                context
+                    .eval("delete externalPayload", "external-delete.js")
+                    .unwrap();
+            })
+            .unwrap();
+
+        collect_external_until(&mut runtime, &buffer);
+        assert_eq!(buffer.deallocator_received_origin(), Some(true));
+        assert_eq!(runtime.shared.external_buffers.live_allocations(), 0);
+        assert_eq!(runtime.shared.external_buffers.live_bytes(), 0);
+        assert_eq!(runtime.shared.external_buffers.deallocations(), 1);
+    }
+
+    #[test]
+    fn external_buffer_supports_empty_payload() {
+        let mut runtime = Runtime::new().unwrap();
+        let buffer = runtime
+            .with_context(|context| {
+                context
+                    .install_external_buffer("emptyPayload", Vec::new().into_boxed_slice())
+                    .unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(buffer.byte_len(), 0);
+        assert_eq!(buffer.backing_store_matches_origin(), None);
+        runtime
+            .with_context(|context| {
+                let length = context
+                    .eval("emptyPayload.byteLength", "empty-buffer.js")
+                    .unwrap();
+                assert!(context.number(&length).unwrap().abs() < f64::EPSILON);
+                context
+                    .eval("delete emptyPayload", "empty-delete.js")
+                    .unwrap();
+            })
+            .unwrap();
+        collect_external_until(&mut runtime, &buffer);
+        assert_eq!(buffer.deallocator_received_origin(), Some(true));
+    }
+
+    #[test]
+    fn external_buffer_deallocator_survives_runtime_invalidation() {
+        let mut runtime = Runtime::new().unwrap();
+        let buffer = runtime
+            .with_context(|context| {
+                context
+                    .install_external_buffer("liveExternal", vec![42; 64 * 1024].into_boxed_slice())
+                    .unwrap()
+            })
+            .unwrap();
+
+        runtime.invalidate().unwrap();
+        assert!(buffer.is_deallocated());
+        assert_eq!(buffer.deallocator_received_origin(), Some(true));
+        assert_eq!(runtime.shared.external_buffers.live_allocations(), 0);
+        assert_eq!(runtime.shared.external_buffers.live_bytes(), 0);
+        assert_eq!(runtime.shared.external_buffers.deallocations(), 1);
+    }
+
+    #[test]
+    fn external_buffer_publication_failure_releases_transferred_owner() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|context| {
+                context
+                    .eval(
+                        "Object.defineProperty(this, 'rejectedExternal', {\
+                         set() { throw new Error('publication rejected'); }, configurable: true })",
+                        "reject-publication.js",
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    context.install_external_buffer(
+                        "rejectedExternal",
+                        vec![1, 2, 3, 4].into_boxed_slice(),
+                    ),
+                    Err(JsError::Exception(_))
+                ));
+            })
+            .unwrap();
+
+        collect_external_ledger_until_empty(&mut runtime);
+        assert_eq!(runtime.shared.external_buffers.live_allocations(), 0);
+        assert_eq!(runtime.shared.external_buffers.live_bytes(), 0);
+        assert_eq!(runtime.shared.external_buffers.deallocations(), 1);
+    }
+
+    #[test]
+    fn external_buffer_burst_reconciles_ledger() {
+        const BUFFERS: usize = 512;
+
+        let mut runtime = Runtime::new().unwrap();
+        let buffers = runtime
+            .with_context(|context| {
+                let mut buffers = Vec::with_capacity(BUFFERS);
+                for index in 0..BUFFERS {
+                    buffers.push(
+                        context
+                            .install_external_buffer(
+                                &format!("external{index}"),
+                                vec![u8::try_from(index % 256).unwrap(); 257].into_boxed_slice(),
+                            )
+                            .unwrap(),
+                    );
+                }
+                context
+                    .eval(
+                        "for (let i = 0; i < 512; i++) delete this['external' + i]",
+                        "external-burst-delete.js",
+                    )
+                    .unwrap();
+                buffers
+            })
+            .unwrap();
+
+        collect_external_ledger_until_empty(&mut runtime);
+        assert!(buffers.iter().all(ExternalBuffer::is_deallocated));
+        assert!(
+            buffers
+                .iter()
+                .all(|buffer| buffer.deallocator_received_origin() == Some(true))
+        );
+        assert_eq!(runtime.shared.external_buffers.live_bytes(), 0);
+        assert_eq!(runtime.shared.external_buffers.deallocations(), BUFFERS);
+    }
+
     fn collect_until(runtime: &mut Runtime, drops: &Cell<usize>, expected: usize) {
         for _ in 0..32 {
             runtime
@@ -1472,5 +1645,43 @@ mod tests {
             "expected {expected} native-state drops, observed {}",
             drops.get()
         );
+    }
+
+    fn collect_external_until(runtime: &mut Runtime, buffer: &ExternalBuffer) {
+        for _ in 0..32 {
+            if buffer.is_deallocated() {
+                return;
+            }
+            force_external_collection(runtime);
+        }
+        panic!("external ArrayBuffer owner was not deallocated");
+    }
+
+    fn collect_external_ledger_until_empty(runtime: &mut Runtime) {
+        for _ in 0..32 {
+            if runtime.shared.external_buffers.live_allocations() == 0 {
+                return;
+            }
+            force_external_collection(runtime);
+        }
+        panic!(
+            "expected an empty external ledger, observed {} allocations and {} bytes",
+            runtime.shared.external_buffers.live_allocations(),
+            runtime.shared.external_buffers.live_bytes()
+        );
+    }
+
+    fn force_external_collection(runtime: &mut Runtime) {
+        runtime
+            .with_context(|context| {
+                context.collect_garbage().unwrap();
+                context
+                    .eval(
+                        "Array.from({ length: 4096 }, (_, i) => ({ i }))",
+                        "external-gc-churn.js",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
     }
 }

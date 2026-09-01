@@ -10,9 +10,11 @@ Safe crates forbid `unsafe`. Boundary crates deny `unsafe_op_in_unsafe_fn`.
 `rustjsi-backend-jsc` contains a feature-gated experimental binding to the macOS
 JavaScriptCore C API. Its unsafe surface is limited to raw declarations, calls,
 callback argument views, active-entry recovery, class private-data access, and
-native-object finalization. Finalizers enqueue opaque generational tokens only;
-they do not enter JavaScriptCore, lock, allocate, or destroy user state. Rust
-state is reclaimed later on the runtime-owning thread.
+native-object finalization. It also transfers boxed byte allocations to JSC
+through its no-copy ArrayBuffer API and reclaims them through a panic-contained,
+thread-independent C deallocator. Finalizers enqueue opaque generational tokens
+only; they do not enter JavaScriptCore, lock, allocate, or destroy user state.
+Rust state is reclaimed later on the runtime-owning thread.
 
 ## Required documentation
 
