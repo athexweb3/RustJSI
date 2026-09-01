@@ -46,7 +46,7 @@ jobs:
       - name: Generate LCOV and summary
         run: |
           mkdir -p target/llvm-cov
-          cargo llvm-cov nextest --workspace --all-features --locked --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov nextest --workspace --all-features --locked --no-tests=pass --lcov --output-path target/llvm-cov/lcov.info
           cargo llvm-cov report --summary-only | tee target/llvm-cov/summary.txt
 
       - name: Upload coverage artifacts

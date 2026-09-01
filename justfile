@@ -16,7 +16,7 @@ clippy:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 test:
-    cargo nextest run --workspace --all-features --locked --profile ci
+    cargo nextest run --workspace --all-features --locked --profile ci --no-tests=pass
 
 test-doc:
     cargo test --workspace --doc --all-features --locked
@@ -28,7 +28,7 @@ deny:
     cargo deny check
 
 coverage:
-    cargo llvm-cov nextest --workspace --all-features --locked
+    cargo llvm-cov nextest --workspace --all-features --locked --no-tests=pass
 
 miri:
     cargo +nightly miri test --locked -p rustjsi-core -p rustjsi-runtime -p rustjsi-host -p rustjsi-embed -p rustjsi-module -p rustjsi-ir -p rustjsi-codegen -p rustjsi-testkit
