@@ -12,7 +12,13 @@ publish.workspace = true
 
 [features]
 default = []
-experimental-jsc = []
+experimental-jsc = ["dep:rustjsi-backend"]
+
+[dependencies]
+rustjsi-backend = { path = "../backend", version = "=0.0.0", optional = true }
+
+[dev-dependencies]
+rustjsi-testkit = { path = "../testkit", version = "=0.0.0" }
 
 [[bench]]
 name = "boundary"

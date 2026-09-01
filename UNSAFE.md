@@ -20,6 +20,14 @@ thread-independent C deallocator. Finalizers enqueue opaque generational tokens
 only; they do not enter JavaScriptCore, lock, allocate, or destroy user state.
 Rust state is reclaimed later on the runtime-owning thread.
 
+The common JSC adapter exists only inside a host-authorized entry. GC-managed
+values returned through its safe scope API are protected and registered until
+scope teardown, including when Rust moves the handle itself to heap storage.
+Scalar primitives avoid this root path. Strong roots balance independent
+protect/unprotect pairs through instance-bound generational slots. Temporary
+ArrayBuffer backing pointers are used only for immediate construction-time
+validation and are never exposed as safe borrowed slices.
+
 ## Required documentation
 
 Every future unsafe block must have a nearby explanation of:

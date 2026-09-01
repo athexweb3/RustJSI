@@ -12,8 +12,9 @@ exists; all crates are `0.0.0` with `publish = false`.
 
 Current feasibility code includes a feature-gated direct integration with the
 macOS system JavaScriptCore C API, an experimental source-linked backend
-contract, and a deterministic backend/lifecycle model. These are research
-artifacts, not compatibility or production claims.
+contract implemented by both a deterministic model and a host-authorized JSC
+adapter, and a deterministic host lifecycle model. These are research artifacts,
+not compatibility or production claims.
 
 ## Intended direction
 
