@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Private local design material. It is intentionally never part of the public
+# repository or its CI/documentation surface.
+/.docs/
+
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Coverage, profiling, and instrumentation
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+/tarpaulin-report.html
+flamegraph.svg
+perf.data
+perf.data.old
+*.lcov
+/bench/results/
+/bench/tmp/
+criterion/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Tool caches and local reports
+.just/
+.nextest/
+/tmp/
+*.sarif
+
+# Deliberately tracked workspace inputs
+!Cargo.lock
+!deny.toml
+!rust-toolchain.toml
+!rustfmt.toml
+!clippy.toml

@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[workspace]
+resolver = "3"
+members = [
+    "core",
+    "runtime",
+    "host",
+    "embed",
+    "backend",
+    "backend-jsc",
+    "abi",
+    "module",
+    "ir",
+    "codegen",
+    "testkit",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+future_incompatible = { level = "warn", priority = -1 }
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

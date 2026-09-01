@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Architecture / RFC proposal
+description: Propose a public design, crate-boundary, or roadmap change.
+labels: ["architecture", "rfc"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to discuss a design before implementation.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Proposal summary
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem does this proposal address?
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of change
+      options:
+        - new design record
+        - revise a public design decision
+        - architecture clarification
+        - roadmap change
+        - crate boundary change
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: documents
+    attributes:
+      label: Documents to change
+      description: Which files, crates, or interfaces would change?
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariant and compatibility impact
+      description: Safety, lifecycle, versioning, compatibility, fallback, and performance implications.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence required
+      description: Tests, benchmarks, or spikes that must land with the decision.
