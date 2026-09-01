@@ -2,7 +2,7 @@
 
 verbose = "on"
 progress = false
-include_fragments = true
+include_fragments = "full"
 insecure = false
 max_retries = 2
 timeout = 20
