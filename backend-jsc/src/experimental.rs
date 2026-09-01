@@ -3,6 +3,8 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
+mod native_state;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::error::Error;
@@ -10,7 +12,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::thread::{self, ThreadId};
+
+pub use native_state::NativeObject;
 
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
@@ -128,6 +133,9 @@ struct Shared {
     context: Cell<Option<NonNull<sys::OpaqueContext>>>,
     roots: RefCell<RootRegistry>,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
+    native_states: RefCell<native_state::NativeRegistry>,
+    native_finalizers: Arc<native_state::FinalizerQueue>,
+    native_drop_panics: Cell<usize>,
 }
 
 struct HostFunctionEntry {
@@ -182,6 +190,7 @@ impl Runtime {
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
 
+        let native_finalizers = Arc::new(native_state::FinalizerQueue::new());
         Ok(Self {
             shared: Rc::new(Shared {
                 owner: thread::current().id(),
@@ -189,6 +198,9 @@ impl Runtime {
                 context: Cell::new(Some(context)),
                 roots: RefCell::new(RootRegistry::default()),
                 host_functions: RefCell::new(HashMap::new()),
+                native_states: RefCell::new(native_state::NativeRegistry::default()),
+                native_finalizers,
+                native_drop_panics: Cell::new(0),
             }),
         })
     }
@@ -203,14 +215,20 @@ impl Runtime {
         operation: impl for<'cx> FnOnce(&mut Context<'cx>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
+        self.shared.drain_native_finalizers();
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
-        let _active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
-        let mut scoped = Context {
-            shared: &self.shared,
-            raw: context,
-            _affine: PhantomData,
+        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        let result = {
+            let mut scoped = Context {
+                shared: &self.shared,
+                raw: context,
+                _affine: PhantomData,
+            };
+            operation(&mut scoped)
         };
-        Ok(operation(&mut scoped))
+        drop(active);
+        self.shared.drain_native_finalizers();
+        Ok(result)
     }
 
     /// Invalidates handles, releases roots, and destroys the JSC context.
@@ -241,11 +259,14 @@ impl Runtime {
             unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
         }
         self.shared.host_functions.borrow_mut().clear();
+        self.shared.close_native_finalizers();
 
         // SAFETY: `Runtime` owns the retained global context, all RustJSI roots have
         // been released, and the owning thread is performing the single release.
         unsafe { sys::global_context_release(context.as_ptr()) };
         self.shared.context.set(None);
+        let native_states = self.shared.native_states.borrow_mut().drain();
+        native_state::drop_states(&self.shared, native_states);
         self.shared.lifecycle.set(Lifecycle::Invalid);
         Ok(())
     }
@@ -707,6 +728,16 @@ impl Shared {
             Err(RuntimeError::Invalidated)
         }
     }
+
+    fn drain_native_finalizers(&self) {
+        let finalized = self.native_finalizers.take();
+        native_state::reclaim_finalized(self, finalized);
+    }
+
+    fn close_native_finalizers(&self) {
+        let finalized = self.native_finalizers.close();
+        native_state::reclaim_finalized(self, finalized);
+    }
 }
 
 impl Drop for RootLease {
@@ -1051,12 +1082,38 @@ fn value_to_raw_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     struct DropProbe(Rc<Cell<usize>>);
 
     impl Drop for DropProbe {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
+        }
+    }
+
+    struct ThreadDropProbe {
+        drops: Rc<Cell<usize>>,
+        threads: Rc<RefCell<Vec<ThreadId>>>,
+    }
+
+    impl Drop for ThreadDropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            self.threads.borrow_mut().push(thread::current().id());
+        }
+    }
+
+    struct NativeResource {
+        answer: u32,
+        _probe: ThreadDropProbe,
+    }
+
+    struct PanicDrop;
+
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            panic!("native-state destructor panic");
         }
     }
 
@@ -1234,5 +1291,186 @@ mod tests {
                 .unwrap();
             runtime.invalidate().unwrap();
         }
+    }
+
+    #[test]
+    fn native_state_is_collected_and_dropped_on_the_runtime_thread() {
+        let owner = thread::current().id();
+        let drops = Rc::new(Cell::new(0));
+        let threads = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new().unwrap();
+        let handle = runtime
+            .with_context(|context| {
+                context
+                    .install_native_state(
+                        "nativeResource",
+                        NativeResource {
+                            answer: 42,
+                            _probe: ThreadDropProbe {
+                                drops: Rc::clone(&drops),
+                                threads: Rc::clone(&threads),
+                            },
+                        },
+                    )
+                    .unwrap()
+            })
+            .unwrap();
+
+        runtime
+            .with_context(|context| {
+                let answer = context
+                    .with_native_state(&handle, |state| state.answer)
+                    .unwrap();
+                assert_eq!(answer, 42);
+            })
+            .unwrap();
+
+        let mut other = Runtime::new().unwrap();
+        other
+            .with_context(|context| {
+                assert_eq!(
+                    context.with_native_state(&handle, |_| ()).unwrap_err(),
+                    JsError::Runtime(RuntimeError::WrongRuntime)
+                );
+            })
+            .unwrap();
+
+        runtime
+            .with_context(|context| {
+                context
+                    .eval("delete nativeResource", "native-delete.js")
+                    .unwrap();
+            })
+            .unwrap();
+        collect_until(&mut runtime, &drops, 1);
+        runtime
+            .with_context(|context| {
+                assert_eq!(
+                    context.with_native_state(&handle, |_| ()).unwrap_err(),
+                    JsError::Runtime(RuntimeError::StaleHandle)
+                );
+            })
+            .unwrap();
+
+        assert_eq!(drops.get(), 1);
+        assert_eq!(threads.borrow().as_slice(), &[owner]);
+    }
+
+    #[test]
+    fn finalizer_queue_reclaims_bursts_without_user_drop_in_finalizer() {
+        const OBJECTS: usize = 512;
+
+        let owner = thread::current().id();
+        let drops = Rc::new(Cell::new(0));
+        let threads = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|context| {
+                for index in 0..OBJECTS {
+                    context
+                        .install_native_state(
+                            &format!("native{index}"),
+                            ThreadDropProbe {
+                                drops: Rc::clone(&drops),
+                                threads: Rc::clone(&threads),
+                            },
+                        )
+                        .unwrap();
+                }
+                context
+                    .eval(
+                        "for (let i = 0; i < 512; i++) delete this['native' + i]",
+                        "native-burst-delete.js",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+        collect_until(&mut runtime, &drops, OBJECTS);
+
+        assert_eq!(drops.get(), OBJECTS);
+        assert!(threads.borrow().iter().all(|thread| *thread == owner));
+    }
+
+    #[test]
+    fn invalidation_releases_live_native_state_on_the_runtime_thread() {
+        let owner = thread::current().id();
+        let drops = Rc::new(Cell::new(0));
+        let threads = Rc::new(RefCell::new(Vec::new()));
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|context| {
+                context
+                    .install_native_state(
+                        "liveResource",
+                        ThreadDropProbe {
+                            drops: Rc::clone(&drops),
+                            threads: Rc::clone(&threads),
+                        },
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+        assert_eq!(threads.borrow().as_slice(), &[owner]);
+    }
+
+    #[test]
+    fn contains_native_state_destructor_panics_outside_jsc() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|context| {
+                context
+                    .install_native_state("panicState", PanicDrop)
+                    .unwrap();
+                context
+                    .eval("delete panicState", "native-panic-delete.js")
+                    .unwrap();
+                context.collect_garbage().unwrap();
+            })
+            .unwrap();
+
+        for _ in 0..32 {
+            if runtime.shared.native_drop_panics.get() == 1 {
+                break;
+            }
+            runtime
+                .with_context(|context| {
+                    context.collect_garbage().unwrap();
+                    context
+                        .eval(
+                            "Array.from({ length: 4096 }, (_, i) => ({ i }))",
+                            "native-panic-gc-churn.js",
+                        )
+                        .unwrap();
+                })
+                .unwrap();
+        }
+        assert_eq!(runtime.shared.native_drop_panics.get(), 1);
+        runtime.invalidate().unwrap();
+    }
+
+    fn collect_until(runtime: &mut Runtime, drops: &Cell<usize>, expected: usize) {
+        for _ in 0..32 {
+            runtime
+                .with_context(|context| {
+                    context.collect_garbage().unwrap();
+                    context
+                        .eval(
+                            "Array.from({ length: 4096 }, (_, i) => ({ i }))",
+                            "native-gc-churn.js",
+                        )
+                        .unwrap();
+                })
+                .unwrap();
+            if drops.get() == expected {
+                return;
+            }
+        }
+        panic!(
+            "expected {expected} native-state drops, observed {}",
+            drops.get()
+        );
     }
 }

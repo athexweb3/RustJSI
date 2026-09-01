@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::ffi::{c_int, c_uint};
+use std::ffi::{c_int, c_uint, c_void};
 
+pub(crate) enum OpaqueClass {}
 pub(crate) enum OpaqueContext {}
 pub(crate) enum OpaqueString {}
 pub(crate) enum OpaqueValue {}
 
+pub(crate) type ClassRef = *mut OpaqueClass;
 pub(crate) type ContextRef = *const OpaqueContext;
 pub(crate) type GlobalContextRef = *mut OpaqueContext;
 pub(crate) type StringRef = *mut OpaqueString;
@@ -23,8 +25,41 @@ pub(crate) type FunctionCallback = Option<
     ) -> ValueRef,
 >;
 
+pub(crate) type FinalizeCallback = Option<unsafe extern "C" fn(ObjectRef)>;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct ClassDefinition {
+    pub(crate) version: c_int,
+    pub(crate) attributes: c_uint,
+    pub(crate) class_name: *const c_void,
+    pub(crate) parent_class: ClassRef,
+    pub(crate) static_values: *const c_void,
+    pub(crate) static_functions: *const c_void,
+    pub(crate) initialize: *const c_void,
+    pub(crate) finalize: FinalizeCallback,
+    pub(crate) has_property: *const c_void,
+    pub(crate) get_property: *const c_void,
+    pub(crate) set_property: *const c_void,
+    pub(crate) delete_property: *const c_void,
+    pub(crate) get_property_names: *const c_void,
+    pub(crate) call_as_function: *const c_void,
+    pub(crate) call_as_constructor: *const c_void,
+    pub(crate) has_instance: *const c_void,
+    pub(crate) convert_to_type: *const c_void,
+}
+
 #[link(name = "JavaScriptCore", kind = "framework")]
 unsafe extern "C" {
+    #[link_name = "kJSClassDefinitionEmpty"]
+    pub(crate) static CLASS_DEFINITION_EMPTY: ClassDefinition;
+
+    #[link_name = "JSClassCreate"]
+    pub(crate) fn class_create(definition: *const ClassDefinition) -> ClassRef;
+
+    #[link_name = "JSClassRelease"]
+    pub(crate) fn class_release(class: ClassRef);
+
     #[link_name = "JSGlobalContextCreate"]
     pub(crate) fn global_context_create(class: *mut ()) -> GlobalContextRef;
 
@@ -109,6 +144,19 @@ unsafe extern "C" {
         name: StringRef,
         callback: FunctionCallback,
     ) -> ObjectRef;
+
+    #[link_name = "JSObjectMake"]
+    pub(crate) fn object_make(
+        context: ContextRef,
+        class: ClassRef,
+        private_data: *mut c_void,
+    ) -> ObjectRef;
+
+    #[link_name = "JSObjectGetPrivate"]
+    pub(crate) fn object_get_private(object: ObjectRef) -> *mut c_void;
+
+    #[link_name = "JSObjectSetPrivate"]
+    pub(crate) fn object_set_private(object: ObjectRef, private_data: *mut c_void) -> bool;
 
     #[link_name = "JSObjectSetProperty"]
     pub(crate) fn object_set_property(
