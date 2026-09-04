@@ -49,6 +49,19 @@ unwinding destructor panic does not skip the remaining callbacks or engine
 release. `Runtime::callback_drop_panics()` reports contained capture-drop
 panics. Publication rollback follows the same cleanup path.
 
+`with_native_state` also takes a private operation lease before releasing the
+registry borrow. Retirement invalidates the handle immediately; an admitted
+operation can finish reading the old state even if its slot is reused. Final
+lease destruction runs on the runtime thread with panic containment. A user
+operation panic still propagates and doesn't roll back mutations inside `T`.
+Only shared `&T` access is exposed, not general same-runtime reentry or mutable
+object dispatch. The 4,096-entry limit bounds registered states, not bytes or
+retired states still held by active operations.
+
+Native-wrapper publication uses a temporary JSC root through setters and
+exception conversion. Failed publication captures the exception before dropping
+Rust state, then detaches the wrapper token during rollback.
+
 Panic containment cannot recover abort-mode panics, aborting hooks, or double
 panics during unwinding. If destroying a caught panic payload itself panics,
 the second payload is deliberately leaked to avoid another destructor call.
@@ -59,3 +72,8 @@ not tail latency or application throughput. Each batch uses separate roots to
 one JS object. Drop includes Rust lease/vector deallocation; drain includes host
 entry, queue polling and JSC unprotect calls. Creation and protection are outside
 the timers, and unrelated live roots remain installed during each case.
+
+The `native_access` bench measures typed state reads inside one admitted entry.
+It includes identity checks and the operation lease but excludes wrapper
+creation, JS calls, retirement and finalizer work. Results are run means, not
+tail-latency or application-performance claims.

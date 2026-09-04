@@ -31,6 +31,11 @@ name = "root_release"
 harness = false
 required-features = ["experimental-jsc"]
 
+[[bench]]
+name = "native_access"
+harness = false
+required-features = ["experimental-jsc"]
+
 [lints.rust]
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
