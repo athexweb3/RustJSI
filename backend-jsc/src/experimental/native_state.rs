@@ -376,8 +376,83 @@ fn closed_sentinel() -> *mut FinalizerToken {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Runtime;
     use super::*;
+    use std::cell::Cell;
     use std::mem::{align_of, size_of};
+
+    struct DropProbe {
+        value: usize,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn native_access_releases_the_registry_borrow_before_user_code() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", 42_u32).unwrap();
+                cx.with_native_state(&handle, |state| {
+                    assert_eq!(*state, 42);
+                    assert!(shared.native_states.try_borrow_mut().is_ok());
+                })
+                .unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn active_operation_keeps_retired_state_alive_after_slot_reuse() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        DropProbe {
+                            value: 41,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                cx.with_native_state(&handle, |state| {
+                    // Simulate retirement by a reentrant host callback, without
+                    // introducing a public same-runtime reentry API in this test.
+                    let removed = shared.native_states.borrow_mut().remove(handle.id);
+                    drop_state(&shared, removed);
+                    assert_eq!(drops.get(), 0);
+                    let replacement = shared.native_states.borrow_mut().insert(99_u32).unwrap();
+                    assert_eq!(replacement.slot, handle.id.slot);
+                    assert_ne!(replacement.generation, handle.id.generation);
+                    assert!(
+                        shared
+                            .native_states
+                            .borrow()
+                            .get::<DropProbe>(handle.id)
+                            .is_none()
+                    );
+                    assert_eq!(state.value, 41);
+                })
+                .unwrap();
+                assert_eq!(drops.get(), 1);
+                assert_eq!(
+                    cx.with_native_state(&handle, |_| ()).unwrap_err(),
+                    JsError::Runtime(RuntimeError::StaleHandle)
+                );
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
 
     #[test]
     fn class_definition_matches_64_bit_jsc_layout() {
