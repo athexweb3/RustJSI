@@ -41,6 +41,11 @@ name = "local_scopes"
 harness = false
 required-features = ["experimental-jsc"]
 
+[[bench]]
+name = "callback_admission"
+harness = false
+required-features = ["experimental-jsc"]
+
 [lints.rust]
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
