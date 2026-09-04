@@ -87,8 +87,7 @@ impl RuntimeIdentity {
                 current.checked_add(1)
             })
             .map_err(|_| IdentityError::RuntimeIdExhausted)?;
-        let runtime_id =
-            RuntimeId(NonZeroU64::new(raw).expect("runtime identity allocator starts at one"));
+        let runtime_id = RuntimeId(NonZeroU64::new(raw).ok_or(IdentityError::RuntimeIdExhausted)?);
         Ok(Self {
             runtime_id,
             next_epoch: NonZeroU64::new(1),
