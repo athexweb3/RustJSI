@@ -5,6 +5,8 @@
 use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 #[cfg(test)]
+mod callback_budget_tests;
+#[cfg(test)]
 mod cleanup_tests;
 mod common;
 mod external_buffer;
@@ -61,6 +63,7 @@ thread_local! {
 }
 
 const INLINE_ARGUMENTS: usize = 8;
+const MAX_HOST_FUNCTIONS: usize = 4096;
 const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -180,6 +183,8 @@ pub enum RuntimeError {
     PersistentRootLimitReached,
     /// No local result reservation is available within the configured limit.
     LocalRootLimitReached,
+    /// The experimental limit of 4096 retained host functions was reached.
+    HostFunctionLimitReached,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -521,9 +526,13 @@ impl<'cx> Context<'cx> {
 
     /// Installs a stateful Rust callback as a global JavaScript function.
     ///
+    /// At most 4096 registrations are retained per runtime, independently of
+    /// root limits. Dropping a handle or overwriting its global does not release
+    /// its registration. Failed publication returns its slot to the registry.
+    ///
     /// # Errors
     ///
-    /// Returns a lifecycle, backend, or JavaScript publication error.
+    /// Returns a lifecycle, registration-limit, backend, or publication error.
     pub fn install_host_function<F>(
         &mut self,
         name: &str,
@@ -533,6 +542,9 @@ impl<'cx> Context<'cx> {
         F: for<'call> Fn(Call<'call>) -> Result<Value, HostError> + 'static,
     {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
+        if self.shared.host_functions.borrow().len() >= MAX_HOST_FUNCTIONS {
+            return Err(JsError::Runtime(RuntimeError::HostFunctionLimitReached));
+        }
         let name = JsString::new(name)?;
 
         // SAFETY: The callback has the exact JSC C ABI and contains all unwinding.
@@ -914,6 +926,7 @@ impl fmt::Display for RuntimeError {
             Self::ScopeDepthExceeded => "Context scope depth limit exceeded",
             Self::PersistentRootLimitReached => "persistent root slot limit reached",
             Self::LocalRootLimitReached => "local result root limit reached",
+            Self::HostFunctionLimitReached => "host function registration limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)

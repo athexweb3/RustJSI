@@ -85,6 +85,20 @@ unwinding destructor panic does not skip the remaining callbacks or engine
 release. `Runtime::callback_drop_panics()` reports contained capture-drop
 panics. Publication rollback follows the same cleanup path.
 
+Each runtime retains at most 4,096 host-function registrations. Further
+installation fails before creating a JSC function or running a global setter.
+Failed publication frees its registration; dropping a `HostFunction` handle or
+overwriting its global does not. Existing callbacks remain callable at the cap.
+This experimental count limit is separate from `RootLimits`; it does not bound
+capture sizes or the JavaScript heap. Unregistered callback arguments follow
+normal Rust drop behavior on rejection.
+
+The `callback_admission` bench measures registration, rejection at the cap and
+invalidation with empty captures. Registration includes name conversion, map
+growth, JSC allocation/protection and global assignment. Rejection includes the
+result check; invalidation includes engine release. Results are batch means,
+not tail latency or bounds for callbacks with arbitrary capture destructors.
+
 `with_native_state` also takes a private operation lease before releasing the
 registry borrow. Retirement invalidates the handle immediately; an admitted
 operation can finish reading the old state even if its slot is reused. Final
