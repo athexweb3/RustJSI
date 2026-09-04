@@ -5,6 +5,8 @@
 use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 #[cfg(test)]
+mod argument_tests;
+#[cfg(test)]
 mod callback_budget_tests;
 #[cfg(test)]
 mod cleanup_tests;
@@ -223,6 +225,10 @@ struct Shared {
     callback_drop_panics: Cell<usize>,
     #[cfg(test)]
     context_local_roots: Cell<usize>,
+    #[cfg(test)]
+    argument_roots: Cell<usize>,
+    #[cfg(test)]
+    argument_gc: Cell<bool>,
     external_buffers: Arc<external_buffer::ExternalLedger>,
 }
 
@@ -336,6 +342,10 @@ impl Runtime {
                 callback_drop_panics: Cell::new(0),
                 #[cfg(test)]
                 context_local_roots: Cell::new(0),
+                #[cfg(test)]
+                argument_roots: Cell::new(0),
+                #[cfg(test)]
+                argument_gc: Cell::new(false),
                 external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
         })
