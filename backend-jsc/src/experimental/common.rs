@@ -507,6 +507,9 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::LocalRootLimitReached => {
             BackendError::Failure("local result root limit reached")
         }
+        RuntimeError::HostFunctionLimitReached => {
+            BackendError::Failure("host function registration limit reached")
+        }
     }
 }
 
