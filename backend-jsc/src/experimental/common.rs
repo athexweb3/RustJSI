@@ -11,14 +11,40 @@ use super::{
 };
 use crate::sys;
 use rustjsi_backend::{
-    BACKEND_CONTRACT_VERSION, BackendBase, BackendError, BackendException, BackendManifest,
-    BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope, OwnershipTransferError,
-    RootBackend, RootScope, ValueKind,
+    BACKEND_CONTRACT_VERSION, BackendBase, BackendError, BackendException, BackendFamily,
+    BackendManifest, BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope,
+    OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
+
+/// Type family for host-authorized JSC entries and scopes.
+///
+/// External backing does not imply stable borrowed-byte access:
+///
+/// ```compile_fail
+/// use rustjsi_backend::{BackendFamily, BorrowedBufferScope};
+/// use rustjsi_backend_jsc::JscBackendFamily;
+/// fn require_bytes<F: BackendFamily>()
+/// where for<'scope> F::Scope<'scope>: BorrowedBufferScope {}
+/// require_bytes::<JscBackendFamily>();
+/// ```
+#[derive(Debug)]
+pub enum JscBackendFamily {}
+
+impl BackendFamily for JscBackendFamily {
+    type Backend<'entry> = JscBackend<'entry>;
+    type Scope<'scope> = JscScope<'scope, 'scope>;
+
+    fn with_scope<R>(
+        backend: &mut JscBackend<'_>,
+        operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> R,
+    ) -> Result<R, BackendError> {
+        Ok(operation(backend.open_scope()?))
+    }
+}
 
 /// Engine mechanics exposed only during a host-authorized JSC entry.
 ///
