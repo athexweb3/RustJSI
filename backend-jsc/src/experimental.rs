@@ -4,6 +4,8 @@
 
 use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
+#[cfg(test)]
+mod cleanup_tests;
 mod common;
 mod external_buffer;
 mod local_budget;
