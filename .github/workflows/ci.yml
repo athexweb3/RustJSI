@@ -143,6 +143,9 @@ jobs:
       - name: Test system JavaScriptCore integration
         run: cargo test -p rustjsi-backend-jsc --features experimental-jsc --locked
 
+      - name: Validate boundary benchmark results
+        run: cargo bench -p rustjsi-backend-jsc --features experimental-jsc --bench boundary --locked
+
   doc:
     name: doc
     runs-on: ubuntu-latest

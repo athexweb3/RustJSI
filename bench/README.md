@@ -36,6 +36,11 @@ The callback comparison is a lower-bound comparison, not equal setup work:
 the direct path reuses arguments while RustJSI translates them per call.
 The scalar comparison has closer operation parity, but still excludes host
 entry from its timer. Neither comparison measures application throughput.
+Callback and scalar results are checked against `42` before and after each
+timed workload. These checks do not validate every timed iteration. The direct
+callback function has an explicit root outside the timer; RAII releases the
+root before its context, including if a validation assertion unwinds.
+macOS CI checks successful benchmark execution, not timing thresholds.
 
 ## Reading the report
 

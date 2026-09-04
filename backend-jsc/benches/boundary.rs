@@ -38,6 +38,8 @@ fn main() {
                 })
                 .expect("install host function");
             let arguments = [Value::Number(20.0), Value::Number(22.0)];
+            let result = context.call(&add, &arguments).expect("preflight call");
+            assert_answer(context.number(&result).expect("read preflight result"));
 
             for _ in 0..WARMUP {
                 black_box(context.call(&add, &arguments).expect("warmup call"));
@@ -49,6 +51,8 @@ fn main() {
             }
             let elapsed = started.elapsed();
             rustjsi = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(ITERATIONS);
+            let result = context.call(&add, &arguments).expect("postflight call");
+            assert_answer(context.number(&result).expect("read postflight result"));
         })
         .expect("enter JSC runtime");
 
@@ -56,6 +60,8 @@ fn main() {
     runtime
         .with_backend(|backend| {
             let scope = backend.open_scope().expect("open common JSC scope");
+            let value = scope.number(42.0).expect("preflight number");
+            assert_answer(scope.as_number(value).expect("read preflight number"));
             for _ in 0..WARMUP {
                 let value = scope.number(black_box(42.0)).expect("make number");
                 black_box(scope.as_number(value).expect("read number"));
@@ -68,6 +74,8 @@ fn main() {
             }
             let elapsed = started.elapsed();
             common_scalar = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(ITERATIONS);
+            let value = scope.number(42.0).expect("postflight number");
+            assert_answer(scope.as_number(value).expect("read postflight number"));
         })
         .expect("enter common JSC backend");
 
@@ -84,6 +92,14 @@ fn main() {
     println!(
         "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
         common_scalar / direct_scalar
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_answer(value: f64) {
+    assert!(
+        (value - 42.0).abs() < f64::EPSILON,
+        "wrong benchmark result: {value}"
     );
 }
 
@@ -146,18 +162,66 @@ mod raw {
 
         #[link_name = "JSValueToNumber"]
         fn to_number(context: Context, value: Value, exception: *mut Value) -> f64;
+
+        #[link_name = "JSValueProtect"]
+        fn protect(context: Context, value: Value);
+
+        #[link_name = "JSValueUnprotect"]
+        fn unprotect(context: Context, value: Value);
+    }
+
+    struct OwnedContext(GlobalContext);
+
+    impl OwnedContext {
+        fn new() -> Self {
+            // SAFETY: A null class requests the default global. Check before use.
+            let context = unsafe { context_create(ptr::null_mut()) };
+            assert!(!context.is_null(), "create direct JSC context");
+            Self(context)
+        }
+    }
+
+    impl Drop for OwnedContext {
+        fn drop(&mut self) {
+            // SAFETY: This guard uniquely owns one successful creation on this
+            // thread. All borrowing function guards have already been dropped.
+            unsafe { context_release(self.0) };
+        }
+    }
+
+    struct RootedFunction<'context> {
+        context: &'context OwnedContext,
+        function: Object,
+    }
+
+    impl<'context> RootedFunction<'context> {
+        fn new(context: &'context OwnedContext) -> Self {
+            // SAFETY: The context is live and raw_add matches the synchronous ABI.
+            let function = unsafe { make_function(context.0, ptr::null_mut(), Some(raw_add)) };
+            assert!(!function.is_null(), "create direct JSC function");
+            // SAFETY: Root immediately, before further engine work. This guard
+            // balances the protection before its borrowed context can be released.
+            unsafe { protect(context.0, function) };
+            Self { context, function }
+        }
+    }
+
+    impl Drop for RootedFunction<'_> {
+        fn drop(&mut self) {
+            // SAFETY: The owning context borrow is still live on this thread,
+            // and this non-cloneable guard owns exactly one protection.
+            unsafe { unprotect(self.context.0, self.function) };
+        }
     }
 
     pub(super) fn measure(warmup: u32, iterations: u32) -> f64 {
-        // SAFETY: The default global class is requested and the returned context is
-        // checked before any use.
-        let context = unsafe { context_create(ptr::null_mut()) };
-        assert!(!context.is_null(), "create direct JSC context");
-        // SAFETY: `raw_add` matches JSC's synchronous callback ABI.
-        let function = unsafe { make_function(context, ptr::null_mut(), Some(raw_add)) };
-        assert!(!function.is_null(), "create direct JSC function");
+        let owner = OwnedContext::new();
+        let rooted = RootedFunction::new(&owner);
+        let context = owner.0;
+        let function = rooted.function;
         // SAFETY: Both primitive values are created in the live context.
         let arguments = unsafe { [make_number(context, 20.0), make_number(context, 22.0)] };
+        check_result(context, call(context, function, &arguments));
 
         for _ in 0..warmup {
             black_box(call(context, function, &arguments));
@@ -168,16 +232,14 @@ mod raw {
         }
         let elapsed = started.elapsed();
 
-        // SAFETY: This balances the single successful context creation after all
-        // synchronous calls have returned.
-        unsafe { context_release(context) };
+        check_result(context, call(context, function, &arguments));
         elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
     }
 
     pub(super) fn measure_scalar(warmup: u32, iterations: u32) -> f64 {
-        // SAFETY: The default global class is requested and checked before use.
-        let context = unsafe { context_create(ptr::null_mut()) };
-        assert!(!context.is_null(), "create direct JSC scalar context");
+        let owner = OwnedContext::new();
+        let context = owner.0;
+        super::assert_answer(scalar_round_trip(context, 42.0));
 
         for _ in 0..warmup {
             black_box(scalar_round_trip(context, black_box(42.0)));
@@ -188,9 +250,22 @@ mod raw {
         }
         let elapsed = started.elapsed();
 
-        // SAFETY: This balances the successful context creation after all calls.
-        unsafe { context_release(context) };
+        super::assert_answer(scalar_round_trip(context, 42.0));
         elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
+    fn check_result(context: Context, value: Value) {
+        assert!(!value.is_null(), "direct call returned null");
+        // SAFETY: The synchronous call just returned this value in its live context.
+        assert!(
+            unsafe { is_number(context, value) },
+            "direct call returned a non-number"
+        );
+        let mut exception = ptr::null();
+        // SAFETY: The strict check avoids coercion; capture the exception output.
+        let number = unsafe { to_number(context, value, &raw mut exception) };
+        assert!(exception.is_null(), "direct result conversion threw");
+        super::assert_answer(number);
     }
 
     fn scalar_round_trip(context: Context, number: f64) -> f64 {

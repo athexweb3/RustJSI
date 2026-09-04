@@ -20,6 +20,10 @@ thread-independent C deallocator. Finalizers enqueue opaque generational tokens
 only; they do not enter JavaScriptCore, lock, allocate, or destroy user state.
 Rust state is reclaimed later on the runtime-owning thread.
 
+The direct boundary benchmark has separate raw JSC bindings. Its function-root
+guard borrows an owning context guard so unprotect precedes context release on
+return or unwind. Result validation is outside the measurement timers.
+
 The common JSC adapter exists only inside a host-authorized entry. GC-managed
 values returned through its safe scope API are protected and registered until
 scope teardown, including when Rust moves the handle itself to heap storage.
