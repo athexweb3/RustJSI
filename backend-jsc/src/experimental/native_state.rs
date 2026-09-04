@@ -42,7 +42,45 @@ pub(super) struct NativeRegistry {
 struct NativeSlot {
     generation: u64,
     type_id: Option<TypeId>,
-    value: Option<Box<dyn Any>>,
+    value: Option<Rc<dyn Any>>,
+}
+
+struct NativeLease<'a, T: 'static> {
+    shared: &'a Shared,
+    value: Option<Rc<T>>,
+}
+
+struct PublicationRoot {
+    context: NonNull<sys::OpaqueContext>,
+    object: NonNull<sys::OpaqueValue>,
+}
+
+impl PublicationRoot {
+    fn new(context: NonNull<sys::OpaqueContext>, object: NonNull<sys::OpaqueValue>) -> Self {
+        // SAFETY: The caller just created this object inside its active Context.
+        // Keep it rooted through setters, exception conversion and rollback.
+        unsafe { sys::value_protect(context.as_ptr(), object.as_ptr()) };
+        Self { context, object }
+    }
+}
+
+impl Drop for PublicationRoot {
+    fn drop(&mut self) {
+        // SAFETY: This stack-local guard cannot outlive the installation entry;
+        // its protection is released once, before the Context or host entry ends.
+        unsafe { sys::value_unprotect(self.context.as_ptr(), self.object.as_ptr()) };
+    }
+}
+
+impl<T: 'static> Drop for NativeLease<'_, T> {
+    fn drop(&mut self) {
+        // Retirement can leave this operation as the last owner, including on
+        // unwind. Contain the destructor separately from the user's operation.
+        drop_state(
+            self.shared,
+            self.value.take().map(|value| value as Rc<dyn Any>),
+        );
+    }
 }
 
 pub(super) struct FinalizerQueue {
@@ -126,7 +164,7 @@ impl NativeRegistry {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot];
             entry.type_id = Some(TypeId::of::<T>());
-            entry.value = Some(Box::new(value));
+            entry.value = Some(Rc::new(value));
             return Ok(NativeId {
                 slot,
                 generation: entry.generation,
@@ -137,7 +175,7 @@ impl NativeRegistry {
         self.slots.push(NativeSlot {
             generation: 1,
             type_id: Some(TypeId::of::<T>()),
-            value: Some(Box::new(value)),
+            value: Some(Rc::new(value)),
         });
         Ok(NativeId {
             slot,
@@ -145,15 +183,15 @@ impl NativeRegistry {
         })
     }
 
-    fn get<T: 'static>(&self, id: NativeId) -> Option<&T> {
+    fn get<T: 'static>(&self, id: NativeId) -> Option<Rc<T>> {
         let slot = self.slots.get(id.slot)?;
         if slot.generation != id.generation || slot.type_id != Some(TypeId::of::<T>()) {
             return None;
         }
-        slot.value.as_ref()?.downcast_ref()
+        Rc::clone(slot.value.as_ref()?).downcast().ok()
     }
 
-    fn remove(&mut self, id: NativeId) -> Option<Box<dyn Any>> {
+    fn remove(&mut self, id: NativeId) -> Option<Rc<dyn Any>> {
         let slot = self.slots.get_mut(id.slot)?;
         if slot.generation != id.generation {
             return None;
@@ -168,7 +206,7 @@ impl NativeRegistry {
         Some(value)
     }
 
-    pub(super) fn drain(&mut self) -> Vec<Box<dyn Any>> {
+    pub(super) fn drain(&mut self) -> Vec<Rc<dyn Any>> {
         let mut values = Vec::new();
         self.free.clear();
         self.live = 0;
@@ -205,7 +243,7 @@ impl Context<'_> {
         let id = match inserted {
             Ok(id) => id,
             Err(state) => {
-                drop_state(self.shared, Some(Box::new(state)));
+                drop_state(self.shared, Some(Rc::new(state)));
                 return Err(JsError::Backend("native-state capacity exceeded"));
             }
         };
@@ -242,6 +280,7 @@ impl Context<'_> {
             drop_state(self.shared, state);
             return Err(JsError::Backend("JavaScriptCore object creation failed"));
         };
+        let _publication_root = PublicationRoot::new(self.raw, object);
 
         let property = match JsString::new(name) {
             Ok(property) => property,
@@ -272,10 +311,9 @@ impl Context<'_> {
             );
         }
         if !exception.is_null() {
+            let exception = super::exception_to_owned(self.raw, exception);
             self.rollback_native_object(object, token, id);
-            return Err(JsError::Exception(super::exception_to_owned(
-                self.raw, exception,
-            )));
+            return Err(JsError::Exception(exception));
         }
 
         Ok(NativeObject {
@@ -286,16 +324,37 @@ impl Context<'_> {
         })
     }
 
-    /// Borrows typed Rust state while its JavaScript wrapper remains live.
+    /// Leases live typed Rust state for one synchronous operation.
+    ///
+    /// The registry borrow ends before `operation` starts. Retirement rejects
+    /// future accesses but cannot destroy state used by an admitted operation.
+    /// Only shared access is exposed; interior-mutability rules belong to `T`.
+    ///
+    /// ```compile_fail
+    /// use rustjsi_backend_jsc::Runtime;
+    /// let mut runtime = Runtime::new().unwrap();
+    /// runtime.with_context(|cx| {
+    ///     let object = cx.install_native_state("object", String::from("state")).unwrap();
+    ///     let borrowed = cx.with_native_state(&object, |state| state).unwrap();
+    ///     println!("{borrowed}");
+    /// }).unwrap();
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead, foreign, collected, or type-invalid handle.
+    /// Returns an error for an inactive runtime or dead, foreign, collected, or
+    /// type-invalid handle.
+    ///
+    /// # Panics
+    ///
+    /// Propagates an `operation` panic after releasing its lease. An unwinding
+    /// state-destructor panic is contained and counted separately.
     pub fn with_native_state<T: 'static, R>(
         &mut self,
         handle: &NativeObject<T>,
         operation: impl FnOnce(&T) -> R,
     ) -> Result<R, JsError> {
+        self.shared.ensure_active().map_err(JsError::Runtime)?;
         let runtime = handle
             .runtime
             .upgrade()
@@ -304,11 +363,19 @@ impl Context<'_> {
             return Err(JsError::Runtime(RuntimeError::WrongRuntime));
         }
 
-        let states = self.shared.native_states.borrow();
-        let state = states
+        let state = self
+            .shared
+            .native_states
+            .borrow()
             .get(handle.id)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
-        Ok(operation(state))
+        let lease = NativeLease {
+            shared: self.shared,
+            value: Some(state),
+        };
+        Ok(operation(
+            lease.value.as_deref().expect("live operation lease"),
+        ))
     }
 
     fn rollback_native_object(
@@ -340,13 +407,13 @@ pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken)
     }
 }
 
-pub(super) fn drop_states(shared: &Shared, states: Vec<Box<dyn Any>>) {
+pub(super) fn drop_states(shared: &Shared, states: Vec<Rc<dyn Any>>) {
     for state in states {
         drop_state(shared, Some(state));
     }
 }
 
-fn drop_state(shared: &Shared, state: Option<Box<dyn Any>>) {
+fn drop_state(shared: &Shared, state: Option<Rc<dyn Any>>) {
     if super::contain_unwind(std::panic::AssertUnwindSafe(|| drop(state))).is_err() {
         shared
             .native_drop_panics
@@ -376,8 +443,293 @@ fn closed_sentinel() -> *mut FinalizerToken {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Runtime;
     use super::*;
+    use std::cell::Cell;
     use std::mem::{align_of, size_of};
+
+    struct DropProbe {
+        value: usize,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[test]
+    fn native_access_releases_the_registry_borrow_before_user_code() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", 42_u32).unwrap();
+                cx.with_native_state(&handle, |state| {
+                    assert_eq!(*state, 42);
+                    assert!(shared.native_states.try_borrow_mut().is_ok());
+                })
+                .unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn active_operation_keeps_retired_state_alive_after_slot_reuse() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        DropProbe {
+                            value: 41,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                cx.with_native_state(&handle, |state| {
+                    // Simulate retirement by a reentrant host callback, without
+                    // introducing a public same-runtime reentry API in this test.
+                    let removed = shared.native_states.borrow_mut().remove(handle.id);
+                    drop_state(&shared, removed);
+                    assert_eq!(drops.get(), 0);
+                    let replacement = shared.native_states.borrow_mut().insert(99_u32).unwrap();
+                    assert_eq!(replacement.slot, handle.id.slot);
+                    assert_ne!(replacement.generation, handle.id.generation);
+                    assert!(
+                        shared
+                            .native_states
+                            .borrow()
+                            .get::<DropProbe>(handle.id)
+                            .is_none()
+                    );
+                    assert_eq!(state.value, 41);
+                })
+                .unwrap();
+                assert_eq!(drops.get(), 1);
+                assert_eq!(
+                    cx.with_native_state(&handle, |_| ()).unwrap_err(),
+                    JsError::Runtime(RuntimeError::StaleHandle)
+                );
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn publication_error_is_captured_before_state_destruction() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime.with_context(|cx| {
+            let observed_drops = Rc::clone(&drops);
+            cx.install_host_function("stateWasDropped", move |_| {
+                Ok(super::super::Value::Boolean(observed_drops.get() != 0))
+            }).unwrap();
+            cx.eval("Object.defineProperty(globalThis, 'rejectState', { set(value) { globalThis.savedRejectedState = value; throw { toString() { return stateWasDropped() ? 'changed after cleanup' : 'publication failed'; } }; } })", "native-setter.js").unwrap();
+            let error = cx.install_native_state("rejectState", DropProbe {
+                value: 42,
+                drops: Rc::clone(&drops),
+            }).unwrap_err();
+            assert!(matches!(error, JsError::Exception(ref error) if error.message().contains("publication failed")), "{error}");
+            assert_eq!(drops.get(), 1);
+            assert_eq!(shared.native_states.borrow().live, 0);
+            cx.eval("delete savedRejectedState", "delete-rejected-state.js").unwrap();
+            cx.collect_garbage().unwrap();
+        }).unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn operation_panic_releases_lease_without_rolling_back_state() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", Cell::new(1)).unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.with_native_state(&handle, |state| {
+                        state.set(2);
+                        panic!("operation failed");
+                    })
+                    .unwrap();
+                }));
+                assert!(result.is_err());
+                assert_eq!(cx.with_native_state(&handle, Cell::get).unwrap(), 2);
+                let registry = cx.shared.native_states.borrow();
+                assert_eq!(
+                    Rc::strong_count(registry.slots[handle.id.slot].value.as_ref().unwrap()),
+                    1
+                );
+            })
+            .unwrap();
+    }
+
+    struct PanicDropProbe {
+        shared: Weak<Shared>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(
+                self.shared
+                    .upgrade()
+                    .unwrap()
+                    .native_states
+                    .try_borrow_mut()
+                    .is_ok()
+            );
+            panic!("state destructor failed");
+        }
+    }
+
+    #[test]
+    fn retiring_during_unwind_contains_last_lease_destructor_panic() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        PanicDropProbe {
+                            shared: Rc::downgrade(&shared),
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.with_native_state(&handle, |_| {
+                        let removed = shared.native_states.borrow_mut().remove(handle.id);
+                        drop_state(&shared, removed);
+                        assert_eq!(drops.get(), 0);
+                        panic!("operation failed");
+                    })
+                    .unwrap();
+                }));
+                let payload = result.expect_err("operation must still unwind");
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"operation failed"));
+                assert_eq!(drops.get(), 1);
+                assert_eq!(shared.native_drop_panics.get(), 1);
+                let value = cx.eval("42", "after-unwind.js").unwrap();
+                assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn queued_finalizer_retirement_preserves_the_active_operation() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        DropProbe {
+                            value: 42,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                cx.with_native_state(&handle, |state| {
+                    // Inject a finalizer signal on a worker to make retirement timing
+                    // deterministic. No engine API or application state moves there.
+                    let token = Box::new(FinalizerToken {
+                        queue: Arc::clone(&shared.native_finalizers),
+                        id: handle.id,
+                        next: AtomicPtr::new(ptr::null_mut()),
+                    });
+                    std::thread::spawn(move || {
+                        let queue = Arc::clone(&token.queue);
+                        // SAFETY: This thread transfers its uniquely owned test token
+                        // to the queue, exactly as the engine finalizer does.
+                        unsafe { queue.push(Box::into_raw(token)) };
+                    })
+                    .join()
+                    .unwrap();
+                    shared.drain_native_finalizers();
+                    assert_eq!(shared.native_states.borrow().live, 0);
+                    assert_eq!(drops.get(), 0);
+                    assert_eq!(state.value, 42);
+                })
+                .unwrap();
+                assert_eq!(drops.get(), 1);
+            })
+            .unwrap();
+        // The real wrapper's later signal must be stale and harmless.
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn access_rejects_wrong_type_and_draining_runtime() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", 42_u32).unwrap();
+                let forged = NativeObject::<String> {
+                    runtime: Rc::downgrade(&shared),
+                    id: handle.id,
+                    _type: PhantomData,
+                    _affine: PhantomData,
+                };
+                assert_eq!(
+                    cx.with_native_state(&forged, |_| panic!("wrong type ran"))
+                        .unwrap_err(),
+                    JsError::Runtime(RuntimeError::StaleHandle)
+                );
+                shared.gate.request_drain();
+                assert_eq!(
+                    cx.with_native_state(&handle, |_| panic!("draining access ran"))
+                        .unwrap_err(),
+                    JsError::Runtime(RuntimeError::Invalidated)
+                );
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn last_native_lease_defers_its_persistent_root_to_host_maintenance() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "state-owned-root.js").unwrap();
+                let root = cx.persist(&value).unwrap();
+                let handle = cx.install_native_state("resource", root).unwrap();
+                cx.with_native_state(&handle, |_| {
+                    let removed = shared.native_states.borrow_mut().remove(handle.id);
+                    drop_state(&shared, removed);
+                    assert!(shared.roots.borrow().pending_head.is_none());
+                })
+                .unwrap();
+                assert!(shared.roots.borrow().pending_head.is_some());
+            })
+            .unwrap();
+        assert!(shared.roots.borrow().pending_head.is_none());
+        assert!(
+            shared
+                .roots
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| slot.value.is_none())
+        );
+    }
 
     #[test]
     fn class_definition_matches_64_bit_jsc_layout() {
