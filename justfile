@@ -36,6 +36,9 @@ spell:
 links:
     lychee --offline --config lychee.toml .
 
+bench-test:
+    python3 -B -m unittest discover -s bench -p 'test_*.py'
+
 ci: fmt-check check clippy test test-doc doc
 
 verify: ci deny spell links

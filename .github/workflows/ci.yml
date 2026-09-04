@@ -118,6 +118,9 @@ jobs:
       - name: doctests
         run: cargo test --workspace --doc --all-features --locked
 
+      - name: Benchmark runner tests
+        run: python3 -B -m unittest discover -s bench -p 'test_*.py'
+
   jsc-smoke:
     name: JavaScriptCore smoke
     runs-on: macos-latest
