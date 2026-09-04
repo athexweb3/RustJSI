@@ -1287,6 +1287,27 @@ mod tests {
         assert_eq!(shared.context_local_roots.get(), 0);
     }
 
+    #[test]
+    fn pending_persistent_roots_cannot_grow_without_limit() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "root-budget.js").unwrap();
+                for _ in 0..4096 {
+                    drop(cx.persist(&value).unwrap());
+                }
+                assert!(cx.persist(&value).is_err());
+                assert_eq!(cx.shared.roots.borrow().slots.len(), 4096);
+            })
+            .unwrap();
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "after-drain.js").unwrap();
+                drop(cx.persist(&value).unwrap());
+            })
+            .unwrap();
+    }
+
     fn retained_roots(shared: &Shared) -> usize {
         shared
             .roots
