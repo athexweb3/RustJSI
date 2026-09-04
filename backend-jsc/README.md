@@ -45,10 +45,14 @@ reservations; scope cleanup returns committed slots.
 
 String arguments passed from Rust are protected from their creation through
 the synchronous call and result/exception capture. Capacity for every string
-argument is reserved atomically before conversion. Argument roots share the
-local budget and are released before `call` returns; scalar arguments do not
-consume root capacity. This bounds roots, not argument-buffer bytes or input
-string sizes.
+argument is reserved atomically before conversion, after a type-counting pass.
+Argument roots share the local budget and are released before `call` returns;
+scalar arguments do not consume root capacity. This bounds roots, not
+argument-buffer bytes or input string sizes.
+
+The `call_arguments` bench varies string argument counts across inline and
+heap argument storage. It includes conversion, temporary roots, the JSC call
+and result cleanup, with input Rust strings prepared before the timer.
 
 Unknown-result operations require headroom even if they would return scalars.
 Context refunds scalar reservations immediately. Common evaluation/resolution

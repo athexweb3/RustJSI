@@ -731,8 +731,11 @@ impl<'cx> Context<'cx> {
         ),
         JsError,
     > {
-        let Value::String(value) = value else {
-            return Ok((value_to_raw(self.raw, value, &mut Vec::new())?, None));
+        let value = match value {
+            Value::String(value) => value,
+            Value::Undefined | Value::Null | Value::Boolean(_) | Value::Number(_) => {
+                return Ok((value_to_raw(self.raw, value, &mut Vec::new())?, None));
+            }
         };
         let string = JsString::new(value)?;
         // SAFETY: The context and input string are live. ArgumentRoot protects

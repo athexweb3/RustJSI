@@ -51,6 +51,11 @@ name = "exception_capture"
 harness = false
 required-features = ["experimental-jsc"]
 
+[[bench]]
+name = "call_arguments"
+harness = false
+required-features = ["experimental-jsc"]
+
 [lints.rust]
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
