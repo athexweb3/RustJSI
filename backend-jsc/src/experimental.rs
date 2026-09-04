@@ -6,6 +6,9 @@ use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
+mod local_budget;
+#[cfg(test)]
+mod local_budget_tests;
 mod local_roots;
 mod native_state;
 mod panic_boundary;
@@ -13,6 +16,7 @@ mod panic_boundary;
 mod root_budget_tests;
 mod scopes;
 
+use local_budget::{LocalBudget, Reservation};
 use local_roots::LocalRoots;
 use panic_boundary::contain_unwind;
 
@@ -31,6 +35,24 @@ use std::thread::{self, ThreadId};
 pub use common::{JscBackend, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
+
+/// Creation-time root admission limits for the experimental standalone host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootLimits {
+    /// Persistent registry slots, including pending and exhausted identities.
+    pub persistent_slots: usize,
+    /// Local protections plus in-flight result reservations across all scopes.
+    pub local_roots: usize,
+}
+
+impl Default for RootLimits {
+    fn default() -> Self {
+        Self {
+            persistent_slots: 4096,
+            local_roots: 4096,
+        }
+    }
+}
 
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
@@ -154,6 +176,8 @@ pub enum RuntimeError {
     ScopeDepthExceeded,
     /// No persistent registry slot is available within the configured limit.
     PersistentRootLimitReached,
+    /// No local result reservation is available within the configured limit.
+    LocalRootLimitReached,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -180,6 +204,7 @@ struct Shared {
     gate: EntryGate,
     context: Cell<Option<NonNull<sys::OpaqueContext>>>,
     roots: RefCell<RootRegistry>,
+    local_budget: LocalBudget,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
@@ -234,13 +259,13 @@ struct JsString(NonNull<sys::OpaqueString>);
 impl Runtime {
     /// Creates an isolated `JavaScriptCore` global context.
     ///
-    /// Uses a limit of 4096 persistent registry slots.
+    /// Uses limits of 4096 persistent registry slots and 4096 local root slots.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::CreationFailed`] if JSC cannot create the context.
     pub fn new() -> Result<Self, RuntimeError> {
-        Self::new_with_persistent_root_limit(4096)
+        Self::new_with_root_limits(RootLimits::default())
     }
 
     /// Creates a runtime with a persistent registry slot limit.
@@ -250,11 +275,30 @@ impl Runtime {
     /// disables new persistent roots; locals and JavaScript execution still work.
     /// The limit doesn't reserve memory or bound local roots, lease clones, native
     /// registrations or the JavaScript heap. It cannot change after creation.
+    /// The local root limit remains at its default of 4096.
     ///
     /// # Errors
     ///
     /// Returns a creation or runtime-identity error if initialization fails.
     pub fn new_with_persistent_root_limit(limit: usize) -> Result<Self, RuntimeError> {
+        Self::new_with_root_limits(RootLimits {
+            persistent_slots: limit,
+            ..RootLimits::default()
+        })
+    }
+
+    /// Creates a runtime with independent persistent and local root budgets.
+    ///
+    /// Local-producing operations reserve a result slot before engine execution
+    /// or external-owner acceptance. Unknown result types require headroom even
+    /// if the result is scalar. Exceptions and unwind return unused reservations.
+    /// Scope exit returns committed local slots. These limits do not bound heap
+    /// bytes, callback registrations, temporary arguments or exception metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a creation or runtime-identity error if initialization fails.
+    pub fn new_with_root_limits(limits: RootLimits) -> Result<Self, RuntimeError> {
         let id = NEXT_RUNTIME_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -272,7 +316,8 @@ impl Runtime {
                 owner: thread::current().id(),
                 gate: EntryGate::new(ENTRY_LIMIT),
                 context: Cell::new(Some(context)),
-                roots: RefCell::new(RootRegistry::new(limit)),
+                roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
+                local_budget: LocalBudget::new(limits.local_roots),
                 host_functions: RefCell::new(HashMap::new()),
                 native_states: RefCell::new(native_state::NativeRegistry::default()),
                 native_finalizers,
@@ -388,9 +433,14 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns a lifecycle, backend, or JavaScript exception error.
+    /// Returns a lifecycle, local-admission, backend, or JavaScript exception error.
     pub fn eval(&mut self, source: &str, source_url: &str) -> Result<Local<'cx>, JsError> {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
+        let reservation = self
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(JsError::Runtime)?;
         let script = JsString::new(source)?;
         let url = JsString::new(source_url)?;
         let mut exception = ptr::null();
@@ -407,7 +457,7 @@ impl<'cx> Context<'cx> {
                 &raw mut exception,
             )
         };
-        self.local_or_exception(value, exception)
+        self.local_or_exception(value, exception, reservation)
     }
 
     /// Protects a scoped value so it can survive later entries.
@@ -442,7 +492,7 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead, foreign, or stale handle.
+    /// Returns an error for a dead, foreign, or stale handle, or a full local budget.
     pub fn resolve(&mut self, persistent: &Persistent) -> Result<Local<'cx>, JsError> {
         let runtime = persistent
             .lease
@@ -458,7 +508,12 @@ impl<'cx> Context<'cx> {
             .borrow()
             .get(persistent.lease.id)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
-        Ok(self.root_local(value))
+        let reservation = self
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(JsError::Runtime)?;
+        Ok(self.root_local(value, reservation))
     }
 
     /// Installs a stateful Rust callback as a global JavaScript function.
@@ -548,7 +603,8 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead/foreign handle, conversion failure, or exception.
+    /// Returns an error for a dead/foreign handle, local-admission failure,
+    /// conversion failure, or exception.
     pub fn call(
         &mut self,
         function: &HostFunction,
@@ -569,6 +625,11 @@ impl<'cx> Context<'cx> {
             .map(|entry| entry.function)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
 
+        let reservation = self
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(JsError::Runtime)?;
         let mut string_storage = Vec::new();
         let mut inline_arguments = [ptr::null(); INLINE_ARGUMENTS];
         let mut heap_arguments = Vec::new();
@@ -603,7 +664,7 @@ impl<'cx> Context<'cx> {
                 &raw mut exception,
             )
         };
-        self.local_or_exception(value, exception)
+        self.local_or_exception(value, exception, reservation)
     }
 
     /// Reads a JavaScript number without coercion.
@@ -661,16 +722,21 @@ impl<'cx> Context<'cx> {
         &self,
         value: sys::ValueRef,
         exception: sys::ValueRef,
+        reservation: Reservation<'_>,
     ) -> Result<Local<'cx>, JsError> {
         if !exception.is_null() {
             return Err(JsError::Exception(exception_to_owned(self.raw, exception)));
         }
         let value = NonNull::new(value.cast_mut())
             .ok_or(JsError::Backend("JavaScriptCore returned a null value"))?;
-        Ok(self.root_local(value))
+        Ok(self.root_local(value, reservation))
     }
 
-    fn root_local(&self, value: NonNull<sys::OpaqueValue>) -> Local<'cx> {
+    fn root_local(
+        &self,
+        value: NonNull<sys::OpaqueValue>,
+        reservation: Reservation<'_>,
+    ) -> Local<'cx> {
         // SAFETY: This value was returned by this live context or resolved from
         // its protected-root registry. Type inspection does not coerce it.
         let kind = unsafe { sys::value_get_type(self.raw.as_ptr(), value.as_ptr()) };
@@ -678,10 +744,11 @@ impl<'cx> Context<'cx> {
             kind,
             sys::TYPE_UNDEFINED | sys::TYPE_NULL | sys::TYPE_BOOLEAN | sys::TYPE_NUMBER
         ) {
+            self.local_roots.borrow_mut().push(value);
             // SAFETY: The context keeps this independent protection until Drop,
             // before the enclosing host entry guard is released.
             unsafe { sys::value_protect(self.raw.as_ptr(), value.as_ptr()) };
-            self.local_roots.borrow_mut().push(value);
+            reservation.commit();
             #[cfg(test)]
             self.shared
                 .context_local_roots
@@ -697,6 +764,7 @@ impl Drop for Context<'_> {
             // SAFETY: Each stored value owns one protection in this context;
             // the host entry still keeps the context alive during unwinding too.
             unsafe { sys::value_unprotect(self.raw.as_ptr(), value.as_ptr()) };
+            self.shared.local_budget.release();
             #[cfg(test)]
             self.shared
                 .context_local_roots
@@ -842,6 +910,7 @@ impl fmt::Display for RuntimeError {
             Self::IdentityExhausted => "runtime identity space is exhausted",
             Self::ScopeDepthExceeded => "Context scope depth limit exceeded",
             Self::PersistentRootLimitReached => "persistent root slot limit reached",
+            Self::LocalRootLimitReached => "local result root limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)
