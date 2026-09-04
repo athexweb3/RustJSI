@@ -11,6 +11,7 @@
 mod conformance;
 mod lifecycle;
 mod model;
+mod model_entry;
 
 pub use conformance::{
     create_number_root, verify_base_values, verify_external_buffer_identity,
@@ -23,3 +24,4 @@ pub use model::{
     Evaluation, ExternalBufferStats, ModelBackend, ModelBufferView, ModelRoot, ModelScope,
     ModelValue, Primitive,
 };
+pub use model_entry::{ModelEntry, ModelEntryScope};
