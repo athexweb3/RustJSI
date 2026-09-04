@@ -8,6 +8,7 @@ use rustjsi_backend::{
 };
 use rustjsi_testkit::{
     Evaluation, ExternalBufferStats, ModelBackend, Primitive, verify_base_values,
+    verify_external_buffer_identity_in_scope,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -236,4 +237,60 @@ fn overlapping_entries_reject_foreign_values() {
         });
         assert_eq!(scope.as_number(value), Ok(55.0));
     });
+}
+
+#[test]
+fn scoped_buffer_conformance_accepts_borrowed_entries() {
+    let mut model = ModelBackend::new();
+    model.with_entry(|entry| {
+        let scope = entry.open_scope().unwrap();
+        verify_external_buffer_identity_in_scope(&scope).unwrap();
+        verify_external_buffer_identity_in_scope(&scope).unwrap();
+    });
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 2,
+            finalized: 2,
+            live_bytes: 0,
+            copied_bytes: 0,
+        }
+    );
+}
+
+#[test]
+fn scoped_buffer_conformance_returns_transfer_failures() {
+    let mut model = ModelBackend::new();
+    model.reject_next_external_buffer();
+    model.with_entry(|entry| {
+        let scope = entry.open_scope().unwrap();
+        assert_eq!(
+            verify_external_buffer_identity_in_scope(&scope),
+            Err(BackendError::Failure("injected external-buffer rejection"))
+        );
+    });
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats::default()
+    );
+    model.fail_next_external_buffer_after_accept();
+    model.with_entry(|entry| {
+        let scope = entry.open_scope().unwrap();
+        assert_eq!(
+            verify_external_buffer_identity_in_scope(&scope),
+            Err(BackendError::Failure(
+                "injected failure after ownership transfer"
+            ))
+        );
+        verify_external_buffer_identity_in_scope(&scope).unwrap();
+    });
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 2,
+            finalized: 2,
+            live_bytes: 0,
+            copied_bytes: 0,
+        }
+    );
 }
