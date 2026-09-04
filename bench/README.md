@@ -40,6 +40,7 @@ Callback and scalar results are checked against `42` before and after each
 timed workload. These checks do not validate every timed iteration. The direct
 callback function has an explicit root outside the timer; RAII releases the
 root before its context, including if a validation assertion unwinds.
+macOS CI checks successful benchmark execution, not timing thresholds.
 
 ## Reading the report
 
