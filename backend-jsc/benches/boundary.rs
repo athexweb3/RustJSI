@@ -6,7 +6,7 @@
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Runtime, Value};
-    use rustjsi_host::EntryGate;
+    use rustjsi_host::{EntryGate, FinalEntryPolicy};
     use std::hint::black_box;
     use std::num::NonZeroU32;
     use std::time::Instant;
@@ -18,7 +18,7 @@ fn main() {
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
-    let gate = EntryGate::new(NonZeroU32::new(64).unwrap());
+    let gate = EntryGate::new(NonZeroU32::new(64).unwrap(), FinalEntryPolicy::Unavailable);
     let gate_entry = measure_entry(WARMUP, ITERATIONS, || {
         let entry = black_box(&gate).try_enter().expect("admit host entry");
         black_box(&entry);

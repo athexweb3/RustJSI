@@ -6,4 +6,6 @@
 
 mod entry;
 
-pub use entry::{CleanupGuard, EntryGate, EntryGuard, GateError, HostState};
+pub use entry::{
+    CleanupGuard, EntryGate, EntryGuard, FinalEntryOutcome, FinalEntryPolicy, GateError, HostState,
+};

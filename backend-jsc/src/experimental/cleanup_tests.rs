@@ -2,6 +2,7 @@
 
 use super::{ACTIVE_RUNTIME, GateError, RuntimeError};
 use super::{HostState, Runtime, Shared, Value};
+use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy};
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
@@ -50,6 +51,14 @@ fn invalidation_separates_cleanup_entry_from_post_engine_destruction() {
     assert_eq!(native.get(), Some((HostState::Invalid, false, false)));
     assert!(!runtime.shared.gate.cleanup_in_progress());
     assert_eq!(runtime.shared.gate.state(), HostState::Destroyed);
+    assert_eq!(
+        runtime.shared.gate.final_entry_policy(),
+        FinalEntryPolicy::Guaranteed
+    );
+    assert_eq!(
+        runtime.shared.gate.final_entry_outcome(),
+        Some(FinalEntryOutcome::Completed)
+    );
 }
 
 #[test]
