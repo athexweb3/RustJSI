@@ -4,6 +4,8 @@
 
 use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
+#[cfg(test)]
+mod cleanup_tests;
 mod common;
 mod external_buffer;
 mod local_budget;
@@ -373,11 +375,11 @@ impl Runtime {
         }
 
         self.shared.gate.request_drain();
-        if !self.shared.gate.is_drain_ready() {
-            return Err(RuntimeError::Host(GateError::EntriesRemain(
-                self.shared.gate.active_entries(),
-            )));
-        }
+        let cleanup = self
+            .shared
+            .gate
+            .try_begin_cleanup()
+            .map_err(RuntimeError::Host)?;
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let roots = self.shared.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
@@ -394,6 +396,7 @@ impl Runtime {
             self.shared.drop_callback(entry);
         }
         self.shared.close_native_finalizers();
+        drop(cleanup);
         self.shared
             .gate
             .finish_drain()

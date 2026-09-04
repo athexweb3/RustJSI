@@ -29,6 +29,8 @@ pub enum GateError {
     DepthLimit,
     /// Teardown must wait for this many entry guards.
     EntriesRemain(u32),
+    /// An exclusive cleanup guard has not yet been dropped.
+    CleanupInProgress,
     /// The requested transition is not legal in the current state.
     InvalidTransition {
         /// State at rejection.
@@ -64,6 +66,7 @@ pub enum GateError {
 pub struct EntryGate {
     state: Cell<HostState>,
     entries: Cell<u32>,
+    cleanup: Cell<bool>,
     limit: NonZeroU32,
     _affine: PhantomData<Rc<()>>,
 }
@@ -95,6 +98,34 @@ pub struct EntryGuard<'gate> {
     gate: &'gate EntryGate,
 }
 
+/// Exclusive accounting for host-authorized cleanup during draining.
+///
+/// The host must separately establish engine ownership, thread and VM access.
+/// This guard cannot admit application work. Drop leaves the state Draining,
+/// allowing a host to retry cleanup after unwind. Forgetting it blocks completion.
+///
+/// ```compile_fail
+/// use rustjsi_host::CleanupGuard;
+/// fn require_send<T: Send>() {}
+/// require_send::<CleanupGuard<'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use rustjsi_host::EntryGate;
+/// use std::num::NonZeroU32;
+/// let guard = {
+///     let gate = EntryGate::new(NonZeroU32::new(1).unwrap());
+///     gate.request_drain();
+///     gate.try_begin_cleanup().unwrap()
+/// };
+/// drop(guard);
+/// ```
+#[derive(Debug)]
+#[must_use = "keep the guard alive for the entire host cleanup entry"]
+pub struct CleanupGuard<'gate> {
+    gate: &'gate EntryGate,
+}
+
 impl EntryGate {
     /// Creates an active gate with an explicit simultaneous-entry limit.
     #[must_use]
@@ -102,6 +133,7 @@ impl EntryGate {
         Self {
             state: Cell::new(HostState::Active),
             entries: Cell::new(0),
+            cleanup: Cell::new(false),
             limit,
             _affine: PhantomData,
         }
@@ -113,7 +145,7 @@ impl EntryGate {
         self.state.get()
     }
 
-    /// Returns the number of guards not yet dropped.
+    /// Returns the number of normal entry guards not yet dropped.
     #[must_use]
     pub fn active_entries(&self) -> u32 {
         self.entries.get()
@@ -154,7 +186,38 @@ impl EntryGate {
     /// This does not authorize an engine cleanup entry or perform cleanup.
     #[must_use]
     pub fn is_drain_ready(&self) -> bool {
-        self.state.get() == HostState::Draining && self.entries.get() == 0
+        self.state.get() == HostState::Draining && self.entries.get() == 0 && !self.cleanup.get()
+    }
+
+    /// Reports whether a cleanup guard is live, independently of normal entries.
+    #[must_use]
+    pub fn cleanup_in_progress(&self) -> bool {
+        self.cleanup.get()
+    }
+
+    /// Counts one exclusive cleanup entry after host authorization.
+    ///
+    /// This is optional accounting: hosts without an engine cleanup entry can
+    /// still record their own terminal cleanup through `finish_drain`.
+    ///
+    /// # Errors
+    ///
+    /// Requires Draining, no normal entries and no outstanding cleanup guard.
+    pub fn try_begin_cleanup(&self) -> Result<CleanupGuard<'_>, GateError> {
+        if self.state.get() != HostState::Draining {
+            return Err(GateError::InvalidTransition {
+                state: self.state.get(),
+                operation: "begin_cleanup",
+            });
+        }
+        if self.entries.get() != 0 {
+            return Err(GateError::EntriesRemain(self.entries.get()));
+        }
+        if self.cleanup.get() {
+            return Err(GateError::CleanupInProgress);
+        }
+        self.cleanup.set(true);
+        Ok(CleanupGuard { gate: self })
     }
 
     /// Records completed entry-dependent cleanup and forbids further access.
@@ -164,8 +227,11 @@ impl EntryGate {
     ///
     /// # Errors
     ///
-    /// Rejects live entries and states other than `Draining` or `Invalid`.
+    /// Rejects live entry or cleanup guards and states other than `Draining` or `Invalid`.
     pub fn finish_drain(&self) -> Result<(), GateError> {
+        if self.cleanup.get() {
+            return Err(GateError::CleanupInProgress);
+        }
         match self.state.get() {
             HostState::Invalid => Ok(()),
             HostState::Draining if self.entries.get() == 0 => {
@@ -209,12 +275,19 @@ impl Drop for EntryGuard<'_> {
     }
 }
 
+impl Drop for CleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.cleanup.set(false);
+    }
+}
+
 impl fmt::Display for GateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotActive(state) => write!(formatter, "host is not active: {state:?}"),
             Self::DepthLimit => formatter.write_str("host entry depth limit reached"),
             Self::EntriesRemain(count) => write!(formatter, "{count} host entries remain"),
+            Self::CleanupInProgress => formatter.write_str("host cleanup entry remains"),
             Self::InvalidTransition { state, operation } => {
                 write!(formatter, "cannot {operation} while host is {state:?}")
             }
@@ -339,5 +412,59 @@ mod tests {
         second.mark_destroyed().unwrap();
         assert_eq!(first.state(), HostState::Active);
         assert_eq!(first.active_entries(), 1);
+    }
+
+    #[test]
+    fn cleanup_is_exclusive_and_cannot_complete_while_live() {
+        let gate = gate(1);
+        assert!(gate.try_begin_cleanup().is_err());
+        let entry = gate.try_enter().unwrap();
+        gate.request_drain();
+        assert_eq!(
+            gate.try_begin_cleanup().unwrap_err(),
+            GateError::EntriesRemain(1)
+        );
+        drop(entry);
+        let cleanup = gate.try_begin_cleanup().unwrap();
+        assert_eq!(gate.active_entries(), 0);
+        assert!(gate.cleanup_in_progress());
+        assert!(!gate.is_drain_ready());
+        assert!(gate.try_enter().is_err());
+        assert_eq!(
+            gate.try_begin_cleanup().unwrap_err(),
+            GateError::CleanupInProgress
+        );
+        assert_eq!(gate.finish_drain(), Err(GateError::CleanupInProgress));
+        assert!(gate.mark_destroyed().is_err());
+        drop(cleanup);
+        gate.finish_drain().unwrap();
+        assert!(gate.try_begin_cleanup().is_err());
+        gate.mark_destroyed().unwrap();
+        assert!(gate.try_begin_cleanup().is_err());
+    }
+
+    #[test]
+    fn cleanup_unwind_leaves_a_retryable_draining_gate() {
+        let gate = gate(1);
+        gate.request_drain();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = gate.try_begin_cleanup().unwrap();
+            panic!("cleanup failed");
+        }));
+        assert!(result.is_err());
+        assert!(gate.is_drain_ready());
+        assert_eq!(gate.state(), HostState::Draining);
+        drop(gate.try_begin_cleanup().unwrap());
+        gate.finish_drain().unwrap();
+    }
+
+    #[test]
+    fn forgotten_cleanup_guard_blocks_teardown() {
+        let gate = gate(1);
+        gate.request_drain();
+        std::mem::forget(gate.try_begin_cleanup().unwrap());
+        assert_eq!(gate.finish_drain(), Err(GateError::CleanupInProgress));
+        assert!(gate.try_begin_cleanup().is_err());
+        assert!(!gate.is_drain_ready());
     }
 }

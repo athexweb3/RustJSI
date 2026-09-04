@@ -75,6 +75,10 @@ unwinding restores the previous active runtime and releases admission counts;
 it does not run engine destruction. The internal entry limit counts host
 admissions, not JavaScript recursion or callbacks within an admitted frame.
 
+Invalidation holds an exclusive cleanup guard while releasing roots and
+callback captures. The guard closes before engine release; cleanup does not
+lend a `Context` or replace the active runtime of an enclosing entry.
+
 Dispatch leases the callback with an `Rc` before releasing the registry borrow.
 Teardown detaches the registry and destroys each capture separately; an
 unwinding destructor panic does not skip the remaining callbacks or engine
