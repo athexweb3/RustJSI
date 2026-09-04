@@ -1,53 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub use rustjsi_host::{AttachmentEpoch as Epoch, AttachmentId, RuntimeId};
 use std::error::Error;
 use std::fmt;
-
-/// Deterministic identity of one modeled runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RuntimeId(u64);
-
-impl RuntimeId {
-    /// Creates a nonzero test runtime ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `value` is zero, which is reserved as an invalid identity.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        assert!(value != 0, "runtime ID must be nonzero");
-        Self(value)
-    }
-
-    /// Returns the integer identity.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Monotonic attachment generation of a modeled runtime identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Epoch(u64);
-
-impl Epoch {
-    /// Creates a nonzero epoch.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `value` is zero.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        assert!(value != 0, "epoch must be nonzero");
-        Self(value)
-    }
-
-    /// Returns the integer generation.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
 
 /// Monotonic state of a modeled host-owned runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,8 +20,7 @@ pub enum RuntimeState {
 /// One active entry token in the deterministic lifecycle model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Entry {
-    runtime_id: RuntimeId,
-    epoch: Epoch,
+    attachment: AttachmentId,
     sequence: u64,
 }
 
@@ -74,13 +28,19 @@ impl Entry {
     /// Returns the runtime ID captured at entry.
     #[must_use]
     pub const fn runtime_id(self) -> RuntimeId {
-        self.runtime_id
+        self.attachment.runtime_id()
     }
 
     /// Returns the epoch captured at entry.
     #[must_use]
     pub const fn epoch(self) -> Epoch {
-        self.epoch
+        self.attachment.epoch()
+    }
+
+    /// Returns the complete attachment identity captured at entry.
+    #[must_use]
+    pub const fn attachment_id(self) -> AttachmentId {
+        self.attachment
     }
 }
 
@@ -147,8 +107,7 @@ impl Error for LifecycleError {}
 /// introduced.
 #[derive(Debug)]
 pub struct LifecycleModel {
-    runtime_id: RuntimeId,
-    epoch: Epoch,
+    attachment: AttachmentId,
     state: RuntimeState,
     next_entry: u64,
     live_entries: Vec<u64>,
@@ -158,15 +117,20 @@ pub struct LifecycleModel {
 impl LifecycleModel {
     /// Creates an active attachment.
     #[must_use]
-    pub fn new(runtime_id: RuntimeId, epoch: Epoch) -> Self {
+    pub fn new(attachment: AttachmentId) -> Self {
         Self {
-            runtime_id,
-            epoch,
+            attachment,
             state: RuntimeState::Active,
             next_entry: 1,
             live_entries: Vec::new(),
             events: Vec::new(),
         }
+    }
+
+    /// Returns the attachment identity modeled by this lifecycle instance.
+    #[must_use]
+    pub const fn attachment_id(&self) -> AttachmentId {
+        self.attachment
     }
 
     /// Returns the current lifecycle state.
@@ -201,8 +165,7 @@ impl LifecycleModel {
             .checked_add(1)
             .ok_or(LifecycleError::EntrySpaceExhausted)?;
         let entry = Entry {
-            runtime_id: self.runtime_id,
-            epoch: self.epoch,
+            attachment: self.attachment,
             sequence: self.next_entry,
         };
         self.next_entry = next_entry;
@@ -217,7 +180,7 @@ impl LifecycleModel {
     ///
     /// Rejects foreign, stale, or duplicate entry tokens.
     pub fn exit(&mut self, entry: Entry) -> Result<(), LifecycleError> {
-        if entry.runtime_id != self.runtime_id || entry.epoch != self.epoch {
+        if entry.attachment != self.attachment {
             return Err(LifecycleError::WrongRuntime);
         }
         let Some(index) = self
@@ -295,8 +258,8 @@ impl LifecycleModel {
     /// # Errors
     ///
     /// Rejects stale identity/epoch and all work once draining starts.
-    pub fn validate_work(&self, runtime_id: RuntimeId, epoch: Epoch) -> Result<(), LifecycleError> {
-        if runtime_id != self.runtime_id || epoch != self.epoch {
+    pub fn validate_work(&self, attachment: AttachmentId) -> Result<(), LifecycleError> {
+        if attachment != self.attachment {
             return Err(LifecycleError::WrongRuntime);
         }
         if self.state == RuntimeState::Active {
@@ -310,10 +273,18 @@ impl LifecycleModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustjsi_host::RuntimeIdentity;
+
+    fn new_attachment() -> AttachmentId {
+        RuntimeIdentity::allocate()
+            .unwrap()
+            .next_attachment()
+            .unwrap()
+    }
 
     #[test]
     fn invalidation_waits_for_outermost_entry() {
-        let mut model = LifecycleModel::new(RuntimeId::new(1), Epoch::new(1));
+        let mut model = LifecycleModel::new(new_attachment());
         let outer = model.enter().unwrap();
         let inner = model.enter().unwrap();
 
@@ -332,17 +303,28 @@ mod tests {
 
     #[test]
     fn stale_epoch_work_is_rejected() {
-        let model = LifecycleModel::new(RuntimeId::new(9), Epoch::new(2));
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let stale = identity.next_attachment().unwrap();
+        let current = identity.next_attachment().unwrap();
+        let model = LifecycleModel::new(current);
+        assert_eq!(model.attachment_id(), current);
         assert_eq!(
-            model.validate_work(RuntimeId::new(9), Epoch::new(1)),
+            model.validate_work(stale),
+            Err(LifecycleError::WrongRuntime)
+        );
+
+        let foreign = new_attachment();
+        assert_eq!(
+            model.validate_work(foreign),
             Err(LifecycleError::WrongRuntime)
         );
     }
 
     #[test]
     fn one_thousand_lifecycle_cycles_are_finite_and_idempotent() {
-        for cycle in 1..=1_000 {
-            let mut model = LifecycleModel::new(RuntimeId::new(cycle), Epoch::new(1));
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        for _ in 0..1_000 {
+            let mut model = LifecycleModel::new(identity.next_attachment().unwrap());
             let entry = model.enter().unwrap();
             model.request_invalidate();
             model.request_invalidate();
@@ -358,7 +340,7 @@ mod tests {
 
     #[test]
     fn entry_sequence_exhaustion_fails_closed() {
-        let mut model = LifecycleModel::new(RuntimeId::new(1), Epoch::new(1));
+        let mut model = LifecycleModel::new(new_attachment());
         model.next_entry = u64::MAX;
         assert_eq!(model.enter(), Err(LifecycleError::EntrySpaceExhausted));
         assert_eq!(model.active_entries(), 0);

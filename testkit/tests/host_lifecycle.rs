@@ -2,16 +2,17 @@
 
 //! Differential checks against the independent lifecycle event model.
 
-use rustjsi_host::{EntryGate, FinalEntryPolicy, HostState};
-use rustjsi_testkit::{Epoch, LifecycleModel, RuntimeId, RuntimeState};
+use rustjsi_host::{EntryGate, FinalEntryPolicy, HostState, RuntimeIdentity};
+use rustjsi_testkit::{LifecycleModel, RuntimeState};
 use std::num::NonZeroU32;
 
 #[test]
 fn gate_matches_independent_model_over_one_hundred_thousand_operations() {
     let mut random = 0x05ee_da11_u64;
-    for cycle in 1..=1_000 {
+    let mut identity = RuntimeIdentity::allocate().unwrap();
+    for _ in 0..1_000 {
         let gate = EntryGate::new(NonZeroU32::new(100).unwrap(), FinalEntryPolicy::BestEffort);
-        let mut model = LifecycleModel::new(RuntimeId::new(cycle), Epoch::new(1));
+        let mut model = LifecycleModel::new(identity.next_attachment().unwrap());
         let mut entries = Vec::new();
         let mut cleanup = None;
         for _ in 0..100 {

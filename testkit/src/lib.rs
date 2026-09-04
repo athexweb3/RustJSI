@@ -19,7 +19,8 @@ pub use conformance::{
     verify_owned_external_buffer, verify_strong_root_round_trip,
 };
 pub use lifecycle::{
-    Entry, Epoch, LifecycleError, LifecycleEvent, LifecycleModel, RuntimeId, RuntimeState,
+    AttachmentId, Entry, Epoch, LifecycleError, LifecycleEvent, LifecycleModel, RuntimeId,
+    RuntimeState,
 };
 pub use model::{
     Evaluation, ExternalBufferStats, ModelBackend, ModelBufferView, ModelRoot, ModelScope,
