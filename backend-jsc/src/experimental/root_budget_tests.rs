@@ -40,7 +40,10 @@ fn legacy_and_common_roots_compete_for_the_same_slots() {
         .with_backend(|backend| {
             let scope = backend.open_scope().unwrap();
             let value = scope.resolve(common).unwrap();
-            assert_eq!(scope.as_number(value).unwrap(), 42.0);
+            assert_eq!(
+                scope.as_number(value).unwrap().to_bits(),
+                42.0_f64.to_bits()
+            );
             let replacement = scope.persist(value).unwrap();
             scope.release(common).unwrap();
             scope.release(replacement).unwrap();
