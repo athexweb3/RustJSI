@@ -13,6 +13,9 @@
 use std::error::Error;
 use std::fmt;
 
+mod family;
+pub use family::BackendFamily;
+
 /// The current source-level backend contract version.
 pub const BACKEND_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0);
 
