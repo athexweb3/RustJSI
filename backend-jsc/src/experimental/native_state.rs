@@ -347,7 +347,7 @@ pub(super) fn drop_states(shared: &Shared, states: Vec<Box<dyn Any>>) {
 }
 
 fn drop_state(shared: &Shared, state: Option<Box<dyn Any>>) {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(state))).is_err() {
+    if super::contain_unwind(std::panic::AssertUnwindSafe(|| drop(state))).is_err() {
         shared
             .native_drop_panics
             .set(shared.native_drop_panics.get().saturating_add(1));

@@ -7,6 +7,9 @@ use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
 mod native_state;
+mod panic_boundary;
+
+use panic_boundary::contain_unwind;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -150,12 +153,13 @@ struct Shared {
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
     native_drop_panics: Cell<usize>,
+    callback_drop_panics: Cell<usize>,
     external_buffers: Arc<external_buffer::ExternalLedger>,
 }
 
 struct HostFunctionEntry {
     function: NonNull<sys::OpaqueValue>,
-    callback: Box<Callback>,
+    callback: Rc<Callback>,
 }
 
 struct RootLease {
@@ -215,6 +219,7 @@ impl Runtime {
                 native_states: RefCell::new(native_state::NativeRegistry::default()),
                 native_finalizers,
                 native_drop_panics: Cell::new(0),
+                callback_drop_panics: Cell::new(0),
                 external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
         })
@@ -266,20 +271,19 @@ impl Runtime {
         }
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let roots = self.shared.roots.borrow_mut().drain();
-        let functions = self
-            .shared
-            .host_functions
-            .borrow()
-            .values()
-            .map(|entry| entry.function)
-            .collect::<Vec<_>>();
+        let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
 
-        for value in roots.into_iter().chain(functions) {
+        for value in roots
+            .into_iter()
+            .chain(functions.values().map(|entry| entry.function))
+        {
             // SAFETY: Every value was protected exactly once in this context and is
             // unprotected before the context is released, on its owning thread.
             unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
         }
-        self.shared.host_functions.borrow_mut().clear();
+        for entry in functions.into_values() {
+            self.shared.drop_callback(entry);
+        }
         self.shared.close_native_finalizers();
         self.shared
             .gate
@@ -297,6 +301,15 @@ impl Runtime {
             .mark_destroyed()
             .map_err(RuntimeError::Host)?;
         Ok(())
+    }
+
+    /// Returns the number of contained registered-callback destruction panics.
+    ///
+    /// The saturating counter remains readable after explicit invalidation.
+    /// Abort-mode panics and double panics during unwinding are not recoverable.
+    #[must_use]
+    pub fn callback_drop_panics(&self) -> usize {
+        self.shared.callback_drop_panics.get()
     }
 }
 
@@ -410,7 +423,7 @@ impl<'cx> Context<'cx> {
             key,
             HostFunctionEntry {
                 function,
-                callback: Box::new(callback),
+                callback: Rc::new(callback),
             },
         );
 
@@ -420,9 +433,12 @@ impl<'cx> Context<'cx> {
 
         // SAFETY: The active context always has a global object.
         let global = unsafe { sys::context_get_global_object(self.raw.as_ptr()) };
-        let global = NonNull::new(global).ok_or(JsError::Backend(
-            "JavaScriptCore returned a null global object",
-        ))?;
+        let Some(global) = NonNull::new(global) else {
+            self.rollback_host_function(key, function);
+            return Err(JsError::Backend(
+                "JavaScriptCore returned a null global object",
+            ));
+        };
         let mut exception = ptr::null();
         // SAFETY: The global object, name, and protected function belong to this
         // context. The exception output is initialized and checked below.
@@ -437,17 +453,25 @@ impl<'cx> Context<'cx> {
             );
         }
         if !exception.is_null() {
-            self.shared.host_functions.borrow_mut().remove(&key);
-            // SAFETY: This balances the protection established above after publication
-            // failed, while the context is still active.
-            unsafe { sys::value_unprotect(self.raw.as_ptr(), function.as_ptr()) };
-            return Err(JsError::Exception(exception_to_owned(self.raw, exception)));
+            let error = JsError::Exception(exception_to_owned(self.raw, exception));
+            self.rollback_host_function(key, function);
+            return Err(error);
         }
 
         Ok(HostFunction {
             runtime: Rc::downgrade(self.shared),
             key,
         })
+    }
+
+    fn rollback_host_function(&self, key: usize, function: NonNull<sys::OpaqueValue>) {
+        let removed = self.shared.host_functions.borrow_mut().remove(&key);
+        // SAFETY: Publication failed after protection in this still-live context.
+        // Retire the registration and release its root before running user Drop.
+        unsafe { sys::value_unprotect(self.raw.as_ptr(), function.as_ptr()) };
+        if let Some(entry) = removed {
+            self.shared.drop_callback(entry);
+        }
     }
 
     /// Calls an installed Rust host function through `JavaScriptCore`.
@@ -749,6 +773,13 @@ impl Error for JsError {
 }
 
 impl Shared {
+    fn drop_callback(&self, entry: HostFunctionEntry) {
+        if contain_unwind(std::panic::AssertUnwindSafe(|| drop(entry))).is_err() {
+            self.callback_drop_panics
+                .set(self.callback_drop_panics.get().saturating_add(1));
+        }
+    }
+
     fn ensure_thread(&self) -> Result<(), RuntimeError> {
         if self.owner == thread::current().id() {
             Ok(())
@@ -900,7 +931,7 @@ unsafe extern "C" fn host_function_callback(
     arguments: *const sys::ValueRef,
     exception: *mut sys::ValueRef,
 ) -> sys::ValueRef {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = contain_unwind(std::panic::AssertUnwindSafe(|| {
         let shared = ACTIVE_RUNTIME.with(Cell::get);
         let shared = NonNull::new(shared.cast_mut()).ok_or_else(|| {
             HostError::new("host function called outside an active RustJSI entry")
@@ -926,11 +957,13 @@ unsafe extern "C" fn host_function_callback(
             unsafe { std::slice::from_raw_parts(arguments, argument_count) }
         };
         let key = function as usize;
-        let callbacks = shared.host_functions.borrow();
-        let callback = callbacks
+        let callback = shared
+            .host_functions
+            .borrow()
             .get(&key)
+            .map(|entry| Rc::clone(&entry.callback))
             .ok_or_else(|| HostError::new("host function registration is stale"))?;
-        (callback.callback)(Call {
+        callback(Call {
             raw_context: NonNull::new(context.cast_mut())
                 .ok_or_else(|| HostError::new("JSC supplied a null context"))?,
             arguments,
@@ -952,7 +985,7 @@ unsafe extern "C" fn host_function_callback(
             // SAFETY: JSC supplied a live callback context.
             unsafe { sys::value_make_undefined(context) }
         }
-        Err(_) => {
+        Err(()) => {
             write_exception(context, exception, "Rust host function panicked");
             // SAFETY: JSC supplied a live callback context.
             unsafe { sys::value_make_undefined(context) }
@@ -1147,6 +1180,181 @@ mod tests {
     }
 
     struct PanicDrop;
+
+    struct CallbackDropProbe {
+        shared: Weak<Shared>,
+        observations: Rc<RefCell<Vec<bool>>>,
+        panic: bool,
+    }
+
+    impl Drop for CallbackDropProbe {
+        fn drop(&mut self) {
+            let shared = self.shared.upgrade().unwrap();
+            self.observations
+                .borrow_mut()
+                .push(shared.host_functions.try_borrow_mut().is_ok());
+            assert!(!self.panic, "callback capture drop panic");
+        }
+    }
+
+    #[test]
+    fn callback_teardown_contains_each_drop_without_registry_borrow() {
+        let mut runtime = Runtime::new().unwrap();
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                for index in 0..4 {
+                    let probe = CallbackDropProbe {
+                        shared: Rc::downgrade(&shared),
+                        observations: Rc::clone(&observations),
+                        panic: index == 1,
+                    };
+                    cx.install_host_function(&format!("callback{index}"), move |_| {
+                        let _probe = &probe;
+                        Ok(Value::Undefined)
+                    })
+                    .unwrap();
+                }
+            })
+            .unwrap();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.invalidate()));
+        assert!(result.is_ok(), "capture panic escaped invalidation");
+        result.unwrap().unwrap();
+        assert_eq!(&*observations.borrow(), &[true; 4]);
+        assert!(shared.context.get().is_none());
+        assert_eq!(shared.gate.state(), HostState::Destroyed);
+        assert_eq!(runtime.callback_drop_panics(), 1);
+        runtime.invalidate().unwrap();
+        assert_eq!(&*observations.borrow(), &[true; 4]);
+    }
+
+    #[test]
+    fn callback_dispatch_releases_registry_borrow() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let weak = Rc::downgrade(&shared);
+                cx.install_host_function("inspectRegistry", move |_| {
+                    let shared = weak.upgrade().unwrap();
+                    Ok(Value::Boolean(
+                        shared.host_functions.try_borrow_mut().is_ok(),
+                    ))
+                })
+                .unwrap();
+                let result = cx.eval("inspectRegistry()", "registry.js").unwrap();
+                assert!(cx.boolean(&result).unwrap());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn callback_publication_failure_preserves_exception_and_reclaims_capture() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        runtime.with_context(|cx| {
+            cx.eval("Object.defineProperty(globalThis, 'rejectCallback', { set(value) { globalThis.savedRejected = value; throw new Error('publication failed'); } })", "setter.js").unwrap();
+            let probe = CallbackDropProbe {
+                shared: Rc::downgrade(&shared),
+                observations: Rc::clone(&observations),
+                panic: true,
+            };
+            let error = cx.install_host_function("rejectCallback", move |_| {
+                let _probe = &probe;
+                Ok(Value::Undefined)
+            }).err().expect("publication must fail");
+            assert!(matches!(error, JsError::Exception(ref error) if error.message().contains("publication failed")));
+            assert!(shared.host_functions.borrow().is_empty());
+            let stale = cx.eval("savedRejected()", "stale.js").err().unwrap();
+            assert!(stale.to_string().contains("registration is stale"));
+            let value = cx.eval("42", "after-failure.js").unwrap();
+            assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+        }).unwrap();
+        assert_eq!(&*observations.borrow(), &[true]);
+        assert_eq!(runtime.callback_drop_panics(), 1);
+        runtime.invalidate().unwrap();
+        assert_eq!(&*observations.borrow(), &[true]);
+    }
+
+    #[test]
+    fn runtime_drop_during_unwind_contains_callback_capture_panic() {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut runtime = Runtime::new().unwrap();
+            let probe = CallbackDropProbe {
+                shared: Rc::downgrade(&runtime.shared),
+                observations: Rc::clone(&observations),
+                panic: true,
+            };
+            runtime
+                .with_context(|cx| {
+                    cx.install_host_function("panicOnDrop", move |_| {
+                        let _probe = &probe;
+                        Ok(Value::Undefined)
+                    })
+                    .unwrap();
+                })
+                .unwrap();
+            panic!("outer application unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(&*observations.borrow(), &[true]);
+    }
+
+    struct PanickingPayload;
+
+    impl Drop for PanickingPayload {
+        fn drop(&mut self) {
+            panic!("payload drop panic");
+        }
+    }
+
+    struct DropWithPanickingPayload;
+
+    impl Drop for DropWithPanickingPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(PanickingPayload);
+        }
+    }
+
+    #[test]
+    fn native_state_payload_drop_panic_does_not_interrupt_teardown() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|cx| {
+                cx.install_native_state("panicState", DropWithPanickingPayload)
+                    .unwrap();
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(runtime.shared.native_drop_panics.get(), 1);
+        assert_eq!(runtime.shared.gate.state(), HostState::Destroyed);
+        assert!(runtime.shared.context.get().is_none());
+    }
+
+    #[test]
+    fn callback_payload_drop_panic_is_translated_at_c_boundary() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|cx| {
+                cx.install_host_function("panicWithPayload", |_| {
+                    std::panic::panic_any(PanickingPayload)
+                })
+                .unwrap();
+                let error = cx
+                    .eval("panicWithPayload()", "panic-payload.js")
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("Rust host function panicked"));
+                let value = cx.eval("42", "after-panic.js").unwrap();
+                assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
 
     impl Drop for PanicDrop {
         fn drop(&mut self) {

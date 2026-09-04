@@ -23,3 +23,13 @@ rejects outstanding entries before releasing roots or the engine. Panic
 unwinding restores the previous active runtime and releases admission counts;
 it does not run engine destruction. The internal entry limit counts host
 admissions, not JavaScript recursion or callbacks within an admitted frame.
+
+Dispatch leases the callback with an `Rc` before releasing the registry borrow.
+Teardown detaches the registry and destroys each capture separately; an
+unwinding destructor panic does not skip the remaining callbacks or engine
+release. `Runtime::callback_drop_panics()` reports contained capture-drop
+panics. Publication rollback follows the same cleanup path.
+
+Panic containment cannot recover abort-mode panics, aborting hooks, or double
+panics during unwinding. If destroying a caught panic payload itself panics,
+the second payload is deliberately leaked to avoid another destructor call.
