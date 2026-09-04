@@ -74,7 +74,17 @@ pub struct Local<'cx> {
     _affine: PhantomData<Rc<()>>,
 }
 
-/// A JavaScript value protected from collection until its last lease is dropped.
+/// A JavaScript value protected from collection while any lease remains.
+///
+/// Last drop requests release without calling JSC. The standalone host drains
+/// requests at the next entry boundary or during invalidation. An idle runtime
+/// retains pending roots; an empty entry explicitly flushes them.
+///
+/// ```compile_fail
+/// use rustjsi_backend_jsc::Persistent;
+/// fn require_send<T: Send>() {}
+/// require_send::<Persistent>();
+/// ```
 pub struct Persistent {
     lease: Rc<RootLease>,
 }
@@ -192,11 +202,19 @@ struct RootId {
 struct RootRegistry {
     slots: Vec<RootSlot>,
     free: Vec<usize>,
+    pending_head: Option<usize>,
 }
 
 struct RootSlot {
     generation: u64,
     value: Option<NonNull<sys::OpaqueValue>>,
+    release: RootRelease,
+}
+
+#[derive(Clone, Copy)]
+enum RootRelease {
+    Live,
+    Pending { next: Option<usize> },
 }
 
 struct ActiveRuntimeGuard {
@@ -253,9 +271,10 @@ impl Runtime {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        self.shared.drain_native_finalizers();
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(context);
         let result = {
             let mut scoped = Context {
                 shared: &self.shared,
@@ -265,8 +284,9 @@ impl Runtime {
             };
             operation(&mut scoped)
         };
-        drop(active);
         self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(context);
+        drop(active);
         Ok(result)
     }
 
@@ -375,7 +395,7 @@ impl<'cx> Context<'cx> {
         let id = self.shared.roots.borrow_mut().insert(local.value);
 
         // SAFETY: The local belongs to this context and the registry will balance this
-        // protection on last lease drop or runtime invalidation.
+        // protection during host entry maintenance or runtime invalidation.
         unsafe { sys::value_protect(self.raw.as_ptr(), local.value.as_ptr()) };
 
         Ok(Persistent {
@@ -854,6 +874,19 @@ impl Shared {
         native_state::reclaim_finalized(self, finalized);
     }
 
+    fn drain_root_releases(&self, context: NonNull<sys::OpaqueContext>) {
+        debug_assert!(self.gate.active_entries() > 0);
+        debug_assert!(ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), self)));
+        loop {
+            let value = self.roots.borrow_mut().take_pending();
+            let Some(value) = value else { break };
+            // SAFETY: The standalone host owns this active context and calls this
+            // only inside its admitted entry. Each queued slot owns one protection;
+            // it is removed exactly once, with no registry borrow held across JSC.
+            unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
+        }
+    }
+
     fn close_native_finalizers(&self) {
         let finalized = self.native_finalizers.close();
         native_state::reclaim_finalized(self, finalized);
@@ -868,16 +901,9 @@ impl Drop for RootLease {
         if runtime.ensure_thread().is_err() || runtime.gate.state() != HostState::Active {
             return;
         }
-        let Some(context) = runtime.context.get() else {
-            return;
-        };
-        let Some(value) = runtime.roots.borrow_mut().remove(self.id) else {
-            return;
-        };
-
-        // SAFETY: This is the last Rust lease, the registry removed the matching
-        // generation, and the owning context/thread are still active.
-        unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
+        // Root-registry borrows never span user execution. Queue links live in
+        // existing slots, so this performs no allocation or engine operation.
+        runtime.roots.borrow_mut().request_release(self.id);
     }
 }
 
@@ -896,6 +922,7 @@ impl RootRegistry {
         self.slots.push(RootSlot {
             generation: 1,
             value: Some(value),
+            release: RootRelease::Live,
         });
         RootId {
             slot,
@@ -905,14 +932,14 @@ impl RootRegistry {
 
     fn get(&self, id: RootId) -> Option<NonNull<sys::OpaqueValue>> {
         let slot = self.slots.get(id.slot)?;
-        (slot.generation == id.generation)
+        (slot.generation == id.generation && matches!(slot.release, RootRelease::Live))
             .then_some(slot.value)
             .flatten()
     }
 
     fn remove(&mut self, id: RootId) -> Option<NonNull<sys::OpaqueValue>> {
         let slot = self.slots.get_mut(id.slot)?;
-        if slot.generation != id.generation {
+        if slot.generation != id.generation || !matches!(slot.release, RootRelease::Live) {
             return None;
         }
         let value = slot.value.take()?;
@@ -923,10 +950,43 @@ impl RootRegistry {
         Some(value)
     }
 
+    fn request_release(&mut self, id: RootId) {
+        let Some(slot) = self.slots.get_mut(id.slot) else {
+            return;
+        };
+        if slot.generation != id.generation
+            || slot.value.is_none()
+            || !matches!(slot.release, RootRelease::Live)
+        {
+            return;
+        }
+        slot.release = RootRelease::Pending {
+            next: self.pending_head,
+        };
+        self.pending_head = Some(id.slot);
+    }
+
+    fn take_pending(&mut self) -> Option<NonNull<sys::OpaqueValue>> {
+        let index = self.pending_head?;
+        let slot = &mut self.slots[index];
+        let RootRelease::Pending { next } = slot.release else {
+            unreachable!("pending root list contains a live slot");
+        };
+        self.pending_head = next;
+        slot.release = RootRelease::Live;
+        let id = RootId {
+            slot: index,
+            generation: slot.generation,
+        };
+        self.remove(id)
+    }
+
     fn drain(&mut self) -> Vec<NonNull<sys::OpaqueValue>> {
         let mut values = Vec::new();
         self.free.clear();
+        self.pending_head = None;
         for (index, slot) in self.slots.iter_mut().enumerate() {
+            slot.release = RootRelease::Live;
             if let Some(value) = slot.value.take() {
                 values.push(value);
             }
@@ -1205,6 +1265,266 @@ fn value_to_raw_callback(
 mod tests {
     use super::*;
     use std::thread;
+
+    fn retained_roots(shared: &Shared) -> usize {
+        shared
+            .roots
+            .borrow()
+            .slots
+            .iter()
+            .filter(|slot| slot.value.is_some())
+            .count()
+    }
+
+    fn object_root(runtime: &mut Runtime) -> Persistent {
+        runtime
+            .with_context(|cx| {
+                let local = cx.eval("({ answer: 42 })", "release.js").unwrap();
+                cx.persist(&local).unwrap()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn last_lease_drop_waits_for_either_host_entry_path() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let clone = root.clone();
+            drop(root);
+            assert_eq!(retained_roots(&shared), 1);
+            drop(clone);
+            assert_eq!(shared.gate.active_entries(), 0);
+            assert_eq!(retained_roots(&shared), 1, "Drop must only request release");
+            if common_entry {
+                runtime
+                    .with_backend(|_| assert_eq!(retained_roots(&shared), 0))
+                    .unwrap();
+            } else {
+                runtime
+                    .with_context(|_| assert_eq!(retained_roots(&shared), 0))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn lease_drop_inside_entry_waits_for_exit_maintenance() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let operation = || {
+                drop(root);
+                assert_eq!(retained_roots(&shared), 1);
+            };
+            if common_entry {
+                runtime.with_backend(|_| operation()).unwrap();
+            } else {
+                runtime.with_context(|_| operation()).unwrap();
+            }
+            assert_eq!(retained_roots(&shared), 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_releases_pending_and_live_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let pending = object_root(&mut runtime);
+        let live = object_root(&mut runtime);
+        let shared = Rc::clone(&runtime.shared);
+        drop(pending);
+        assert_eq!(retained_roots(&shared), 2);
+        runtime.invalidate().unwrap();
+        assert_eq!(retained_roots(&shared), 0);
+        drop(live);
+        runtime.invalidate().unwrap();
+        assert_eq!(retained_roots(&shared), 0);
+    }
+
+    #[test]
+    fn unwinding_defers_pending_releases_until_the_next_entry() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let operation = || {
+                    drop(root);
+                    panic!("entry interrupted after release request");
+                };
+                if common_entry {
+                    runtime.with_backend(|_| operation()).unwrap();
+                } else {
+                    runtime.with_context(|_| operation()).unwrap();
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(shared.gate.active_entries(), 0);
+            assert!(ACTIVE_RUNTIME.with(|active| active.get().is_null()));
+            assert_eq!(retained_roots(&shared), 1);
+            runtime.with_context(|_| ()).unwrap();
+            assert_eq!(retained_roots(&shared), 0);
+        }
+    }
+
+    #[test]
+    fn another_runtime_cannot_drain_a_dropped_lease() {
+        let mut first = Runtime::new().unwrap();
+        let mut second = Runtime::new().unwrap();
+        let root = object_root(&mut first);
+        let first_shared = Rc::clone(&first.shared);
+        second.with_backend(|_| drop(root)).unwrap();
+        assert_eq!(retained_roots(&first_shared), 1);
+        first.with_backend(|_| ()).unwrap();
+        assert_eq!(retained_roots(&first_shared), 0);
+    }
+
+    #[test]
+    fn dropping_a_burst_uses_existing_slots_and_delays_reuse() {
+        let mut runtime = Runtime::new().unwrap();
+        let roots = runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "burst.js").unwrap();
+                (0..1024)
+                    .map(|_| cx.persist(&value).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let ids = roots.iter().map(|root| root.lease.id).collect::<Vec<_>>();
+        let shared = Rc::clone(&runtime.shared);
+        let capacities = {
+            let registry = shared.roots.borrow();
+            (registry.slots.capacity(), registry.free.capacity())
+        };
+        drop(roots);
+        {
+            let registry = shared.roots.borrow();
+            assert_eq!(
+                (registry.slots.capacity(), registry.free.capacity()),
+                capacities
+            );
+            assert!(registry.free.is_empty());
+            assert!(ids.iter().all(|id| registry.get(*id).is_none()));
+        }
+        assert_eq!(retained_roots(&shared), 1024);
+        let new_root = object_root(&mut runtime);
+        assert_eq!(retained_roots(&shared), 1);
+        assert_eq!(new_root.lease.id.slot, ids[0].slot);
+        assert_ne!(new_root.lease.id.generation, ids[0].generation);
+        assert!(shared.roots.borrow().get(ids[0]).is_none());
+    }
+
+    #[test]
+    fn queued_roots_reject_duplicate_stale_and_exhausted_generations() {
+        let value = NonNull::dangling(); // Registry-only test; never passed to JSC.
+        let mut registry = RootRegistry::default();
+        let first = registry.insert(value);
+        registry.request_release(first);
+        registry.request_release(first);
+        assert_eq!(registry.get(first), None);
+        assert_eq!(registry.remove(first), None);
+        assert_eq!(registry.take_pending(), Some(value));
+        assert_eq!(registry.take_pending(), None);
+
+        let second = registry.insert(value);
+        registry.request_release(first);
+        assert_eq!(registry.get(second), Some(value));
+        assert_eq!(registry.take_pending(), None);
+        registry.slots[second.slot].generation = u64::MAX - 1;
+        let exhausted = RootId {
+            slot: second.slot,
+            generation: u64::MAX - 1,
+        };
+        registry.request_release(exhausted);
+        assert_eq!(registry.take_pending(), Some(value));
+        let third = registry.insert(value);
+        assert_ne!(third.slot, exhausted.slot);
+        registry.request_release(exhausted);
+        assert_eq!(registry.take_pending(), None);
+        assert_eq!(registry.drain(), vec![value]);
+        registry.request_release(third);
+        assert_eq!(registry.take_pending(), None);
+    }
+
+    #[test]
+    fn callback_drop_can_request_release_without_borrowing_the_engine() {
+        let mut runtime = Runtime::new().unwrap();
+        let root = object_root(&mut runtime);
+        let shared = Rc::clone(&runtime.shared);
+        let holder = Rc::new(RefCell::new(Some(root)));
+        runtime
+            .with_context(|cx| {
+                cx.install_host_function("releaseRoot", move |_| {
+                    drop(holder.borrow_mut().take());
+                    assert_eq!(retained_roots(&shared), 1);
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+                cx.eval("releaseRoot()", "drop-in-callback.js").unwrap();
+                assert_eq!(retained_roots(cx.shared), 1);
+            })
+            .unwrap();
+        assert_eq!(retained_roots(&runtime.shared), 0);
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn deferred_lease_release_does_not_consume_explicit_backend_roots() {
+        use rustjsi_backend::{BackendBase, BackendScope, RootScope};
+        let mut runtime = Runtime::new().unwrap();
+        let lease = object_root(&mut runtime);
+        let explicit = runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                scope.persist(scope.number(42.0).unwrap()).unwrap()
+            })
+            .unwrap();
+        drop(lease);
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let value = scope.resolve(explicit).unwrap();
+                assert!((scope.as_number(value).unwrap() - 42.0).abs() < f64::EPSILON);
+                scope.release(explicit).unwrap();
+                assert!(scope.release(explicit).is_err());
+            })
+            .unwrap();
+        assert_eq!(retained_roots(&runtime.shared), 0);
+    }
+
+    #[test]
+    fn pending_root_release_allows_jsc_to_collect_native_state() {
+        let mut runtime = Runtime::new().unwrap();
+        let drops = Rc::new(Cell::new(0));
+        let persistent = runtime
+            .with_context(|cx| {
+                cx.install_native_state(
+                    "rootedResource",
+                    ThreadDropProbe {
+                        drops: Rc::clone(&drops),
+                        threads: Rc::new(RefCell::new(Vec::new())),
+                    },
+                )
+                .unwrap();
+                let local = cx.eval("rootedResource", "rooted-state.js").unwrap();
+                let root = cx.persist(&local).unwrap();
+                cx.eval("delete rootedResource", "delete-rooted-state.js")
+                    .unwrap();
+                root
+            })
+            .unwrap();
+        runtime
+            .with_context(|cx| cx.collect_garbage().unwrap())
+            .unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(persistent);
+        assert_eq!(retained_roots(&runtime.shared), 1);
+        collect_until(&mut runtime, &drops, 1);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(retained_roots(&runtime.shared), 0);
+    }
 
     #[test]
     fn context_locals_in_heap_storage_have_balanced_roots() {

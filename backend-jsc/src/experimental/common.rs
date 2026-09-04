@@ -87,9 +87,10 @@ impl Runtime {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        self.shared.drain_native_finalizers();
         let raw = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(raw);
         let result = {
             let mut backend = JscBackend {
                 shared: &self.shared,
@@ -98,8 +99,9 @@ impl Runtime {
             };
             operation(&mut backend)
         };
-        drop(active);
         self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(raw);
+        drop(active);
         Ok(result)
     }
 }
