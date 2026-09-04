@@ -29,7 +29,12 @@ pub(super) fn copy(string: &JsString) -> Result<JsException, JsError> {
     // SAFETY: The owned JSString remains live. JSC reports UTF-16 code units,
     // not the worst-case UTF-8 capacity returned by maximum_utf8_size.
     let original_units = unsafe { sys::string_length(string.as_ptr()) };
-    let truncated = message.encode_utf16().count() < original_units;
+    let copied_units = if message.is_ascii() {
+        message.len()
+    } else {
+        message.encode_utf16().count()
+    };
+    let truncated = copied_units < original_units;
     if truncated {
         let mut end = message
             .len()

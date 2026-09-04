@@ -135,7 +135,7 @@ fn publication_rollback_preserves_bounded_exception_metadata() {
         assert!(error.message().len() <= 4096);
         assert!(cx.shared.host_functions.borrow().is_empty());
         let error = cx.install_native_state("reject", 42_u32)
-            .err().expect("publication must fail");
+            .expect_err("publication must fail");
         let JsError::Exception(error) = error else {
             panic!("expected native publication exception");
         };

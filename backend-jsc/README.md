@@ -93,6 +93,17 @@ This experimental count limit is separate from `RootLimits`; it does not bound
 capture sizes or the JavaScript heap. Unregistered callback arguments follow
 normal Rust drop behavior on rejection.
 
+Captured exception messages are limited to 4 KiB of UTF-8, including a
+truncation suffix. `JsException::is_truncated()` and the common
+`BackendException::is_truncated()` preserve that distinction. Small messages,
+including embedded NULs, are retained in full. Ordinary string values are not
+truncated. This bounds the Rust diagnostic copy, not JSC string allocation,
+user `toString()` execution, caller-created `HostError` strings or error redaction.
+
+The `exception_capture` bench repeatedly throws pre-created strings and measures
+evaluation, diagnostic copying and error destruction. Message creation and
+runtime setup are outside the timer. Results are batch means, not tail latency.
+
 The `callback_admission` bench measures registration, rejection at the cap and
 invalidation with empty captures. Registration includes name conversion, map
 growth, JSC allocation/protection and global assignment. Rejection includes the
