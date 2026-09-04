@@ -6,6 +6,8 @@ use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
+#[cfg(test)]
+mod local_budget_tests;
 mod local_roots;
 mod native_state;
 mod panic_boundary;
