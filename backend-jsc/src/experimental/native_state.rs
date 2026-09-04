@@ -547,6 +547,191 @@ mod tests {
     }
 
     #[test]
+    fn operation_panic_releases_lease_without_rolling_back_state() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", Cell::new(1)).unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.with_native_state(&handle, |state| {
+                        state.set(2);
+                        panic!("operation failed");
+                    })
+                    .unwrap();
+                }));
+                assert!(result.is_err());
+                assert_eq!(cx.with_native_state(&handle, Cell::get).unwrap(), 2);
+                let registry = cx.shared.native_states.borrow();
+                assert_eq!(
+                    Rc::strong_count(registry.slots[handle.id.slot].value.as_ref().unwrap()),
+                    1
+                );
+            })
+            .unwrap();
+    }
+
+    struct PanicDropProbe {
+        shared: Weak<Shared>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(
+                self.shared
+                    .upgrade()
+                    .unwrap()
+                    .native_states
+                    .try_borrow_mut()
+                    .is_ok()
+            );
+            panic!("state destructor failed");
+        }
+    }
+
+    #[test]
+    fn retiring_during_unwind_contains_last_lease_destructor_panic() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        PanicDropProbe {
+                            shared: Rc::downgrade(&shared),
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.with_native_state(&handle, |_| {
+                        let removed = shared.native_states.borrow_mut().remove(handle.id);
+                        drop_state(&shared, removed);
+                        assert_eq!(drops.get(), 0);
+                        panic!("operation failed");
+                    })
+                    .unwrap();
+                }));
+                let payload = result.expect_err("operation must still unwind");
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"operation failed"));
+                assert_eq!(drops.get(), 1);
+                assert_eq!(shared.native_drop_panics.get(), 1);
+                let value = cx.eval("42", "after-unwind.js").unwrap();
+                assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn queued_finalizer_retirement_preserves_the_active_operation() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .with_context(|cx| {
+                let handle = cx
+                    .install_native_state(
+                        "resource",
+                        DropProbe {
+                            value: 42,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .unwrap();
+                cx.with_native_state(&handle, |state| {
+                    // Inject a finalizer signal on a worker to make retirement timing
+                    // deterministic. No engine API or application state moves there.
+                    let token = Box::new(FinalizerToken {
+                        queue: Arc::clone(&shared.native_finalizers),
+                        id: handle.id,
+                        next: AtomicPtr::new(ptr::null_mut()),
+                    });
+                    std::thread::spawn(move || {
+                        let queue = Arc::clone(&token.queue);
+                        // SAFETY: This thread transfers its uniquely owned test token
+                        // to the queue, exactly as the engine finalizer does.
+                        unsafe { queue.push(Box::into_raw(token)) };
+                    })
+                    .join()
+                    .unwrap();
+                    shared.drain_native_finalizers();
+                    assert_eq!(shared.native_states.borrow().live, 0);
+                    assert_eq!(drops.get(), 0);
+                    assert_eq!(state.value, 42);
+                })
+                .unwrap();
+                assert_eq!(drops.get(), 1);
+            })
+            .unwrap();
+        // The real wrapper's later signal must be stale and harmless.
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn access_rejects_wrong_type_and_draining_runtime() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let handle = cx.install_native_state("resource", 42_u32).unwrap();
+                let forged = NativeObject::<String> {
+                    runtime: Rc::downgrade(&shared),
+                    id: handle.id,
+                    _type: PhantomData,
+                    _affine: PhantomData,
+                };
+                assert_eq!(
+                    cx.with_native_state(&forged, |_| panic!("wrong type ran"))
+                        .unwrap_err(),
+                    JsError::Runtime(RuntimeError::StaleHandle)
+                );
+                shared.gate.request_drain();
+                assert_eq!(
+                    cx.with_native_state(&handle, |_| panic!("draining access ran"))
+                        .unwrap_err(),
+                    JsError::Runtime(RuntimeError::Invalidated)
+                );
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn last_native_lease_defers_its_persistent_root_to_host_maintenance() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "state-owned-root.js").unwrap();
+                let root = cx.persist(&value).unwrap();
+                let handle = cx.install_native_state("resource", root).unwrap();
+                cx.with_native_state(&handle, |_| {
+                    let removed = shared.native_states.borrow_mut().remove(handle.id);
+                    drop_state(&shared, removed);
+                    assert!(shared.roots.borrow().pending_head.is_none());
+                })
+                .unwrap();
+                assert!(shared.roots.borrow().pending_head.is_some());
+            })
+            .unwrap();
+        assert!(shared.roots.borrow().pending_head.is_none());
+        assert!(
+            shared
+                .roots
+                .borrow()
+                .slots
+                .iter()
+                .all(|slot| slot.value.is_none())
+        );
+    }
+
+    #[test]
     fn class_definition_matches_64_bit_jsc_layout() {
         assert_eq!(size_of::<sys::ClassDefinition>(), 128);
         assert_eq!(align_of::<sys::ClassDefinition>(), 8);
