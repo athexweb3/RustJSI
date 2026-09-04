@@ -15,6 +15,7 @@ use rustjsi_backend::{
     BackendManifest, BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope,
     OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
+use rustjsi_host::AttachmentId;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
@@ -86,7 +87,7 @@ pub struct JscScope<'scope, 'entry> {
 /// ```
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct JscValue<'scope> {
-    runtime: u64,
+    attachment: AttachmentId,
     raw: NonNull<sys::OpaqueValue>,
     _scope: PhantomData<&'scope ()>,
     _affine: PhantomData<Rc<()>>,
@@ -95,7 +96,7 @@ pub struct JscValue<'scope> {
 /// An explicit, generational JSC strong root that can cross scope entries.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct JscRoot {
-    runtime: u64,
+    attachment: AttachmentId,
     id: RootId,
     _affine: PhantomData<Rc<()>>,
 }
@@ -301,7 +302,7 @@ impl RootScope for JscScope<'_, '_> {
         // invalidation.
         unsafe { sys::value_protect(self.backend.raw.as_ptr(), value.raw.as_ptr()) };
         Ok(JscRoot {
-            runtime: self.backend.shared.id,
+            attachment: self.backend.shared.id,
             id,
             _affine: PhantomData,
         })
@@ -423,7 +424,7 @@ impl JscScope<'_, '_> {
 
     fn value(&self, raw: NonNull<sys::OpaqueValue>) -> JscValue<'_> {
         JscValue {
-            runtime: self.backend.shared.id,
+            attachment: self.backend.shared.id,
             raw,
             _scope: PhantomData,
             _affine: PhantomData,
@@ -431,7 +432,7 @@ impl JscScope<'_, '_> {
     }
 
     fn ensure_value(&self, value: JscValue<'_>) -> Result<(), BackendError> {
-        if value.runtime == self.backend.shared.id {
+        if value.attachment == self.backend.shared.id {
             Ok(())
         } else {
             Err(BackendError::WrongBackend)
@@ -439,7 +440,7 @@ impl JscScope<'_, '_> {
     }
 
     fn ensure_root(&self, root: JscRoot) -> Result<(), BackendError> {
-        if root.runtime == self.backend.shared.id {
+        if root.attachment == self.backend.shared.id {
             Ok(())
         } else {
             Err(BackendError::WrongBackend)
