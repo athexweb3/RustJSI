@@ -167,9 +167,27 @@ def executable_from_cargo(output):
     return Path(executables.pop())
 
 
-def record_process(arguments, directory, name):
+def compiler_environment(toolchain):
+    environment = os.environ.copy()
+    for variable, binary in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc")):
+        path = command(["rustup", "which", "--toolchain", toolchain, binary])
+        if not Path(path).is_absolute():
+            raise ValueError(f"rustup returned a non-absolute {binary} path")
+        environment[variable] = path
+        environment[f"CARGO_BUILD_{variable}"] = path
+    # Disable both environment- and Cargo-configured wrappers for this build.
+    environment["RUSTC_WRAPPER"] = ""
+    environment["RUSTC_WORKSPACE_WRAPPER"] = ""
+    environment["CARGO_BUILD_RUSTC_WRAPPER"] = ""
+    environment["CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"] = ""
+    environment["RUSTUP_TOOLCHAIN"] = toolchain
+    return environment
+
+
+def record_process(arguments, directory, name, *, environment=None):
     result = subprocess.run(
-        arguments, cwd=ROOT, capture_output=True, text=True, check=False, timeout=300
+        arguments, cwd=ROOT, capture_output=True, text=True, check=False, timeout=300,
+        env=environment,
     )
     for suffix, content in (("stdout", result.stdout), ("stderr", result.stderr)):
         with (directory / f"{name}.{suffix}").open("x", encoding="utf-8") as output:
@@ -204,7 +222,9 @@ def read_report(directory):
         parse_sample((directory / f"run-{index:03}.stdout").read_text(encoding="utf-8"))
         for index in range(count)
     ]
-    return summarize(samples)
+    report = summarize(samples)
+    report["compiler_selection"] = metadata.get("compiler_selection", "unverified")
+    return report
 
 
 def collect(directory, runs, toolchain):
@@ -222,12 +242,15 @@ def collect(directory, runs, toolchain):
     directory.mkdir(parents=True, exist_ok=False)
     try:
         stamp = source_stamp()
+        build_environment = compiler_environment(toolchain)
         build = [
             "rustup", "run", toolchain, "cargo", "bench", "--locked",
             "-p", "rustjsi-backend-jsc", "--features", "experimental-jsc",
             "--bench", "boundary", "--no-run", "--message-format=json",
         ]
-        executable = executable_from_cargo(record_process(build, directory, "build"))
+        executable = executable_from_cargo(record_process(
+            build, directory, "build", environment=build_environment,
+        ))
         metadata = {
             "schema": SCHEMA,
             "benchmark": "boundary",
@@ -237,7 +260,12 @@ def collect(directory, runs, toolchain):
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
             "build_command": build,
-            "rustc": command(["rustup", "run", toolchain, "rustc", "-Vv"]),
+            "compiler_selection": "explicit",
+            "compiler_paths": {
+                key: build_environment[key] for key in ("RUSTC", "RUSTDOC")
+            },
+            "compiler_wrappers": "disabled",
+            "rustc": command([build_environment["RUSTC"], "-Vv"]),
             "cargo": command(["rustup", "run", toolchain, "cargo", "-V"]),
             "os": command(["sw_vers"]),
             "architecture": platform.machine(),
@@ -265,6 +293,7 @@ def collect(directory, runs, toolchain):
         if final_hash != metadata["binary_sha256"]:
             raise RuntimeError("benchmark executable changed during collection")
         report = summarize(samples)
+        report["compiler_selection"] = "explicit"
         write_json(directory / "summary.json", report)
         write_json(directory / "complete.json", {
             "source": final_stamp,
