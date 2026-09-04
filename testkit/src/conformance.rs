@@ -142,6 +142,8 @@ where
 /// This check requires both ownership transfer and stable borrowed-byte
 /// capabilities. Backends may implement the first without implementing the
 /// second.
+/// For entry-borrowing backends, open a scope and use
+/// [`verify_external_buffer_identity_in_scope`] instead.
 ///
 /// # Errors
 ///
@@ -152,9 +154,34 @@ where
     B: BackendBase,
     for<'scope> B::Scope<'scope>: OwnedExternalBufferScope + BorrowedBufferScope,
 {
+    verify_external_buffer_identity_in_scope(&backend.open_scope()?)
+}
+
+/// Verifies exact allocation identity in an already-open capable scope.
+///
+/// Borrowed backends can use this check without a higher-ranked scope bound.
+/// Both ownership transfer and stable borrowed-byte access are required.
+///
+/// ```
+/// use rustjsi_backend::BackendBase;
+/// use rustjsi_testkit::{ModelBackend, verify_external_buffer_identity_in_scope};
+///
+/// let mut model = ModelBackend::new();
+/// model.with_entry(|entry| {
+///     let scope = entry.open_scope().unwrap();
+///     verify_external_buffer_identity_in_scope(&scope).unwrap();
+/// });
+/// ```
+///
+/// # Errors
+///
+/// Returns the first backend, transfer, or conformance failure.
+pub fn verify_external_buffer_identity_in_scope<S>(scope: &S) -> Result<(), BackendError>
+where
+    S: OwnedExternalBufferScope + BorrowedBufferScope,
+{
     let owner = vec![1_u8, 2, 3, 4, 5].into_boxed_slice();
     let pointer = owner.as_ptr();
-    let scope = backend.open_scope()?;
     let value = scope
         .externalize(owner)
         .map_err(|error| error.error().clone())?;
