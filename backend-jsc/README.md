@@ -43,12 +43,24 @@ before accepting the owner. Rejection leaves that operation unexecuted and
 returns rejected external bytes unchanged. Exceptions and unwind refund unused
 reservations; scope cleanup returns committed slots.
 
+String arguments passed from Rust are protected from their creation through
+the synchronous call and result/exception capture. Capacity for every string
+argument is reserved atomically before conversion, after a type-counting pass.
+Argument roots share the local budget and are released before `call` returns;
+scalar arguments do not consume root capacity. This bounds roots, not
+argument-buffer bytes or input string sizes.
+
+The `call_arguments` bench varies string argument counts across inline and
+heap argument storage. It includes conversion, temporary roots, the JSC call
+and result cleanup, with input Rust strings prepared before the timer.
+
 Unknown-result operations require headroom even if they would return scalars.
 Context refunds scalar reservations immediately. Common evaluation/resolution
 keeps its existing protection for every result; direct common primitive
 constructors don't reserve. Zero local capacity rejects evaluation, but those
 primitive constructors still work. Neither budget covers total heap bytes,
-temporary arguments, callback registrations or exception metadata.
+scalar argument storage, input string sizes, callback registrations or exception
+metadata.
 
 Last `Persistent` lease drop marks its existing registry slot for release. It
 doesn't allocate or call JSC. Both entry paths drain requests before user code
