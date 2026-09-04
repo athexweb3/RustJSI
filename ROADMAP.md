@@ -29,6 +29,11 @@ external buffers during a standalone host-authorized entry. It is not ready to
 publish crates or claim runtime compatibility, general performance, or
 production readiness.
 
+The shared host entry gate now provides bounded admission and deferred
+invalidation accounting, exercised against the lifecycle model and both JSC
+entry paths. A complete host contract still needs attached-runtime leases,
+runtime/epoch validation, scheduling, and an explicit final-entry policy.
+
 ## Deferred work
 
 The project does not currently include a React Native module framework,

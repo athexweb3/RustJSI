@@ -15,6 +15,7 @@ name = "rustjsi-backend-jsc"
 version = "0.0.0"
 dependencies = [
  "rustjsi-backend",
+ "rustjsi-host",
  "rustjsi-testkit",
 ]
 
@@ -51,4 +52,5 @@ name = "rustjsi-testkit"
 version = "0.0.0"
 dependencies = [
  "rustjsi-backend",
+ "rustjsi-host",
 ]

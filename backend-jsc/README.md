@@ -17,3 +17,9 @@ strict primitive reads, semantic value kinds, explicit generational roots, and
 owned external buffers. They deliberately do not advertise borrowed buffer
 bytes because JSC documents its backing-store pointer as temporary across API
 calls.
+
+Both standalone entry paths use `rustjsi-host` entry accounting. Teardown
+rejects outstanding entries before releasing roots or the engine. Panic
+unwinding restores the previous active runtime and releases admission counts;
+it does not run engine destruction. The internal entry limit counts host
+admissions, not JavaScript recursion or callbacks within an admitted frame.

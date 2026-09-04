@@ -28,6 +28,11 @@ protect/unprotect pairs through instance-bound generational slots. Temporary
 ArrayBuffer backing pointers are used only for immediate construction-time
 validation and are never exposed as safe borrowed slices.
 
+Both standalone JSC entry paths hold a safe host admission guard until their
+local scopes and finalizer drains have returned. Invalidation checks that no
+entry remains before releasing roots or the context. The gate supplies only
+lifecycle accounting; engine thread and lifetime checks remain in the host.
+
 ## Required documentation
 
 Every future unsafe block must have a nearby explanation of:

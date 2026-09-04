@@ -3,3 +3,7 @@
 //! Host lifecycle, thread entry, and scheduling for `RustJSI`.
 
 #![forbid(unsafe_code)]
+
+mod entry;
+
+pub use entry::{EntryGate, EntryGuard, GateError, HostState};
