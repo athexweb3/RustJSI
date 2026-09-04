@@ -456,6 +456,7 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
             BackendError::Failure("JavaScriptCore runtime thread mismatch")
         }
         RuntimeError::IdentityExhausted => BackendError::Failure("runtime identity exhausted"),
+        RuntimeError::ScopeDepthExceeded => BackendError::Failure("Context scope depth exceeded"),
     }
 }
 

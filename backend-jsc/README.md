@@ -19,11 +19,21 @@ bytes because JSC documents its backing-store pointer as temporary across API
 calls.
 
 The older `Context` API also roots managed locals returned by evaluation,
-calls, and persistent resolution until entry exit. Moving a local into a Rust
-container or dropping its original persistent lease cannot remove that local
+calls, and persistent resolution until its Context scope exits. Moving a local
+into a Rust container or dropping its original persistent lease cannot remove that local
 protection. Scalar primitives skip root storage. Both scope implementations
-share inline storage for 16 roots, then spill to a vector. Long object-heavy
-entries still need bounded/nested frames before production use.
+share inline storage for 16 roots, then spill to a vector.
+
+Use `Context::with_scope` for short batches inside a long host entry. Each child
+has separate root storage, released on return or unwind. Parent values stay
+valid; child locals can't escape. Return owned data or use `persist` explicitly.
+Up to 64 child scopes may nest, independently of host admission depth. The
+common backend already supports sequential short `open_scope` lifetimes.
+
+Scopes only limit local retention when callers keep their batches small. They
+don't impose a root-count/heap quota, undo JS effects or native registrations,
+or drain pending persistent releases and native finalizers. Those still follow
+host-entry maintenance. Explicit resource budgets remain required.
 
 Last `Persistent` lease drop marks its existing registry slot for release. It
 doesn't allocate or call JSC. Both entry paths drain requests before user code
@@ -77,3 +87,7 @@ The `native_access` bench measures typed state reads inside one admitted entry.
 It includes identity checks and the operation lease but excludes wrapper
 creation, JS calls, retirement and finalizer work. Results are run means, not
 tail-latency or application-performance claims.
+
+The `local_scopes` bench compares entry-wide retention (`batch=0`) with short
+batches. It includes evaluation and local-root cleanup, not engine creation.
+It reports elapsed time, not retained heap size or GC latency guarantees.
