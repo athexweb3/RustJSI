@@ -42,7 +42,23 @@ pub(super) struct NativeRegistry {
 struct NativeSlot {
     generation: u64,
     type_id: Option<TypeId>,
-    value: Option<Box<dyn Any>>,
+    value: Option<Rc<dyn Any>>,
+}
+
+struct NativeLease<'a, T: 'static> {
+    shared: &'a Shared,
+    value: Option<Rc<T>>,
+}
+
+impl<T: 'static> Drop for NativeLease<'_, T> {
+    fn drop(&mut self) {
+        // Retirement can leave this operation as the last owner, including on
+        // unwind. Contain the destructor separately from the user's operation.
+        drop_state(
+            self.shared,
+            self.value.take().map(|value| value as Rc<dyn Any>),
+        );
+    }
 }
 
 pub(super) struct FinalizerQueue {
@@ -126,7 +142,7 @@ impl NativeRegistry {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot];
             entry.type_id = Some(TypeId::of::<T>());
-            entry.value = Some(Box::new(value));
+            entry.value = Some(Rc::new(value));
             return Ok(NativeId {
                 slot,
                 generation: entry.generation,
@@ -137,7 +153,7 @@ impl NativeRegistry {
         self.slots.push(NativeSlot {
             generation: 1,
             type_id: Some(TypeId::of::<T>()),
-            value: Some(Box::new(value)),
+            value: Some(Rc::new(value)),
         });
         Ok(NativeId {
             slot,
@@ -145,15 +161,15 @@ impl NativeRegistry {
         })
     }
 
-    fn get<T: 'static>(&self, id: NativeId) -> Option<&T> {
+    fn get<T: 'static>(&self, id: NativeId) -> Option<Rc<T>> {
         let slot = self.slots.get(id.slot)?;
         if slot.generation != id.generation || slot.type_id != Some(TypeId::of::<T>()) {
             return None;
         }
-        slot.value.as_ref()?.downcast_ref()
+        Rc::clone(slot.value.as_ref()?).downcast().ok()
     }
 
-    fn remove(&mut self, id: NativeId) -> Option<Box<dyn Any>> {
+    fn remove(&mut self, id: NativeId) -> Option<Rc<dyn Any>> {
         let slot = self.slots.get_mut(id.slot)?;
         if slot.generation != id.generation {
             return None;
@@ -168,7 +184,7 @@ impl NativeRegistry {
         Some(value)
     }
 
-    pub(super) fn drain(&mut self) -> Vec<Box<dyn Any>> {
+    pub(super) fn drain(&mut self) -> Vec<Rc<dyn Any>> {
         let mut values = Vec::new();
         self.free.clear();
         self.live = 0;
@@ -205,7 +221,7 @@ impl Context<'_> {
         let id = match inserted {
             Ok(id) => id,
             Err(state) => {
-                drop_state(self.shared, Some(Box::new(state)));
+                drop_state(self.shared, Some(Rc::new(state)));
                 return Err(JsError::Backend("native-state capacity exceeded"));
             }
         };
@@ -286,16 +302,37 @@ impl Context<'_> {
         })
     }
 
-    /// Borrows typed Rust state while its JavaScript wrapper remains live.
+    /// Leases live typed Rust state for one synchronous operation.
+    ///
+    /// The registry borrow ends before `operation` starts. Retirement rejects
+    /// future accesses but cannot destroy state used by an admitted operation.
+    /// Only shared access is exposed; interior-mutability rules belong to `T`.
+    ///
+    /// ```compile_fail
+    /// use rustjsi_backend_jsc::Runtime;
+    /// let mut runtime = Runtime::new().unwrap();
+    /// runtime.with_context(|cx| {
+    ///     let object = cx.install_native_state("object", String::from("state")).unwrap();
+    ///     let borrowed = cx.with_native_state(&object, |state| state).unwrap();
+    ///     println!("{borrowed}");
+    /// }).unwrap();
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead, foreign, collected, or type-invalid handle.
+    /// Returns an error for an inactive runtime or dead, foreign, collected, or
+    /// type-invalid handle.
+    ///
+    /// # Panics
+    ///
+    /// Propagates an `operation` panic after releasing its lease. An unwinding
+    /// state-destructor panic is contained and counted separately.
     pub fn with_native_state<T: 'static, R>(
         &mut self,
         handle: &NativeObject<T>,
         operation: impl FnOnce(&T) -> R,
     ) -> Result<R, JsError> {
+        self.shared.ensure_active().map_err(JsError::Runtime)?;
         let runtime = handle
             .runtime
             .upgrade()
@@ -304,11 +341,19 @@ impl Context<'_> {
             return Err(JsError::Runtime(RuntimeError::WrongRuntime));
         }
 
-        let states = self.shared.native_states.borrow();
-        let state = states
+        let state = self
+            .shared
+            .native_states
+            .borrow()
             .get(handle.id)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
-        Ok(operation(state))
+        let lease = NativeLease {
+            shared: self.shared,
+            value: Some(state),
+        };
+        Ok(operation(
+            lease.value.as_deref().expect("live operation lease"),
+        ))
     }
 
     fn rollback_native_object(
@@ -340,13 +385,13 @@ pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken)
     }
 }
 
-pub(super) fn drop_states(shared: &Shared, states: Vec<Box<dyn Any>>) {
+pub(super) fn drop_states(shared: &Shared, states: Vec<Rc<dyn Any>>) {
     for state in states {
         drop_state(shared, Some(state));
     }
 }
 
-fn drop_state(shared: &Shared, state: Option<Box<dyn Any>>) {
+fn drop_state(shared: &Shared, state: Option<Rc<dyn Any>>) {
     if super::contain_unwind(std::panic::AssertUnwindSafe(|| drop(state))).is_err() {
         shared
             .native_drop_panics
