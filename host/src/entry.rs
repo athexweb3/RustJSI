@@ -145,7 +145,7 @@ impl EntryGate {
         self.state.get()
     }
 
-    /// Returns the number of guards not yet dropped.
+    /// Returns the number of normal entry guards not yet dropped.
     #[must_use]
     pub fn active_entries(&self) -> u32 {
         self.entries.get()
@@ -227,7 +227,7 @@ impl EntryGate {
     ///
     /// # Errors
     ///
-    /// Rejects live entries and states other than `Draining` or `Invalid`.
+    /// Rejects live entry or cleanup guards and states other than `Draining` or `Invalid`.
     pub fn finish_drain(&self) -> Result<(), GateError> {
         if self.cleanup.get() {
             return Err(GateError::CleanupInProgress);
