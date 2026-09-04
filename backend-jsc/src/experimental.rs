@@ -1344,6 +1344,189 @@ mod tests {
     }
 
     #[test]
+    fn unwinding_defers_pending_releases_until_the_next_entry() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let operation = || {
+                    drop(root);
+                    panic!("entry interrupted after release request");
+                };
+                if common_entry {
+                    runtime.with_backend(|_| operation()).unwrap();
+                } else {
+                    runtime.with_context(|_| operation()).unwrap();
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(shared.gate.active_entries(), 0);
+            assert!(ACTIVE_RUNTIME.with(|active| active.get().is_null()));
+            assert_eq!(retained_roots(&shared), 1);
+            runtime.with_context(|_| ()).unwrap();
+            assert_eq!(retained_roots(&shared), 0);
+        }
+    }
+
+    #[test]
+    fn another_runtime_cannot_drain_a_dropped_lease() {
+        let mut first = Runtime::new().unwrap();
+        let mut second = Runtime::new().unwrap();
+        let root = object_root(&mut first);
+        let first_shared = Rc::clone(&first.shared);
+        second.with_backend(|_| drop(root)).unwrap();
+        assert_eq!(retained_roots(&first_shared), 1);
+        first.with_backend(|_| ()).unwrap();
+        assert_eq!(retained_roots(&first_shared), 0);
+    }
+
+    #[test]
+    fn dropping_a_burst_uses_existing_slots_and_delays_reuse() {
+        let mut runtime = Runtime::new().unwrap();
+        let roots = runtime
+            .with_context(|cx| {
+                let value = cx.eval("({})", "burst.js").unwrap();
+                (0..1024)
+                    .map(|_| cx.persist(&value).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let ids = roots.iter().map(|root| root.lease.id).collect::<Vec<_>>();
+        let shared = Rc::clone(&runtime.shared);
+        let capacities = {
+            let registry = shared.roots.borrow();
+            (registry.slots.capacity(), registry.free.capacity())
+        };
+        drop(roots);
+        {
+            let registry = shared.roots.borrow();
+            assert_eq!(
+                (registry.slots.capacity(), registry.free.capacity()),
+                capacities
+            );
+            assert!(registry.free.is_empty());
+            assert!(ids.iter().all(|id| registry.get(*id).is_none()));
+        }
+        assert_eq!(retained_roots(&shared), 1024);
+        let new_root = object_root(&mut runtime);
+        assert_eq!(retained_roots(&shared), 1);
+        assert_eq!(new_root.lease.id.slot, ids[0].slot);
+        assert_ne!(new_root.lease.id.generation, ids[0].generation);
+        assert!(shared.roots.borrow().get(ids[0]).is_none());
+    }
+
+    #[test]
+    fn queued_roots_reject_duplicate_stale_and_exhausted_generations() {
+        let value = NonNull::dangling(); // Registry-only test; never passed to JSC.
+        let mut registry = RootRegistry::default();
+        let first = registry.insert(value);
+        registry.request_release(first);
+        registry.request_release(first);
+        assert_eq!(registry.get(first), None);
+        assert_eq!(registry.remove(first), None);
+        assert_eq!(registry.take_pending(), Some(value));
+        assert_eq!(registry.take_pending(), None);
+
+        let second = registry.insert(value);
+        registry.request_release(first);
+        assert_eq!(registry.get(second), Some(value));
+        assert_eq!(registry.take_pending(), None);
+        registry.slots[second.slot].generation = u64::MAX - 1;
+        let exhausted = RootId {
+            slot: second.slot,
+            generation: u64::MAX - 1,
+        };
+        registry.request_release(exhausted);
+        assert_eq!(registry.take_pending(), Some(value));
+        let third = registry.insert(value);
+        assert_ne!(third.slot, exhausted.slot);
+        registry.request_release(exhausted);
+        assert_eq!(registry.take_pending(), None);
+        assert_eq!(registry.drain(), vec![value]);
+        registry.request_release(third);
+        assert_eq!(registry.take_pending(), None);
+    }
+
+    #[test]
+    fn callback_drop_can_request_release_without_borrowing_the_engine() {
+        let mut runtime = Runtime::new().unwrap();
+        let root = object_root(&mut runtime);
+        let shared = Rc::clone(&runtime.shared);
+        let holder = Rc::new(RefCell::new(Some(root)));
+        runtime
+            .with_context(|cx| {
+                cx.install_host_function("releaseRoot", move |_| {
+                    drop(holder.borrow_mut().take());
+                    assert_eq!(retained_roots(&shared), 1);
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+                cx.eval("releaseRoot()", "drop-in-callback.js").unwrap();
+                assert_eq!(retained_roots(cx.shared), 1);
+            })
+            .unwrap();
+        assert_eq!(retained_roots(&runtime.shared), 0);
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn deferred_lease_release_does_not_consume_explicit_backend_roots() {
+        use rustjsi_backend::{BackendBase, BackendScope, RootScope};
+        let mut runtime = Runtime::new().unwrap();
+        let lease = object_root(&mut runtime);
+        let explicit = runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                scope.persist(scope.number(42.0).unwrap()).unwrap()
+            })
+            .unwrap();
+        drop(lease);
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let value = scope.resolve(explicit).unwrap();
+                assert!((scope.as_number(value).unwrap() - 42.0).abs() < f64::EPSILON);
+                scope.release(explicit).unwrap();
+                assert!(scope.release(explicit).is_err());
+            })
+            .unwrap();
+        assert_eq!(retained_roots(&runtime.shared), 0);
+    }
+
+    #[test]
+    fn pending_root_release_allows_jsc_to_collect_native_state() {
+        let mut runtime = Runtime::new().unwrap();
+        let drops = Rc::new(Cell::new(0));
+        let persistent = runtime
+            .with_context(|cx| {
+                cx.install_native_state(
+                    "rootedResource",
+                    ThreadDropProbe {
+                        drops: Rc::clone(&drops),
+                        threads: Rc::new(RefCell::new(Vec::new())),
+                    },
+                )
+                .unwrap();
+                let local = cx.eval("rootedResource", "rooted-state.js").unwrap();
+                let root = cx.persist(&local).unwrap();
+                cx.eval("delete rootedResource", "delete-rooted-state.js")
+                    .unwrap();
+                root
+            })
+            .unwrap();
+        runtime
+            .with_context(|cx| cx.collect_garbage().unwrap())
+            .unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(persistent);
+        assert_eq!(retained_roots(&runtime.shared), 1);
+        collect_until(&mut runtime, &drops, 1);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(retained_roots(&runtime.shared), 0);
+    }
+
+    #[test]
     fn context_locals_in_heap_storage_have_balanced_roots() {
         let mut runtime = Runtime::new().unwrap();
         let shared = Rc::clone(&runtime.shared);
