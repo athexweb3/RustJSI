@@ -136,6 +136,85 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires macOS"):
                 boundary.collect(Path("not-created"), 10, "1.98.0")
 
+    def test_source_fingerprint_includes_untracked_contents(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "untracked.rs"
+            source.write_text("first")
+            results = [
+                subprocess.CompletedProcess([], 0, b"", b""),
+                subprocess.CompletedProcess([], 0, b"untracked.rs\0", b""),
+            ]
+            with (
+                patch.object(boundary, "ROOT", root),
+                patch.object(boundary.subprocess, "run", side_effect=results * 2),
+                patch.object(boundary, "command", side_effect=["head", "untracked.rs"] * 2),
+            ):
+                before = boundary.source_stamp()
+                source.write_text("second")
+                after = boundary.source_stamp()
+            self.assertTrue(before["untracked_files_present"])
+            self.assertNotEqual(before["worktree_sha256"], after["worktree_sha256"])
+
+    def test_collection_success_and_changed_inputs(self):
+        for changed in (None, "source", "binary"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                executable = root / "binary"
+                executable.write_bytes(b"original binary")
+                directory = root / "results"
+                artifact = json.dumps({
+                    "reason": "compiler-artifact",
+                    "target": {"name": "boundary", "kind": ["bench"]},
+                    "executable": str(executable),
+                })
+
+                def fake_process(arguments, destination, name):
+                    output = artifact if name == "build" else SAMPLE
+                    (destination / f"{name}.stdout").write_text(output)
+                    (destination / f"{name}.stderr").write_text("")
+                    if changed == "binary" and name == "run-009":
+                        executable.write_bytes(b"changed binary")
+                    return output
+
+                stamp = {"head": "original"}
+                final = {"head": "changed"} if changed == "source" else stamp
+                with (
+                    patch.object(boundary.platform, "system", return_value="Darwin"),
+                    patch.object(boundary, "source_stamp", side_effect=[stamp, final]),
+                    patch.object(boundary, "command", return_value="test metadata"),
+                    patch.object(boundary, "record_process", side_effect=fake_process) as run,
+                    patch("builtins.print"),
+                ):
+                    if changed:
+                        with self.assertRaisesRegex(RuntimeError, "changed during collection"):
+                            boundary.collect(directory, 10, "test-toolchain")
+                        self.assertFalse((directory / "complete.json").exists())
+                        self.assertFalse((directory / "summary.json").exists())
+                        with self.assertRaisesRegex(ValueError, "collection failed"):
+                            boundary.read_report(directory)
+                    else:
+                        report = boundary.collect(directory, 10, "test-toolchain")
+                        self.assertEqual(boundary.read_report(directory), report)
+                    self.assertEqual(run.call_count, 11)
+                    # An existing collection is never reused, including failed ones.
+                    with self.assertRaises(FileExistsError):
+                        boundary.collect(directory, 10, "test-toolchain")
+
+    def test_report_rejects_invalid_completion_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
+                "source": {"head": "before"}, "binary_sha256": "test-digest",
+            }
+            boundary.write_json(directory / "metadata.json", metadata)
+            boundary.write_json(directory / "complete.json", {
+                "source": {"head": "after"}, "binary_sha256": "test-digest",
+            })
+            with self.assertRaisesRegex(ValueError, "source or binary changed"):
+                boundary.read_report(directory)
+
 
 if __name__ == "__main__":
     unittest.main()
