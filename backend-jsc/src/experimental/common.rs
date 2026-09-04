@@ -251,7 +251,13 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
 impl RootScope for JscScope<'_, '_> {
     fn persist<'value>(&'value self, value: Self::Value<'value>) -> Result<JscRoot, BackendError> {
         self.ensure_value(value)?;
-        let id = self.backend.shared.roots.borrow_mut().insert(value.raw);
+        let id = self
+            .backend
+            .shared
+            .roots
+            .borrow_mut()
+            .insert(value.raw)
+            .map_err(map_runtime_error)?;
         // SAFETY: The registry owns one matching protection until release or runtime
         // invalidation.
         unsafe { sys::value_protect(self.backend.raw.as_ptr(), value.raw.as_ptr()) };
@@ -457,6 +463,9 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         }
         RuntimeError::IdentityExhausted => BackendError::Failure("runtime identity exhausted"),
         RuntimeError::ScopeDepthExceeded => BackendError::Failure("Context scope depth exceeded"),
+        RuntimeError::PersistentRootLimitReached => {
+            BackendError::Failure("persistent root slot limit reached")
+        }
     }
 }
 
@@ -490,6 +499,25 @@ mod tests {
                 };
                 let scope = backend.open_scope().unwrap();
                 verify_number_root_and_release(&scope, root).unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn common_roots_share_the_configured_registry_limit() {
+        let mut runtime = Runtime::new_with_persistent_root_limit(1).unwrap();
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let value = scope.evaluate("({})", "root-budget.js").unwrap();
+                let root = scope.persist(value).unwrap();
+                let second = scope.evaluate("({})", "root-budget.js").unwrap();
+                assert_eq!(
+                    scope.persist(second),
+                    Err(BackendError::Failure("persistent root slot limit reached"))
+                );
+                scope.release(root).unwrap();
+                scope.persist(second).unwrap();
             })
             .unwrap();
     }

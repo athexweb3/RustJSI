@@ -150,6 +150,8 @@ pub enum RuntimeError {
     Host(GateError),
     /// The experimental limit of 64 nested Context scopes was reached.
     ScopeDepthExceeded,
+    /// No persistent registry slot is available within the configured limit.
+    PersistentRootLimitReached,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -202,11 +204,11 @@ struct RootId {
     generation: u64,
 }
 
-#[derive(Default)]
 struct RootRegistry {
     slots: Vec<RootSlot>,
     free: Vec<usize>,
     pending_head: Option<usize>,
+    limit: usize,
 }
 
 struct RootSlot {
@@ -230,10 +232,27 @@ struct JsString(NonNull<sys::OpaqueString>);
 impl Runtime {
     /// Creates an isolated `JavaScriptCore` global context.
     ///
+    /// Uses a limit of 4096 persistent registry slots.
+    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::CreationFailed`] if JSC cannot create the context.
     pub fn new() -> Result<Self, RuntimeError> {
+        Self::new_with_persistent_root_limit(4096)
+    }
+
+    /// Creates a runtime with a persistent registry slot limit.
+    ///
+    /// Live roots, pending releases and generation-exhausted slots count toward
+    /// this limit. Reusable slots are used before growing the registry. Zero
+    /// disables new persistent roots; locals and JavaScript execution still work.
+    /// The limit doesn't reserve memory or bound local roots, lease clones, native
+    /// registrations or the JavaScript heap. It cannot change after creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a creation or runtime-identity error if initialization fails.
+    pub fn new_with_persistent_root_limit(limit: usize) -> Result<Self, RuntimeError> {
         let id = NEXT_RUNTIME_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -251,7 +270,7 @@ impl Runtime {
                 owner: thread::current().id(),
                 gate: EntryGate::new(ENTRY_LIMIT),
                 context: Cell::new(Some(context)),
-                roots: RefCell::new(RootRegistry::default()),
+                roots: RefCell::new(RootRegistry::new(limit)),
                 host_functions: RefCell::new(HashMap::new()),
                 native_states: RefCell::new(native_state::NativeRegistry::default()),
                 native_finalizers,
@@ -393,11 +412,17 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the runtime is inactive or the value is foreign.
+    /// Returns an error when the runtime is inactive, the value is foreign, or
+    /// the persistent registry has reached its configured slot limit.
     pub fn persist(&mut self, local: &Local<'_>) -> Result<Persistent, JsError> {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
         self.ensure_local_runtime(local)?;
-        let id = self.shared.roots.borrow_mut().insert(local.value);
+        let id = self
+            .shared
+            .roots
+            .borrow_mut()
+            .insert(local.value)
+            .map_err(JsError::Runtime)?;
 
         // SAFETY: The local belongs to this context and the registry will balance this
         // protection during host entry maintenance or runtime invalidation.
@@ -814,6 +839,7 @@ impl fmt::Display for RuntimeError {
             Self::StaleHandle => "handle is stale",
             Self::IdentityExhausted => "runtime identity space is exhausted",
             Self::ScopeDepthExceeded => "Context scope depth limit exceeded",
+            Self::PersistentRootLimitReached => "persistent root slot limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)
@@ -914,26 +940,38 @@ impl Drop for RootLease {
 }
 
 impl RootRegistry {
-    fn insert(&mut self, value: NonNull<sys::OpaqueValue>) -> RootId {
+    fn new(limit: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            pending_head: None,
+            limit,
+        }
+    }
+
+    fn insert(&mut self, value: NonNull<sys::OpaqueValue>) -> Result<RootId, RuntimeError> {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot];
             entry.value = Some(value);
-            return RootId {
+            return Ok(RootId {
                 slot,
                 generation: entry.generation,
-            };
+            });
         }
 
+        if self.slots.len() >= self.limit {
+            return Err(RuntimeError::PersistentRootLimitReached);
+        }
         let slot = self.slots.len();
         self.slots.push(RootSlot {
             generation: 1,
             value: Some(value),
             release: RootRelease::Live,
         });
-        RootId {
+        Ok(RootId {
             slot,
             generation: 1,
-        }
+        })
     }
 
     fn get(&self, id: RootId) -> Option<NonNull<sys::OpaqueValue>> {
@@ -1289,21 +1327,40 @@ mod tests {
 
     #[test]
     fn pending_persistent_roots_cannot_grow_without_limit() {
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = Runtime::new_with_persistent_root_limit(32).unwrap();
         runtime
             .with_context(|cx| {
                 let value = cx.eval("({})", "root-budget.js").unwrap();
-                for _ in 0..4096 {
+                for _ in 0..32 {
                     drop(cx.persist(&value).unwrap());
                 }
-                assert!(cx.persist(&value).is_err());
-                assert_eq!(cx.shared.roots.borrow().slots.len(), 4096);
+                assert_eq!(
+                    cx.persist(&value).unwrap_err(),
+                    JsError::Runtime(RuntimeError::PersistentRootLimitReached)
+                );
+                assert_eq!(cx.shared.roots.borrow().slots.len(), 32);
             })
             .unwrap();
         runtime
             .with_context(|cx| {
                 let value = cx.eval("({})", "after-drain.js").unwrap();
                 drop(cx.persist(&value).unwrap());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn zero_persistent_root_limit_still_allows_local_operations() {
+        let mut runtime = Runtime::new_with_persistent_root_limit(0).unwrap();
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("'local'", "zero-root-budget.js").unwrap();
+                assert_eq!(cx.string(&value).unwrap(), "local");
+                assert_eq!(
+                    cx.persist(&value).unwrap_err(),
+                    JsError::Runtime(RuntimeError::PersistentRootLimitReached)
+                );
+                assert!(cx.shared.roots.borrow().slots.is_empty());
             })
             .unwrap();
     }
@@ -1461,8 +1518,8 @@ mod tests {
     #[test]
     fn queued_roots_reject_duplicate_stale_and_exhausted_generations() {
         let value = NonNull::dangling(); // Registry-only test; never passed to JSC.
-        let mut registry = RootRegistry::default();
-        let first = registry.insert(value);
+        let mut registry = RootRegistry::new(4096);
+        let first = registry.insert(value).unwrap();
         registry.request_release(first);
         registry.request_release(first);
         assert_eq!(registry.get(first), None);
@@ -1470,7 +1527,7 @@ mod tests {
         assert_eq!(registry.take_pending(), Some(value));
         assert_eq!(registry.take_pending(), None);
 
-        let second = registry.insert(value);
+        let second = registry.insert(value).unwrap();
         registry.request_release(first);
         assert_eq!(registry.get(second), Some(value));
         assert_eq!(registry.take_pending(), None);
@@ -1481,13 +1538,31 @@ mod tests {
         };
         registry.request_release(exhausted);
         assert_eq!(registry.take_pending(), Some(value));
-        let third = registry.insert(value);
+        let third = registry.insert(value).unwrap();
         assert_ne!(third.slot, exhausted.slot);
         registry.request_release(exhausted);
         assert_eq!(registry.take_pending(), None);
         assert_eq!(registry.drain(), vec![value]);
         registry.request_release(third);
         assert_eq!(registry.take_pending(), None);
+    }
+
+    #[test]
+    fn generation_exhaustion_consumes_a_registry_slot_budget() {
+        let value = NonNull::dangling();
+        let mut registry = RootRegistry::new(1);
+        let id = registry.insert(value).unwrap();
+        registry.slots[id.slot].generation = u64::MAX - 1;
+        let exhausted = RootId {
+            slot: id.slot,
+            generation: u64::MAX - 1,
+        };
+        registry.request_release(exhausted);
+        assert_eq!(registry.take_pending(), Some(value));
+        assert_eq!(
+            registry.insert(value),
+            Err(RuntimeError::PersistentRootLimitReached)
+        );
     }
 
     #[test]
