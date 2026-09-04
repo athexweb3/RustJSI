@@ -13,6 +13,14 @@ processes. `--toolchain` selects another installed toolchain; `--runs` accepts
 iterations per process. Startup, runtime creation and compilation are outside
 the workload timers.
 
+The collector passes absolute `RUSTC` and `RUSTDOC` paths from `rustup which`
+to Cargo through both direct and configuration environment keys, pins nested
+rustup selection, and disables compiler wrappers for that build. This does not change
+the calling shell. Selecting Cargo alone is insufficient when PATH contains
+a different `rustc`. Reports from older collectors without explicit compiler
+selection are marked `unverified`; their recorded `rustc` label may not identify
+the compiler that produced the benchmark binary.
+
 The output directory must not exist and must be outside the repository or
 Git-ignored. It contains Cargo output, raw stdout and
 stderr for every process, hardware/OS/compiler metadata, a binary hash, and
