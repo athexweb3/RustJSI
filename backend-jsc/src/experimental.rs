@@ -6,9 +6,11 @@ use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
+mod local_roots;
 mod native_state;
 mod panic_boundary;
 
+use local_roots::LocalRoots;
 use panic_boundary::contain_unwind;
 
 use std::cell::{Cell, RefCell};
@@ -50,10 +52,21 @@ pub struct Runtime {
 pub struct Context<'cx> {
     shared: &'cx Rc<Shared>,
     raw: NonNull<sys::OpaqueContext>,
+    local_roots: RefCell<LocalRoots>,
     _affine: PhantomData<Rc<()>>,
 }
 
-/// A JavaScript value valid only during its context entry.
+/// A JavaScript value kept live until its context entry ends.
+///
+/// Managed values remain rooted even when this handle is moved to a Rust heap
+/// container. Dropping the handle does not release its context-owned root.
+///
+/// ```compile_fail
+/// use rustjsi_backend_jsc::Runtime;
+/// let mut runtime = Runtime::new().unwrap();
+/// let local = runtime.with_context(|cx| cx.eval("({})", "escape.js").unwrap()).unwrap();
+/// drop(local);
+/// ```
 pub struct Local<'cx> {
     runtime: *const Shared,
     value: NonNull<sys::OpaqueValue>,
@@ -247,6 +260,7 @@ impl Runtime {
             let mut scoped = Context {
                 shared: &self.shared,
                 raw: context,
+                local_roots: RefCell::new(LocalRoots::new()),
                 _affine: PhantomData,
             };
             operation(&mut scoped)
@@ -392,7 +406,7 @@ impl<'cx> Context<'cx> {
             .borrow()
             .get(persistent.lease.id)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
-        Ok(Local::new(Rc::as_ptr(self.shared), value))
+        Ok(self.root_local(value))
     }
 
     /// Installs a stateful Rust callback as a global JavaScript function.
@@ -601,7 +615,41 @@ impl<'cx> Context<'cx> {
         }
         let value = NonNull::new(value.cast_mut())
             .ok_or(JsError::Backend("JavaScriptCore returned a null value"))?;
-        Ok(Local::new(Rc::as_ptr(self.shared), value))
+        Ok(self.root_local(value))
+    }
+
+    fn root_local(&self, value: NonNull<sys::OpaqueValue>) -> Local<'cx> {
+        // SAFETY: This value was returned by this live context or resolved from
+        // its protected-root registry. Type inspection does not coerce it.
+        let kind = unsafe { sys::value_get_type(self.raw.as_ptr(), value.as_ptr()) };
+        if !matches!(
+            kind,
+            sys::TYPE_UNDEFINED | sys::TYPE_NULL | sys::TYPE_BOOLEAN | sys::TYPE_NUMBER
+        ) {
+            // SAFETY: The context keeps this independent protection until Drop,
+            // before the enclosing host entry guard is released.
+            unsafe { sys::value_protect(self.raw.as_ptr(), value.as_ptr()) };
+            self.local_roots.borrow_mut().push(value);
+            #[cfg(test)]
+            self.shared
+                .context_local_roots
+                .set(self.shared.context_local_roots.get() + 1);
+        }
+        Local::new(Rc::as_ptr(self.shared), value)
+    }
+}
+
+impl Drop for Context<'_> {
+    fn drop(&mut self) {
+        for value in self.local_roots.get_mut().drain() {
+            // SAFETY: Each stored value owns one protection in this context;
+            // the host entry still keeps the context alive during unwinding too.
+            unsafe { sys::value_unprotect(self.raw.as_ptr(), value.as_ptr()) };
+            #[cfg(test)]
+            self.shared
+                .context_local_roots
+                .set(self.shared.context_local_roots.get() - 1);
+        }
     }
 }
 
