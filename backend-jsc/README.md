@@ -25,6 +25,18 @@ protection. Scalar primitives skip root storage. Both scope implementations
 share inline storage for 16 roots, then spill to a vector. Long object-heavy
 entries still need bounded/nested frames before production use.
 
+Last `Persistent` lease drop marks its existing registry slot for release. It
+doesn't allocate or call JSC. Both entry paths drain requests before user code
+and after normal return; invalidation releases pending and live roots together.
+Pending slots cannot resolve or be reused until drained. Explicit common-backend
+roots still use `RootScope::release` inside an entry.
+
+An idle runtime retains pending roots. Use an empty `with_context` or
+`with_backend` entry to flush them. If user code unwinds, exit maintenance waits
+until the next entry or invalidation. Pending links need no separate queue
+allocation, but root registration still has no quota, slots retain capacity,
+and draining a backlog has no time budget. `Persistent` remains thread-affine.
+
 Both standalone entry paths use `rustjsi-host` entry accounting. Teardown
 rejects outstanding entries before releasing roots or the engine. Panic
 unwinding restores the previous active runtime and releases admission counts;
@@ -40,3 +52,10 @@ panics. Publication rollback follows the same cleanup path.
 Panic containment cannot recover abort-mode panics, aborting hooks, or double
 panics during unwinding. If destroying a caught panic payload itself panics,
 the second payload is deliberately leaked to avoid another destructor call.
+
+Run `cargo bench -p rustjsi-backend-jsc --features experimental-jsc --bench root_release`
+to measure last-lease drop and entry drain separately. Results are batch means,
+not tail latency or application throughput. Each batch uses separate roots to
+one JS object. Drop includes Rust lease/vector deallocation; drain includes host
+entry, queue polling and JSC unprotect calls. Creation and protection are outside
+the timers, and unrelated live roots remain installed during each case.
