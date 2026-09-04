@@ -9,6 +9,7 @@ mod external_buffer;
 mod local_roots;
 mod native_state;
 mod panic_boundary;
+mod scopes;
 
 use local_roots::LocalRoots;
 use panic_boundary::contain_unwind;
@@ -53,10 +54,11 @@ pub struct Context<'cx> {
     shared: &'cx Rc<Shared>,
     raw: NonNull<sys::OpaqueContext>,
     local_roots: RefCell<LocalRoots>,
+    scope_depth: u32,
     _affine: PhantomData<Rc<()>>,
 }
 
-/// A JavaScript value kept live until its context entry ends.
+/// A JavaScript value kept live until its creating Context scope ends.
 ///
 /// Managed values remain rooted even when this handle is moved to a Rust heap
 /// container. Dropping the handle does not release its context-owned root.
@@ -146,6 +148,8 @@ pub enum RuntimeError {
     IdentityExhausted,
     /// Host entry accounting rejected an operation.
     Host(GateError),
+    /// The experimental limit of 64 nested Context scopes was reached.
+    ScopeDepthExceeded,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -280,6 +284,7 @@ impl Runtime {
                 shared: &self.shared,
                 raw: context,
                 local_roots: RefCell::new(LocalRoots::new()),
+                scope_depth: 0,
                 _affine: PhantomData,
             };
             operation(&mut scoped)
@@ -808,6 +813,7 @@ impl fmt::Display for RuntimeError {
             Self::WrongRuntime => "handle belongs to another runtime",
             Self::StaleHandle => "handle is stale",
             Self::IdentityExhausted => "runtime identity space is exhausted",
+            Self::ScopeDepthExceeded => "Context scope depth limit exceeded",
             Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)
@@ -1273,7 +1279,7 @@ mod tests {
         runtime
             .with_context(|cx| {
                 for _ in 0..128 {
-                    drop(cx.eval("({})", "discarded-local.js").unwrap());
+                    let _ = cx.eval("({})", "discarded-local.js").unwrap();
                 }
                 assert_eq!(shared.context_local_roots.get(), 128);
             })
