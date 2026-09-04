@@ -3,7 +3,7 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
-use rustjsi_host::{EntryGate, GateError, HostState};
+use rustjsi_host::{EntryGate, FinalEntryPolicy, GateError, HostState};
 mod argument_roots;
 #[cfg(test)]
 mod argument_tests;
@@ -333,7 +333,7 @@ impl Runtime {
             shared: Rc::new(Shared {
                 id,
                 owner: thread::current().id(),
-                gate: EntryGate::new(ENTRY_LIMIT),
+                gate: EntryGate::new(ENTRY_LIMIT, FinalEntryPolicy::Guaranteed),
                 context: Cell::new(Some(context)),
                 roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
                 local_budget: LocalBudget::new(limits.local_roots),
@@ -417,7 +417,7 @@ impl Runtime {
             self.shared.drop_callback(entry);
         }
         self.shared.close_native_finalizers();
-        drop(cleanup);
+        cleanup.complete();
         self.shared
             .gate
             .finish_drain()

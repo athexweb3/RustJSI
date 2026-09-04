@@ -20,6 +20,29 @@ pub enum HostState {
     Destroyed,
 }
 
+/// Host promise for a final legal engine entry during teardown.
+///
+/// This policy is fixed for one attachment. It describes host authority, not
+/// whether a particular cleanup attempt has completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalEntryPolicy {
+    /// The host promises one final legal entry before engine destruction.
+    Guaranteed,
+    /// The host will attempt a final entry but may have to finish without one.
+    BestEffort,
+    /// The host cannot provide a final engine entry during teardown.
+    Unavailable,
+}
+
+/// Observed final-entry outcome when draining becomes invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalEntryOutcome {
+    /// Host-authorized entry-dependent cleanup completed.
+    Completed,
+    /// Draining finished without a final engine entry.
+    Unavailable,
+}
+
 /// A rejected entry or lifecycle transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GateError {
@@ -31,6 +54,12 @@ pub enum GateError {
     EntriesRemain(u32),
     /// An exclusive cleanup guard has not yet been dropped.
     CleanupInProgress,
+    /// Guaranteed final-entry cleanup has not completed.
+    FinalEntryRequired,
+    /// The attachment declares that final engine entry is unavailable.
+    FinalEntryUnavailable,
+    /// Final-entry cleanup already completed for this attachment.
+    FinalEntryComplete,
     /// The requested transition is not legal in the current state.
     InvalidTransition {
         /// State at rejection.
@@ -67,7 +96,9 @@ pub struct EntryGate {
     state: Cell<HostState>,
     entries: Cell<u32>,
     cleanup: Cell<bool>,
+    final_entry: Cell<Option<FinalEntryOutcome>>,
     limit: NonZeroU32,
+    final_entry_policy: FinalEntryPolicy,
     _affine: PhantomData<Rc<()>>,
 }
 
@@ -78,10 +109,13 @@ pub struct EntryGate {
 /// premature teardown. This is accounting, not a backend-access token.
 ///
 /// ```compile_fail
-/// use rustjsi_host::EntryGate;
+/// use rustjsi_host::{EntryGate, FinalEntryPolicy};
 /// use std::num::NonZeroU32;
 /// let guard = {
-///     let gate = EntryGate::new(NonZeroU32::new(8).unwrap());
+///     let gate = EntryGate::new(
+///         NonZeroU32::new(8).unwrap(),
+///         FinalEntryPolicy::BestEffort,
+///     );
 ///     gate.try_enter().unwrap()
 /// };
 /// drop(guard);
@@ -101,8 +135,9 @@ pub struct EntryGuard<'gate> {
 /// Exclusive accounting for host-authorized cleanup during draining.
 ///
 /// The host must separately establish engine ownership, thread and VM access.
-/// This guard cannot admit application work. Drop leaves the state Draining,
-/// allowing a host to retry cleanup after unwind. Forgetting it blocks completion.
+/// This guard cannot admit application work. [`Self::complete`] records successful
+/// entry-dependent cleanup. Drop without completion leaves the state Draining,
+/// allowing a host to retry after unwind. Forgetting it blocks completion.
 ///
 /// ```compile_fail
 /// use rustjsi_host::CleanupGuard;
@@ -114,7 +149,11 @@ pub struct EntryGuard<'gate> {
 /// use rustjsi_host::EntryGate;
 /// use std::num::NonZeroU32;
 /// let guard = {
-///     let gate = EntryGate::new(NonZeroU32::new(1).unwrap());
+///     use rustjsi_host::FinalEntryPolicy;
+///     let gate = EntryGate::new(
+///         NonZeroU32::new(1).unwrap(),
+///         FinalEntryPolicy::Guaranteed,
+///     );
 ///     gate.request_drain();
 ///     gate.try_begin_cleanup().unwrap()
 /// };
@@ -127,14 +166,16 @@ pub struct CleanupGuard<'gate> {
 }
 
 impl EntryGate {
-    /// Creates an active gate with an explicit simultaneous-entry limit.
+    /// Creates an active gate with explicit entry and teardown policy.
     #[must_use]
-    pub const fn new(limit: NonZeroU32) -> Self {
+    pub const fn new(limit: NonZeroU32, final_entry_policy: FinalEntryPolicy) -> Self {
         Self {
             state: Cell::new(HostState::Active),
             entries: Cell::new(0),
             cleanup: Cell::new(false),
+            final_entry: Cell::new(None),
             limit,
+            final_entry_policy,
             _affine: PhantomData,
         }
     }
@@ -149,6 +190,19 @@ impl EntryGate {
     #[must_use]
     pub fn active_entries(&self) -> u32 {
         self.entries.get()
+    }
+
+    /// Returns this attachment's immutable final-entry policy.
+    #[must_use]
+    pub const fn final_entry_policy(&self) -> FinalEntryPolicy {
+        self.final_entry_policy
+    }
+
+    /// Returns the terminal final-entry outcome once cleanup is completed or
+    /// draining finishes without an entry.
+    #[must_use]
+    pub fn final_entry_outcome(&self) -> Option<FinalEntryOutcome> {
+        self.final_entry.get()
     }
 
     /// Counts a new entry after the host has checked engine entry legality.
@@ -181,9 +235,11 @@ impl EntryGate {
         }
     }
 
-    /// Reports whether the host may begin entry-dependent teardown.
+    /// Reports whether normal entries have drained and no cleanup guard is live.
     ///
-    /// This does not authorize an engine cleanup entry or perform cleanup.
+    /// The host may then attempt a policy-permitted cleanup entry or make its
+    /// terminal drain decision. This predicate does not authorize engine access;
+    /// `try_begin_cleanup` applies the attachment's final-entry policy.
     #[must_use]
     pub fn is_drain_ready(&self) -> bool {
         self.state.get() == HostState::Draining && self.entries.get() == 0 && !self.cleanup.get()
@@ -213,6 +269,12 @@ impl EntryGate {
         if self.entries.get() != 0 {
             return Err(GateError::EntriesRemain(self.entries.get()));
         }
+        if self.final_entry_policy == FinalEntryPolicy::Unavailable {
+            return Err(GateError::FinalEntryUnavailable);
+        }
+        if self.final_entry.get().is_some() {
+            return Err(GateError::FinalEntryComplete);
+        }
         if self.cleanup.get() {
             return Err(GateError::CleanupInProgress);
         }
@@ -228,15 +290,28 @@ impl EntryGate {
     /// # Errors
     ///
     /// Rejects live entry or cleanup guards and states other than `Draining` or `Invalid`.
-    pub fn finish_drain(&self) -> Result<(), GateError> {
+    pub fn finish_drain(&self) -> Result<FinalEntryOutcome, GateError> {
         if self.cleanup.get() {
             return Err(GateError::CleanupInProgress);
         }
         match self.state.get() {
-            HostState::Invalid => Ok(()),
+            HostState::Invalid => Ok(self
+                .final_entry
+                .get()
+                .unwrap_or(FinalEntryOutcome::Unavailable)),
             HostState::Draining if self.entries.get() == 0 => {
+                if self.final_entry_policy == FinalEntryPolicy::Guaranteed
+                    && self.final_entry.get().is_none()
+                {
+                    return Err(GateError::FinalEntryRequired);
+                }
+                let outcome = self
+                    .final_entry
+                    .get()
+                    .unwrap_or(FinalEntryOutcome::Unavailable);
+                self.final_entry.set(Some(outcome));
                 self.state.set(HostState::Invalid);
-                Ok(())
+                Ok(outcome)
             }
             HostState::Draining => Err(GateError::EntriesRemain(self.entries.get())),
             state => Err(GateError::InvalidTransition {
@@ -281,6 +356,18 @@ impl Drop for CleanupGuard<'_> {
     }
 }
 
+impl CleanupGuard<'_> {
+    /// Records successful entry-dependent cleanup and releases the guard.
+    ///
+    /// This method does not validate engine ownership or thread legality. The
+    /// host must establish those conditions before beginning cleanup.
+    pub fn complete(self) {
+        self.gate
+            .final_entry
+            .set(Some(FinalEntryOutcome::Completed));
+    }
+}
+
 impl fmt::Display for GateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -288,6 +375,15 @@ impl fmt::Display for GateError {
             Self::DepthLimit => formatter.write_str("host entry depth limit reached"),
             Self::EntriesRemain(count) => write!(formatter, "{count} host entries remain"),
             Self::CleanupInProgress => formatter.write_str("host cleanup entry remains"),
+            Self::FinalEntryRequired => {
+                formatter.write_str("guaranteed final host entry has not completed")
+            }
+            Self::FinalEntryUnavailable => {
+                formatter.write_str("host does not provide a final engine entry")
+            }
+            Self::FinalEntryComplete => {
+                formatter.write_str("host final-entry cleanup already completed")
+            }
             Self::InvalidTransition { state, operation } => {
                 write!(formatter, "cannot {operation} while host is {state:?}")
             }
@@ -302,7 +398,17 @@ mod tests {
     use super::*;
 
     fn gate(limit: u32) -> EntryGate {
-        EntryGate::new(NonZeroU32::new(limit).unwrap())
+        EntryGate::new(
+            NonZeroU32::new(limit).unwrap(),
+            FinalEntryPolicy::BestEffort,
+        )
+    }
+
+    fn guaranteed_gate(limit: u32) -> EntryGate {
+        EntryGate::new(
+            NonZeroU32::new(limit).unwrap(),
+            FinalEntryPolicy::Guaranteed,
+        )
     }
 
     #[test]
@@ -466,5 +572,65 @@ mod tests {
         assert_eq!(gate.finish_drain(), Err(GateError::CleanupInProgress));
         assert!(gate.try_begin_cleanup().is_err());
         assert!(!gate.is_drain_ready());
+    }
+
+    #[test]
+    fn guaranteed_policy_requires_completed_cleanup() {
+        let gate = guaranteed_gate(1);
+        assert_eq!(gate.final_entry_policy(), FinalEntryPolicy::Guaranteed);
+        gate.request_drain();
+        assert!(gate.is_drain_ready());
+        assert_eq!(gate.finish_drain(), Err(GateError::FinalEntryRequired));
+
+        let cleanup = gate.try_begin_cleanup().unwrap();
+        drop(cleanup);
+        assert_eq!(gate.finish_drain(), Err(GateError::FinalEntryRequired));
+
+        gate.try_begin_cleanup().unwrap().complete();
+        assert_eq!(
+            gate.final_entry_outcome(),
+            Some(FinalEntryOutcome::Completed)
+        );
+        assert_eq!(gate.finish_drain(), Ok(FinalEntryOutcome::Completed));
+        assert_eq!(gate.finish_drain(), Ok(FinalEntryOutcome::Completed));
+    }
+
+    #[test]
+    fn best_effort_and_unavailable_report_missing_final_entry() {
+        let best_effort = gate(1);
+        best_effort.request_drain();
+        assert_eq!(
+            best_effort.finish_drain(),
+            Ok(FinalEntryOutcome::Unavailable)
+        );
+        assert_eq!(
+            best_effort.final_entry_outcome(),
+            Some(FinalEntryOutcome::Unavailable)
+        );
+
+        let unavailable =
+            EntryGate::new(NonZeroU32::new(1).unwrap(), FinalEntryPolicy::Unavailable);
+        unavailable.request_drain();
+        assert!(unavailable.is_drain_ready());
+        assert_eq!(
+            unavailable.try_begin_cleanup().unwrap_err(),
+            GateError::FinalEntryUnavailable
+        );
+        assert_eq!(
+            unavailable.finish_drain(),
+            Ok(FinalEntryOutcome::Unavailable)
+        );
+    }
+
+    #[test]
+    fn completed_cleanup_cannot_be_reopened() {
+        let gate = guaranteed_gate(1);
+        gate.request_drain();
+        gate.try_begin_cleanup().unwrap().complete();
+        assert_eq!(
+            gate.try_begin_cleanup().unwrap_err(),
+            GateError::FinalEntryComplete
+        );
+        assert_eq!(gate.finish_drain(), Ok(FinalEntryOutcome::Completed));
     }
 }
