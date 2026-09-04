@@ -99,6 +99,9 @@ unsafe extern "C" {
     #[link_name = "JSStringRelease"]
     pub(crate) fn string_release(string: StringRef);
 
+    #[link_name = "JSStringGetLength"]
+    pub(crate) fn string_length(string: StringRef) -> usize;
+
     #[link_name = "JSStringGetMaximumUTF8CStringSize"]
     pub(crate) fn string_maximum_utf8_size(string: StringRef) -> usize;
 
