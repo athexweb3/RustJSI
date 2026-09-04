@@ -9,6 +9,8 @@ mod callback_budget_tests;
 #[cfg(test)]
 mod cleanup_tests;
 mod common;
+#[cfg(test)]
+mod exception_tests;
 mod external_buffer;
 mod local_budget;
 #[cfg(test)]
