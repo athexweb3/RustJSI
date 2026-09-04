@@ -6,9 +6,11 @@ use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
+mod local_roots;
 mod native_state;
 mod panic_boundary;
 
+use local_roots::LocalRoots;
 use panic_boundary::contain_unwind;
 
 use std::cell::{Cell, RefCell};
@@ -50,10 +52,21 @@ pub struct Runtime {
 pub struct Context<'cx> {
     shared: &'cx Rc<Shared>,
     raw: NonNull<sys::OpaqueContext>,
+    local_roots: RefCell<LocalRoots>,
     _affine: PhantomData<Rc<()>>,
 }
 
-/// A JavaScript value valid only during its context entry.
+/// A JavaScript value kept live until its context entry ends.
+///
+/// Managed values remain rooted even when this handle is moved to a Rust heap
+/// container. Dropping the handle does not release its context-owned root.
+///
+/// ```compile_fail
+/// use rustjsi_backend_jsc::Runtime;
+/// let mut runtime = Runtime::new().unwrap();
+/// let local = runtime.with_context(|cx| cx.eval("({})", "escape.js").unwrap()).unwrap();
+/// drop(local);
+/// ```
 pub struct Local<'cx> {
     runtime: *const Shared,
     value: NonNull<sys::OpaqueValue>,
@@ -154,6 +167,8 @@ struct Shared {
     native_finalizers: Arc<native_state::FinalizerQueue>,
     native_drop_panics: Cell<usize>,
     callback_drop_panics: Cell<usize>,
+    #[cfg(test)]
+    context_local_roots: Cell<usize>,
     external_buffers: Arc<external_buffer::ExternalLedger>,
 }
 
@@ -220,6 +235,8 @@ impl Runtime {
                 native_finalizers,
                 native_drop_panics: Cell::new(0),
                 callback_drop_panics: Cell::new(0),
+                #[cfg(test)]
+                context_local_roots: Cell::new(0),
                 external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
         })
@@ -243,6 +260,7 @@ impl Runtime {
             let mut scoped = Context {
                 shared: &self.shared,
                 raw: context,
+                local_roots: RefCell::new(LocalRoots::new()),
                 _affine: PhantomData,
             };
             operation(&mut scoped)
@@ -388,7 +406,7 @@ impl<'cx> Context<'cx> {
             .borrow()
             .get(persistent.lease.id)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
-        Ok(Local::new(Rc::as_ptr(self.shared), value))
+        Ok(self.root_local(value))
     }
 
     /// Installs a stateful Rust callback as a global JavaScript function.
@@ -597,7 +615,41 @@ impl<'cx> Context<'cx> {
         }
         let value = NonNull::new(value.cast_mut())
             .ok_or(JsError::Backend("JavaScriptCore returned a null value"))?;
-        Ok(Local::new(Rc::as_ptr(self.shared), value))
+        Ok(self.root_local(value))
+    }
+
+    fn root_local(&self, value: NonNull<sys::OpaqueValue>) -> Local<'cx> {
+        // SAFETY: This value was returned by this live context or resolved from
+        // its protected-root registry. Type inspection does not coerce it.
+        let kind = unsafe { sys::value_get_type(self.raw.as_ptr(), value.as_ptr()) };
+        if !matches!(
+            kind,
+            sys::TYPE_UNDEFINED | sys::TYPE_NULL | sys::TYPE_BOOLEAN | sys::TYPE_NUMBER
+        ) {
+            // SAFETY: The context keeps this independent protection until Drop,
+            // before the enclosing host entry guard is released.
+            unsafe { sys::value_protect(self.raw.as_ptr(), value.as_ptr()) };
+            self.local_roots.borrow_mut().push(value);
+            #[cfg(test)]
+            self.shared
+                .context_local_roots
+                .set(self.shared.context_local_roots.get() + 1);
+        }
+        Local::new(Rc::as_ptr(self.shared), value)
+    }
+}
+
+impl Drop for Context<'_> {
+    fn drop(&mut self) {
+        for value in self.local_roots.get_mut().drain() {
+            // SAFETY: Each stored value owns one protection in this context;
+            // the host entry still keeps the context alive during unwinding too.
+            unsafe { sys::value_unprotect(self.raw.as_ptr(), value.as_ptr()) };
+            #[cfg(test)]
+            self.shared
+                .context_local_roots
+                .set(self.shared.context_local_roots.get() - 1);
+        }
     }
 }
 
@@ -1153,6 +1205,130 @@ fn value_to_raw_callback(
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn context_locals_in_heap_storage_have_balanced_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let mut values = Vec::new();
+                for index in 0..40 {
+                    values.push(
+                        cx.eval(
+                            &format!("({{ toString() {{ return 'object-{index}'; }} }})"),
+                            "heap.js",
+                        )
+                        .unwrap(),
+                    );
+                }
+                assert_eq!(shared.context_local_roots.get(), 40);
+                cx.collect_garbage().unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(cx.string(value).unwrap(), format!("object-{index}"));
+                }
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn resolved_local_survives_last_persistent_lease_drop() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let persistent = runtime
+            .with_context(|cx| {
+                let value = cx
+                    .eval("({ toString() { return 'kept'; } })", "persist.js")
+                    .unwrap();
+                cx.persist(&value).unwrap()
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+        runtime
+            .with_context(|cx| {
+                let local = Box::new(cx.resolve(&persistent).unwrap());
+                drop(persistent);
+                assert_eq!(shared.context_local_roots.get(), 1);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&local).unwrap(), "kept");
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn context_call_roots_strings_but_not_scalar_results() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let text = cx
+                    .install_host_function("text", |_| Ok(Value::String("kept string".to_owned())))
+                    .unwrap();
+                let scalar = cx
+                    .install_host_function("scalar", |_| Ok(Value::Number(42.0)))
+                    .unwrap();
+                let local = Box::new(cx.call(&text, &[]).unwrap());
+                assert_eq!(shared.context_local_roots.get(), 1);
+                for _ in 0..100 {
+                    let value = cx.call(&scalar, &[]).unwrap();
+                    assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+                }
+                assert_eq!(shared.context_local_roots.get(), 1);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&local).unwrap(), "kept string");
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn context_root_cleanup_runs_on_unwind() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime
+                .with_context(|cx| {
+                    let _local = cx.eval("({})", "unwind.js").unwrap();
+                    assert_eq!(shared.context_local_roots.get(), 1);
+                    panic!("context unwind");
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"context unwind")
+        );
+        assert_eq!(shared.context_local_roots.get(), 0);
+        assert_eq!(shared.gate.active_entries(), 0);
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn context_roots_managed_kinds_without_retaining_scalar_primitives() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                for source in ["undefined", "null", "true", "NaN", "Infinity", "-0"] {
+                    let _value = cx.eval(source, "scalar.js").unwrap();
+                }
+                assert_eq!(shared.context_local_roots.get(), 0);
+                let symbol = Box::new(cx.eval("Symbol('local')", "symbol.js").unwrap());
+                let bigint = Box::new(cx.eval("123n", "bigint.js").unwrap());
+                let string = Box::new(cx.eval("'rooted string'", "string.js").unwrap());
+                assert_eq!(shared.context_local_roots.get(), 3);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&bigint).unwrap(), "123");
+                assert_eq!(cx.string(&string).unwrap(), "rooted string");
+                let root = cx.persist(&symbol).unwrap();
+                drop(root);
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
 
     struct DropProbe(Rc<Cell<usize>>);
 

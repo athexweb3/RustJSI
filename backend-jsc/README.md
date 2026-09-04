@@ -18,6 +18,13 @@ owned external buffers. They deliberately do not advertise borrowed buffer
 bytes because JSC documents its backing-store pointer as temporary across API
 calls.
 
+The older `Context` API also roots managed locals returned by evaluation,
+calls, and persistent resolution until entry exit. Moving a local into a Rust
+container or dropping its original persistent lease cannot remove that local
+protection. Scalar primitives skip root storage. Both scope implementations
+share inline storage for 16 roots, then spill to a vector. Long object-heavy
+entries still need bounded/nested frames before production use.
+
 Both standalone entry paths use `rustjsi-host` entry accounting. Teardown
 rejects outstanding entries before releasing roots or the engine. Panic
 unwinding restores the previous active runtime and releases admission counts;

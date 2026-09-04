@@ -3,6 +3,7 @@
 //! Common `RustJSI` backend contract over one host-authorized JSC entry.
 
 use super::external_buffer::{make_external_object, new_observation};
+use super::local_roots::LocalRoots;
 use super::{
     ActiveRuntimeGuard, JsError, JsString, RootId, Runtime, RuntimeError, Shared,
     exception_to_owned, value_to_string,
@@ -17,8 +18,6 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
-
-const INLINE_LOCAL_ROOTS: usize = 16;
 
 /// Engine mechanics exposed only during a host-authorized JSC entry.
 ///
@@ -72,12 +71,6 @@ pub struct JscRoot {
     runtime: u64,
     id: RootId,
     _affine: PhantomData<Rc<()>>,
-}
-
-struct LocalRoots {
-    inline: [Option<NonNull<sys::OpaqueValue>>; INLINE_LOCAL_ROOTS],
-    inline_len: usize,
-    spill: Vec<NonNull<sys::OpaqueValue>>,
 }
 
 impl Runtime {
@@ -423,33 +416,6 @@ impl JscScope<'_, '_> {
         } else {
             Ok(ValueKind::Buffer)
         }
-    }
-}
-
-impl LocalRoots {
-    const fn new() -> Self {
-        Self {
-            inline: [None; INLINE_LOCAL_ROOTS],
-            inline_len: 0,
-            spill: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, value: NonNull<sys::OpaqueValue>) {
-        if self.inline_len < INLINE_LOCAL_ROOTS {
-            self.inline[self.inline_len] = Some(value);
-            self.inline_len += 1;
-        } else {
-            self.spill.push(value);
-        }
-    }
-
-    fn drain(&mut self) -> impl Iterator<Item = NonNull<sys::OpaqueValue>> + '_ {
-        let inline = self.inline[..self.inline_len]
-            .iter_mut()
-            .filter_map(Option::take);
-        self.inline_len = 0;
-        inline.chain(self.spill.drain(..))
     }
 }
 
