@@ -9,6 +9,8 @@ mod external_buffer;
 mod local_roots;
 mod native_state;
 mod panic_boundary;
+#[cfg(test)]
+mod root_budget_tests;
 mod scopes;
 
 use local_roots::LocalRoots;
