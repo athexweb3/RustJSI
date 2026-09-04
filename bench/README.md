@@ -13,7 +13,8 @@ processes. `--toolchain` selects another installed toolchain; `--runs` accepts
 iterations per process. Startup, runtime creation and compilation are outside
 the workload timers.
 
-The output directory must not exist. It contains Cargo output, raw stdout and
+The output directory must not exist and must be outside the repository or
+Git-ignored. It contains Cargo output, raw stdout and
 stderr for every process, hardware/OS/compiler metadata, a binary hash, and
 summary statistics. A completion record is written only after all samples
 validate and source/binary checks match. Failed collections retain diagnostic

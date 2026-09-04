@@ -212,6 +212,13 @@ def collect(directory, runs, toolchain):
         raise ValueError("the boundary benchmark requires macOS system JavaScriptCore")
     if not 10 <= runs <= 1_000:
         raise ValueError("runs must be between 10 and 1000")
+    if directory.is_relative_to(ROOT):
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--quiet", str(directory)], cwd=ROOT,
+            check=False, timeout=60,
+        )
+        if ignored.returncode != 0:
+            raise ValueError("output inside the repository must be Git-ignored")
     directory.mkdir(parents=True, exist_ok=False)
     try:
         stamp = source_stamp()

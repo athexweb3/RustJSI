@@ -136,6 +136,15 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires macOS"):
                 boundary.collect(Path("not-created"), 10, "1.98.0")
 
+    def test_collection_cannot_pollute_its_source_fingerprint(self):
+        result = subprocess.CompletedProcess([], 1)
+        with (
+            patch.object(boundary.platform, "system", return_value="Darwin"),
+            patch.object(boundary.subprocess, "run", return_value=result),
+        ):
+            with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
+                boundary.collect(boundary.ROOT / "not-created", 10, "1.98.0")
+
     def test_source_fingerprint_includes_untracked_contents(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
