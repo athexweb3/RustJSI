@@ -50,6 +50,28 @@ struct NativeLease<'a, T: 'static> {
     value: Option<Rc<T>>,
 }
 
+struct PublicationRoot {
+    context: NonNull<sys::OpaqueContext>,
+    object: NonNull<sys::OpaqueValue>,
+}
+
+impl PublicationRoot {
+    fn new(context: NonNull<sys::OpaqueContext>, object: NonNull<sys::OpaqueValue>) -> Self {
+        // SAFETY: The caller just created this object inside its active Context.
+        // Keep it rooted through setters, exception conversion and rollback.
+        unsafe { sys::value_protect(context.as_ptr(), object.as_ptr()) };
+        Self { context, object }
+    }
+}
+
+impl Drop for PublicationRoot {
+    fn drop(&mut self) {
+        // SAFETY: This stack-local guard cannot outlive the installation entry;
+        // its protection is released once, before the Context or host entry ends.
+        unsafe { sys::value_unprotect(self.context.as_ptr(), self.object.as_ptr()) };
+    }
+}
+
 impl<T: 'static> Drop for NativeLease<'_, T> {
     fn drop(&mut self) {
         // Retirement can leave this operation as the last owner, including on
@@ -258,6 +280,7 @@ impl Context<'_> {
             drop_state(self.shared, state);
             return Err(JsError::Backend("JavaScriptCore object creation failed"));
         };
+        let _publication_root = PublicationRoot::new(self.raw, object);
 
         let property = match JsString::new(name) {
             Ok(property) => property,
@@ -288,10 +311,9 @@ impl Context<'_> {
             );
         }
         if !exception.is_null() {
+            let exception = super::exception_to_owned(self.raw, exception);
             self.rollback_native_object(object, token, id);
-            return Err(JsError::Exception(super::exception_to_owned(
-                self.raw, exception,
-            )));
+            return Err(JsError::Exception(exception));
         }
 
         Ok(NativeObject {
@@ -495,6 +517,31 @@ mod tests {
                 );
             })
             .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn publication_error_is_captured_before_state_destruction() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        runtime.with_context(|cx| {
+            let observed_drops = Rc::clone(&drops);
+            cx.install_host_function("stateWasDropped", move |_| {
+                Ok(super::super::Value::Boolean(observed_drops.get() != 0))
+            }).unwrap();
+            cx.eval("Object.defineProperty(globalThis, 'rejectState', { set(value) { globalThis.savedRejectedState = value; throw { toString() { return stateWasDropped() ? 'changed after cleanup' : 'publication failed'; } }; } })", "native-setter.js").unwrap();
+            let error = cx.install_native_state("rejectState", DropProbe {
+                value: 42,
+                drops: Rc::clone(&drops),
+            }).unwrap_err();
+            assert!(matches!(error, JsError::Exception(ref error) if error.message().contains("publication failed")), "{error}");
+            assert_eq!(drops.get(), 1);
+            assert_eq!(shared.native_states.borrow().live, 0);
+            cx.eval("delete savedRejectedState", "delete-rejected-state.js").unwrap();
+            cx.collect_garbage().unwrap();
+        }).unwrap();
         runtime.invalidate().unwrap();
         assert_eq!(drops.get(), 1);
     }
