@@ -3,6 +3,7 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
+use rustjsi_host::{EntryGate, GateError, HostState};
 mod common;
 mod external_buffer;
 mod native_state;
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::ptr::{self, NonNull};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -27,6 +29,7 @@ thread_local! {
 }
 
 const INLINE_ARGUMENTS: usize = 8;
+const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A standalone `JavaScriptCore` runtime owned by the current thread.
@@ -115,6 +118,8 @@ pub enum RuntimeError {
     StaleHandle,
     /// The process exhausted unique runtime identities.
     IdentityExhausted,
+    /// Host entry accounting rejected an operation.
+    Host(GateError),
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -138,7 +143,7 @@ type Callback = dyn for<'call> Fn(Call<'call>) -> Result<Value, HostError> + 'st
 struct Shared {
     id: u64,
     owner: ThreadId,
-    lifecycle: Cell<Lifecycle>,
+    gate: EntryGate,
     context: Cell<Option<NonNull<sys::OpaqueContext>>>,
     roots: RefCell<RootRegistry>,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
@@ -175,13 +180,6 @@ struct RootSlot {
     value: Option<NonNull<sys::OpaqueValue>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lifecycle {
-    Active,
-    Draining,
-    Invalid,
-}
-
 struct ActiveRuntimeGuard {
     previous: *const Shared,
 }
@@ -210,7 +208,7 @@ impl Runtime {
             shared: Rc::new(Shared {
                 id,
                 owner: thread::current().id(),
-                lifecycle: Cell::new(Lifecycle::Active),
+                gate: EntryGate::new(ENTRY_LIMIT),
                 context: Cell::new(Some(context)),
                 roots: RefCell::new(RootRegistry::default()),
                 host_functions: RefCell::new(HashMap::new()),
@@ -232,6 +230,7 @@ impl Runtime {
         operation: impl for<'cx> FnOnce(&mut Context<'cx>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
+        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         self.shared.drain_native_finalizers();
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
@@ -252,14 +251,19 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::WrongThread`] when called off the owning thread.
+    /// Returns an affinity error or refuses teardown while entries remain.
     pub fn invalidate(&mut self) -> Result<(), RuntimeError> {
         self.shared.ensure_thread()?;
-        if self.shared.lifecycle.get() == Lifecycle::Invalid {
+        if self.shared.gate.state() == HostState::Destroyed {
             return Ok(());
         }
 
-        self.shared.lifecycle.set(Lifecycle::Draining);
+        self.shared.gate.request_drain();
+        if !self.shared.gate.is_drain_ready() {
+            return Err(RuntimeError::Host(GateError::EntriesRemain(
+                self.shared.gate.active_entries(),
+            )));
+        }
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let roots = self.shared.roots.borrow_mut().drain();
         let functions = self
@@ -277,6 +281,10 @@ impl Runtime {
         }
         self.shared.host_functions.borrow_mut().clear();
         self.shared.close_native_finalizers();
+        self.shared
+            .gate
+            .finish_drain()
+            .map_err(RuntimeError::Host)?;
 
         // SAFETY: `Runtime` owns the retained global context, all RustJSI roots have
         // been released, and the owning thread is performing the single release.
@@ -284,7 +292,10 @@ impl Runtime {
         self.shared.context.set(None);
         let native_states = self.shared.native_states.borrow_mut().drain();
         native_state::drop_states(&self.shared, native_states);
-        self.shared.lifecycle.set(Lifecycle::Invalid);
+        self.shared
+            .gate
+            .mark_destroyed()
+            .map_err(RuntimeError::Host)?;
         Ok(())
     }
 }
@@ -701,12 +712,20 @@ impl fmt::Display for RuntimeError {
             Self::WrongRuntime => "handle belongs to another runtime",
             Self::StaleHandle => "handle is stale",
             Self::IdentityExhausted => "runtime identity space is exhausted",
+            Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)
     }
 }
 
-impl Error for RuntimeError {}
+impl Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Host(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for JsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -740,7 +759,7 @@ impl Shared {
 
     fn ensure_active(&self) -> Result<(), RuntimeError> {
         self.ensure_thread()?;
-        if self.lifecycle.get() == Lifecycle::Active {
+        if self.gate.state() == HostState::Active {
             Ok(())
         } else {
             Err(RuntimeError::Invalidated)
@@ -763,7 +782,7 @@ impl Drop for RootLease {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        if runtime.ensure_thread().is_err() || runtime.lifecycle.get() != Lifecycle::Active {
+        if runtime.ensure_thread().is_err() || runtime.gate.state() != HostState::Active {
             return;
         }
         let Some(context) = runtime.context.get() else {
@@ -1262,6 +1281,156 @@ mod tests {
         let mut runtime = Runtime::new().unwrap();
         runtime.invalidate().unwrap();
         runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn both_entry_paths_release_admission_after_unwinding() {
+        use rustjsi_backend::{BackendBase, BackendScope};
+
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.with_context(|_| {
+                assert_eq!(shared.gate.active_entries(), 1);
+                panic!("context entry panic");
+            })
+        }));
+        assert!(panic.is_err());
+        assert_eq!(shared.gate.active_entries(), 0);
+        assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.with_backend(|backend| {
+                assert_eq!(shared.gate.active_entries(), 1);
+                let scope = backend.open_scope().unwrap();
+                let _value = scope.evaluate("({answer: 42})", "panic.js").unwrap();
+                panic!("common entry panic");
+            })
+        }));
+        assert!(panic.is_err());
+        assert_eq!(shared.gate.active_entries(), 0);
+        assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+        runtime
+            .with_context(|cx| {
+                let value = cx.eval("42", "after.js").unwrap();
+                assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+        assert_eq!(shared.gate.state(), HostState::Destroyed);
+    }
+
+    #[test]
+    fn busy_invalidation_preserves_engine_and_callback_state_until_retry() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+        let probe = DropProbe(Rc::clone(&drops));
+        let persistent = runtime
+            .with_context(|cx| {
+                cx.install_host_function("ownedCallback", move |_| {
+                    let _probe = &probe;
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+                let value = cx.eval("({answer: 42})", "busy.js").unwrap();
+                cx.persist(&value).unwrap()
+            })
+            .unwrap();
+
+        let outer = shared.gate.try_enter().unwrap();
+        let inner = shared.gate.try_enter().unwrap();
+        let raw = shared.context.get();
+        assert_eq!(
+            runtime.invalidate(),
+            Err(RuntimeError::Host(GateError::EntriesRemain(2)))
+        );
+        assert_eq!(shared.context.get(), raw);
+        assert!(shared.roots.borrow().get(persistent.lease.id).is_some());
+        assert_eq!(drops.get(), 0);
+        assert_eq!(
+            runtime.with_context(|_| ()).unwrap_err(),
+            RuntimeError::Invalidated
+        );
+        assert_eq!(
+            runtime.with_backend(|_| ()).unwrap_err(),
+            RuntimeError::Invalidated
+        );
+        drop(inner);
+        assert_eq!(
+            runtime.invalidate(),
+            Err(RuntimeError::Host(GateError::EntriesRemain(1)))
+        );
+        drop(outer);
+        assert!(shared.gate.is_drain_ready());
+        assert_eq!(shared.context.get(), raw);
+        assert_eq!(drops.get(), 0);
+        runtime.invalidate().unwrap();
+        runtime.invalidate().unwrap();
+        assert!(shared.context.get().is_none());
+        assert_eq!(shared.gate.state(), HostState::Destroyed);
+        assert!(shared.roots.borrow().get(persistent.lease.id).is_none());
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn both_entry_paths_reject_depth_limit_before_calling_user_code() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let mut entries = (0..64)
+            .map(|_| shared.gate.try_enter().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runtime
+                .with_context(|_| panic!("must not enter"))
+                .unwrap_err(),
+            RuntimeError::Host(GateError::DepthLimit)
+        );
+        assert_eq!(
+            runtime
+                .with_backend(|_| panic!("must not enter"))
+                .unwrap_err(),
+            RuntimeError::Host(GateError::DepthLimit)
+        );
+        assert_eq!(shared.gate.active_entries(), 64);
+        drop(entries.pop());
+        runtime
+            .with_context(|_| assert_eq!(shared.gate.active_entries(), 64))
+            .unwrap();
+        runtime
+            .with_backend(|_| assert_eq!(shared.gate.active_entries(), 64))
+            .unwrap();
+        drop(entries);
+        assert_eq!(shared.gate.active_entries(), 0);
+    }
+
+    #[test]
+    fn nested_runtime_panic_restores_outer_entry_and_callback_dispatch() {
+        let mut first = Runtime::new().unwrap();
+        let mut second = Runtime::new().unwrap();
+        let first_shared = Rc::clone(&first.shared);
+        let second_shared = Rc::clone(&second.shared);
+        first
+            .with_context(|cx| {
+                cx.install_host_function("outerAnswer", |_| Ok(Value::Number(42.0)))
+                    .unwrap();
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    second.with_backend(|_| {
+                        assert_eq!(first_shared.gate.active_entries(), 1);
+                        assert_eq!(second_shared.gate.active_entries(), 1);
+                        assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&second_shared));
+                        panic!("nested entry panic");
+                    })
+                }));
+                assert!(panic.is_err());
+                assert_eq!(second_shared.gate.active_entries(), 0);
+                assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&first_shared));
+                let answer = cx.eval("outerAnswer()", "outer.js").unwrap();
+                assert!((cx.number(&answer).unwrap() - 42.0).abs() < f64::EPSILON);
+            })
+            .unwrap();
+        assert_eq!(first_shared.gate.active_entries(), 0);
+        assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
     }
 
     #[test]

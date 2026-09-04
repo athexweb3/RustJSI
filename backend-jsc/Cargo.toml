@@ -12,10 +12,11 @@ publish.workspace = true
 
 [features]
 default = []
-experimental-jsc = ["dep:rustjsi-backend"]
+experimental-jsc = ["dep:rustjsi-backend", "dep:rustjsi-host"]
 
 [dependencies]
 rustjsi-backend = { path = "../backend", version = "=0.0.0", optional = true }
+rustjsi-host = { path = "../host", version = "=0.0.0", optional = true }
 
 [dev-dependencies]
 rustjsi-testkit = { path = "../testkit", version = "=0.0.0" }

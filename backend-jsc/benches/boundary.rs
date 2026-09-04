@@ -6,7 +6,9 @@
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Runtime, Value};
+    use rustjsi_host::EntryGate;
     use std::hint::black_box;
+    use std::num::NonZeroU32;
     use std::time::Instant;
 
     const WARMUP: u32 = 10_000;
@@ -16,6 +18,17 @@ fn main() {
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
+    let gate = EntryGate::new(NonZeroU32::new(64).unwrap());
+    let gate_entry = measure_entry(WARMUP, ITERATIONS, || {
+        let entry = black_box(&gate).try_enter().expect("admit host entry");
+        black_box(&entry);
+        drop(entry);
+    });
+    let common_entry = measure_entry(WARMUP, ITERATIONS, || {
+        black_box(&mut runtime)
+            .with_backend(|_| black_box(()))
+            .expect("enter common backend");
+    });
     let mut rustjsi = 0.0;
     runtime
         .with_context(|context| {
@@ -59,6 +72,8 @@ fn main() {
         .expect("enter common JSC backend");
 
     println!("direct_jsc_lower_bound: {direct:.2} ns/call");
+    println!("host_gate_admit_and_exit: {gate_entry:.2} ns/entry");
+    println!("jsc_common_empty_entry: {common_entry:.2} ns/entry");
     println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
@@ -70,6 +85,18 @@ fn main() {
         "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
         common_scalar / direct_scalar
     );
+}
+
+#[cfg(target_os = "macos")]
+fn measure_entry(warmup: u32, iterations: u32, mut operation: impl FnMut()) -> f64 {
+    for _ in 0..warmup {
+        operation();
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..iterations {
+        operation();
+    }
+    started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
 }
 
 #[cfg(not(target_os = "macos"))]

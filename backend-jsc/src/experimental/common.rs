@@ -93,6 +93,7 @@ impl Runtime {
         operation: impl for<'entry> FnOnce(&mut JscBackend<'entry>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
+        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         self.shared.drain_native_finalizers();
         let raw = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
@@ -480,6 +481,7 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
     match error {
         RuntimeError::WrongRuntime => BackendError::WrongBackend,
         RuntimeError::StaleHandle => BackendError::StaleHandle,
+        RuntimeError::Host(_) => BackendError::Failure("JavaScriptCore host entry rejected"),
         RuntimeError::CreationFailed => BackendError::Failure("JavaScriptCore creation failed"),
         RuntimeError::Invalidated => BackendError::Failure("JavaScriptCore runtime is invalid"),
         RuntimeError::WrongThread => {
