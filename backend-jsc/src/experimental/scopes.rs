@@ -73,7 +73,8 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::experimental::{ACTIVE_RUNTIME, Runtime};
+    use super::{Context, MAX_SCOPE_DEPTH, RuntimeError};
+    use crate::experimental::{ACTIVE_RUNTIME, JsError, Runtime};
     use std::rc::Rc;
 
     #[test]
@@ -131,5 +132,126 @@ mod tests {
                 assert_eq!(cx.string(&value).unwrap(), "retained");
             })
             .unwrap();
+    }
+
+    #[test]
+    fn nested_unwind_releases_only_child_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let parent = cx.eval("'parent'", "parent.js").unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cx.with_scope(|child| {
+                        let _ = child.eval("'child'", "child.js").unwrap();
+                        child
+                            .with_scope(|grandchild| {
+                                for _ in 0..32 {
+                                    let _ = grandchild.eval("({})", "grandchild.js").unwrap();
+                                }
+                                assert_eq!(shared.context_local_roots.get(), 34);
+                                panic!("nested scope panic");
+                            })
+                            .unwrap();
+                    })
+                    .unwrap();
+                }));
+                assert!(result.is_err());
+                assert_eq!(shared.context_local_roots.get(), 1);
+                assert_eq!(shared.gate.active_entries(), 1);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&parent).unwrap(), "parent");
+                cx.with_scope(|_| ()).unwrap();
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn javascript_error_return_releases_child_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let result: Result<(), JsError> = cx
+                    .with_scope(|child| {
+                        let _ = child.eval("({})", "child.js")?;
+                        let _ = child.eval("throw new Error('failed batch')", "failure.js")?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(matches!(result, Err(JsError::Exception(_))));
+                assert_eq!(shared.context_local_roots.get(), 0);
+                cx.with_scope(|_| ()).unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn scope_depth_limit_is_independent_of_host_admission() {
+        fn descend(cx: &mut Context<'_>) -> Result<(), RuntimeError> {
+            let _ = cx.eval("({})", "depth.js").unwrap();
+            assert_eq!(cx.shared.gate.active_entries(), 1);
+            assert_eq!(
+                cx.shared.context_local_roots.get(),
+                cx.scope_depth as usize + 1
+            );
+            if cx.scope_depth == MAX_SCOPE_DEPTH {
+                return cx.with_scope(|_| panic!("scope depth limit was bypassed"));
+            }
+            cx.with_scope(descend)?
+        }
+
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        assert_eq!(
+            runtime.with_context(descend).unwrap(),
+            Err(RuntimeError::ScopeDepthExceeded)
+        );
+        assert_eq!(shared.context_local_roots.get(), 0);
+        assert_eq!(shared.gate.active_entries(), 0);
+        runtime
+            .with_context(|cx| cx.with_scope(|_| ()).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn draining_rejects_child_scope_before_user_code() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                shared.gate.request_drain();
+                assert_eq!(
+                    cx.with_scope(|_| panic!("draining scope ran")).unwrap_err(),
+                    RuntimeError::Invalidated
+                );
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn scopes_do_not_flush_persistent_releases_or_undo_native_registration() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let object = cx
+                    .with_scope(|child| {
+                        let value = child.eval("({})", "scope.js").unwrap();
+                        let root = child.persist(&value).unwrap();
+                        drop(root);
+                        child
+                            .install_native_state("registeredState", 42_u32)
+                            .unwrap()
+                    })
+                    .unwrap();
+                assert_eq!(shared.context_local_roots.get(), 0);
+                assert!(shared.roots.borrow().pending_head.is_some());
+                assert_eq!(cx.with_native_state(&object, |state| *state).unwrap(), 42);
+            })
+            .unwrap();
+        assert!(shared.roots.borrow().pending_head.is_none());
     }
 }
