@@ -1266,6 +1266,21 @@ mod tests {
     use super::*;
     use std::thread;
 
+    #[test]
+    fn discarding_locals_retains_their_roots_until_context_exit() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                for _ in 0..128 {
+                    drop(cx.eval("({})", "discarded-local.js").unwrap());
+                }
+                assert_eq!(shared.context_local_roots.get(), 128);
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
     fn retained_roots(shared: &Shared) -> usize {
         shared
             .roots
