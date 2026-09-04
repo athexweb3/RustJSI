@@ -343,6 +343,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_quota_rejection_refunds_reserved_local_capacity() {
+        use crate::{RootLimits, Runtime};
+        use rustjsi_backend::{
+            BackendBase, BackendScope, OwnedExternalBufferScope, OwnershipTransferError,
+        };
+        let mut runtime = Runtime::new_with_root_limits(RootLimits {
+            local_roots: 1,
+            ..RootLimits::default()
+        })
+        .unwrap();
+        let ledger = Arc::clone(&runtime.shared.external_buffers);
+        // Synthetic ledger saturation, not engine allocations.
+        for _ in 0..MAX_EXTERNAL_ALLOCATIONS {
+            ledger.reserve(0).unwrap();
+        }
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                assert!(matches!(
+                    scope.externalize(vec![1].into_boxed_slice()),
+                    Err(OwnershipTransferError::Rejected { .. })
+                ));
+                scope.string("local reservation refunded").unwrap();
+            })
+            .unwrap();
+        for _ in 0..MAX_EXTERNAL_ALLOCATIONS {
+            ledger.release(0);
+        }
+        assert_eq!(ledger.live_allocations(), 0);
+    }
+
+    #[test]
     fn external_owner_can_be_released_off_thread() {
         let ledger = Arc::new(ExternalLedger::new());
         ledger.reserve(4).unwrap();
