@@ -10,7 +10,7 @@ pub(super) struct LocalBudget {
 
 pub(super) struct Reservation<'a> {
     budget: &'a LocalBudget,
-    held: bool,
+    held: usize,
 }
 
 impl LocalBudget {
@@ -22,37 +22,59 @@ impl LocalBudget {
     }
 
     pub(super) fn reserve(&self) -> Result<Reservation<'_>, RuntimeError> {
+        self.reserve_many(1)
+    }
+
+    pub(super) fn reserve_many(&self, count: usize) -> Result<Reservation<'_>, RuntimeError> {
+        if count == 0 {
+            return Ok(Reservation {
+                budget: self,
+                held: 0,
+            });
+        }
         let used = self.used.get();
-        if used >= self.limit {
+        let Some(next) = used.checked_add(count) else {
+            return Err(RuntimeError::LocalRootLimitReached);
+        };
+        if next > self.limit {
             return Err(RuntimeError::LocalRootLimitReached);
         }
-        self.used.set(used + 1);
+        self.used.set(next);
         Ok(Reservation {
             budget: self,
-            held: true,
+            held: count,
         })
     }
 
     pub(super) fn release(&self) {
+        self.release_many(1);
+    }
+
+    fn release_many(&self, count: usize) {
         self.used.set(
             self.used
                 .get()
-                .checked_sub(1)
+                .checked_sub(count)
                 .expect("balanced local admission"),
         );
+    }
+
+    #[cfg(test)]
+    pub(super) fn used(&self) -> usize {
+        self.used.get()
     }
 }
 
 impl Reservation<'_> {
     pub(super) fn commit(mut self) {
-        self.held = false;
+        self.held = 0;
     }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        if self.held {
-            self.budget.release();
+        if self.held != 0 {
+            self.budget.release_many(self.held);
         }
     }
 }
@@ -75,5 +97,20 @@ mod tests {
         assert!(budget.reserve().is_err());
         budget.release();
         assert_eq!(budget.used.get(), 0);
+    }
+
+    #[test]
+    fn group_reservations_are_atomic_and_refunded() {
+        let budget = LocalBudget::new(3);
+        let reservation = budget.reserve_many(2).unwrap();
+        assert_eq!(budget.used(), 2);
+        assert!(budget.reserve_many(2).is_err());
+        assert!(budget.reserve_many(usize::MAX).is_err());
+        assert_eq!(budget.used(), 2);
+        drop(reservation);
+        assert_eq!(budget.used(), 0);
+        let empty = budget.reserve_many(0).unwrap();
+        assert_eq!(budget.used(), 0);
+        drop(empty);
     }
 }

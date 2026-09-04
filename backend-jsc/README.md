@@ -43,6 +43,13 @@ before accepting the owner. Rejection leaves that operation unexecuted and
 returns rejected external bytes unchanged. Exceptions and unwind refund unused
 reservations; scope cleanup returns committed slots.
 
+String arguments passed from Rust are protected from their creation through
+the synchronous call and result/exception capture. Capacity for every string
+argument is reserved atomically before conversion. Argument roots share the
+local budget and are released before `call` returns; scalar arguments do not
+consume root capacity. This bounds roots, not argument-buffer bytes or input
+string sizes.
+
 Unknown-result operations require headroom even if they would return scalars.
 Context refunds scalar reservations immediately. Common evaluation/resolution
 keeps its existing protection for every result; direct common primitive

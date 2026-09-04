@@ -4,6 +4,7 @@
 
 use crate::sys;
 use rustjsi_host::{EntryGate, GateError, HostState};
+mod argument_roots;
 #[cfg(test)]
 mod argument_tests;
 #[cfg(test)]
@@ -50,7 +51,7 @@ pub use native_state::NativeObject;
 pub struct RootLimits {
     /// Persistent registry slots, including pending and exhausted identities.
     pub persistent_slots: usize,
-    /// Local protections plus in-flight result reservations across all scopes.
+    /// Local protections and value reservations, including temporary call arguments.
     pub local_roots: usize,
 }
 
@@ -187,7 +188,7 @@ pub enum RuntimeError {
     ScopeDepthExceeded,
     /// No persistent registry slot is available within the configured limit.
     PersistentRootLimitReached,
-    /// No local result reservation is available within the configured limit.
+    /// No local value reservation is available within the configured limit.
     LocalRootLimitReached,
     /// The experimental limit of 4096 retained host functions was reached.
     HostFunctionLimitReached,
@@ -630,6 +631,10 @@ impl<'cx> Context<'cx> {
 
     /// Calls an installed Rust host function through `JavaScriptCore`.
     ///
+    /// String arguments use temporary local-root capacity, reserved as a group
+    /// before conversion and released after capturing the result or exception.
+    /// Scalar arguments do not consume temporary root capacity.
+    ///
     /// # Errors
     ///
     /// Returns an error for a dead/foreign handle, local-admission failure,
@@ -659,18 +664,35 @@ impl<'cx> Context<'cx> {
             .local_budget
             .reserve()
             .map_err(JsError::Runtime)?;
-        let mut string_storage = Vec::new();
+        let string_arguments = arguments
+            .iter()
+            .filter(|value| matches!(value, Value::String(_)))
+            .count();
+        let argument_reservation = self
+            .shared
+            .local_budget
+            .reserve_many(string_arguments)
+            .map_err(JsError::Runtime)?;
+        let mut argument_roots = Vec::with_capacity(string_arguments);
         let mut inline_arguments = [ptr::null(); INLINE_ARGUMENTS];
         let mut heap_arguments = Vec::new();
         let raw_arguments = if arguments.len() <= INLINE_ARGUMENTS {
             for (slot, value) in inline_arguments.iter_mut().zip(arguments) {
-                *slot = value_to_raw(self.raw, value, &mut string_storage)?;
+                let (raw, root) = self.prepare_argument(value)?;
+                *slot = raw;
+                argument_roots.extend(root);
+                #[cfg(test)]
+                self.argument_gc_checkpoint();
             }
             &inline_arguments[..arguments.len()]
         } else {
             heap_arguments.reserve(arguments.len());
             for value in arguments {
-                heap_arguments.push(value_to_raw(self.raw, value, &mut string_storage)?);
+                let (raw, root) = self.prepare_argument(value)?;
+                heap_arguments.push(raw);
+                argument_roots.extend(root);
+                #[cfg(test)]
+                self.argument_gc_checkpoint();
             }
             &heap_arguments
         };
@@ -693,7 +715,43 @@ impl<'cx> Context<'cx> {
                 &raw mut exception,
             )
         };
-        self.local_or_exception(value, exception, reservation)
+        let result = self.local_or_exception(value, exception, reservation);
+        drop(argument_roots);
+        drop(argument_reservation);
+        result
+    }
+
+    fn prepare_argument<'scope>(
+        &'scope self,
+        value: &Value,
+    ) -> Result<
+        (
+            sys::ValueRef,
+            Option<argument_roots::ArgumentRoot<'scope, 'cx>>,
+        ),
+        JsError,
+    > {
+        let Value::String(value) = value else {
+            return Ok((value_to_raw(self.raw, value, &mut Vec::new())?, None));
+        };
+        let string = JsString::new(value)?;
+        // SAFETY: The context and input string are live. ArgumentRoot protects
+        // the returned cell before another engine operation can run.
+        let raw = unsafe { sys::value_make_string(self.raw.as_ptr(), string.as_ptr()) };
+        let raw = NonNull::new(raw.cast_mut()).ok_or(JsError::Backend(
+            "JavaScriptCore returned a null string value",
+        ))?;
+        let root = argument_roots::ArgumentRoot::new(self, raw);
+        Ok((raw.as_ptr(), Some(root)))
+    }
+
+    #[cfg(test)]
+    fn argument_gc_checkpoint(&self) {
+        if self.shared.argument_gc.get() {
+            // SAFETY: Tests request collection inside the same active Context
+            // after each prepared argument has acquired its temporary root.
+            unsafe { sys::garbage_collect(self.raw.as_ptr()) };
+        }
     }
 
     /// Reads a JavaScript number without coercion.
