@@ -235,9 +235,11 @@ impl EntryGate {
         }
     }
 
-    /// Reports whether the host may begin entry-dependent teardown.
+    /// Reports whether normal entries have drained and no cleanup guard is live.
     ///
-    /// This does not authorize an engine cleanup entry or perform cleanup.
+    /// The host may then attempt a policy-permitted cleanup entry or make its
+    /// terminal drain decision. This predicate does not authorize engine access;
+    /// `try_begin_cleanup` applies the attachment's final-entry policy.
     #[must_use]
     pub fn is_drain_ready(&self) -> bool {
         self.state.get() == HostState::Draining && self.entries.get() == 0 && !self.cleanup.get()
@@ -577,6 +579,7 @@ mod tests {
         let gate = guaranteed_gate(1);
         assert_eq!(gate.final_entry_policy(), FinalEntryPolicy::Guaranteed);
         gate.request_drain();
+        assert!(gate.is_drain_ready());
         assert_eq!(gate.finish_drain(), Err(GateError::FinalEntryRequired));
 
         let cleanup = gate.try_begin_cleanup().unwrap();
@@ -608,6 +611,7 @@ mod tests {
         let unavailable =
             EntryGate::new(NonZeroU32::new(1).unwrap(), FinalEntryPolicy::Unavailable);
         unavailable.request_drain();
+        assert!(unavailable.is_drain_ready());
         assert_eq!(
             unavailable.try_begin_cleanup().unwrap_err(),
             GateError::FinalEntryUnavailable
