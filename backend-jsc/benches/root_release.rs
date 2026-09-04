@@ -22,7 +22,7 @@ fn main() {
 
     for live in [0, 4096] {
         for pending in [0, 1, 64, 1024, 16_384] {
-            let mut runtime = Runtime::new().unwrap();
+            let mut runtime = Runtime::new_with_persistent_root_limit(live + pending).unwrap();
             let unrelated = roots(&mut runtime, live);
             let mut drop_total = Duration::ZERO;
             let mut drain_total = Duration::ZERO;
