@@ -28,7 +28,10 @@ fn large_exception_has_a_bounded_rust_message() {
             assert!(error.message().len() <= 4096);
             assert!(error.message.capacity() <= 4097);
             assert!(error.is_truncated());
-            assert!(error.message().ends_with("… [truncated]"));
+            assert_eq!(
+                error.message(),
+                format!("{}… [truncated]", "x".repeat(4096 - "… [truncated]".len()))
+            );
         })
         .unwrap();
 }
@@ -53,17 +56,18 @@ fn complete_messages_do_not_confuse_capacity_with_encoded_length() {
 #[test]
 fn truncated_multibyte_messages_keep_valid_character_boundaries() {
     let mut runtime = Runtime::new().unwrap();
-    for source in [
-        "throw 'x'.repeat(4097)",
-        "throw 'é'.repeat(3000)",
-        "throw '😀'.repeat(2048)",
-        "throw 'x'.repeat(4095) + '😀'",
+    let prefix_bytes = 4096 - "… [truncated]".len();
+    for (source, expected_prefix) in [
+        ("throw 'x'.repeat(4097)", "x".repeat(prefix_bytes)),
+        ("throw 'é'.repeat(3000)", "é".repeat(prefix_bytes / 2)),
+        ("throw '😀'.repeat(2048)", "😀".repeat(prefix_bytes / 4)),
+        ("throw 'x'.repeat(4095) + '😀'", "x".repeat(prefix_bytes)),
     ] {
         let error = thrown(&mut runtime, source);
         assert!(error.is_truncated());
         assert!(error.message().len() <= 4096);
         assert!(error.message.capacity() <= 4097);
-        assert!(error.message().ends_with("… [truncated]"));
+        assert_eq!(error.message(), format!("{expected_prefix}… [truncated]"));
         assert!(!error.message().contains('\u{fffd}'));
     }
 }
