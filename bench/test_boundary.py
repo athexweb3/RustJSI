@@ -114,6 +114,7 @@ class ArtifactTests(unittest.TestCase):
             completion = {key: metadata[key] for key in ("source", "binary_sha256")}
             boundary.write_json(directory / "complete.json", completion)
             report = boundary.read_report(directory)
+            self.assertEqual(report["compiler_selection"], "unverified")
             self.assertEqual(report["metrics"]["direct_jsc_lower_bound"]["mean"], 100)
             # A stale summary is not used to reconstruct the report.
             boundary.write_json(directory / "summary.json", {"wrong": True})
@@ -178,7 +179,9 @@ class ArtifactTests(unittest.TestCase):
                     "executable": str(executable),
                 })
 
-                def fake_process(arguments, destination, name):
+                def fake_process(arguments, destination, name, *, environment=None):
+                    if name == "build":
+                        self.assertEqual(environment["RUSTC"], "/test/rustc")
                     output = artifact if name == "build" else SAMPLE
                     (destination / f"{name}.stdout").write_text(output)
                     (destination / f"{name}.stderr").write_text("")
@@ -192,6 +195,9 @@ class ArtifactTests(unittest.TestCase):
                     patch.object(boundary.platform, "system", return_value="Darwin"),
                     patch.object(boundary, "source_stamp", side_effect=[stamp, final]),
                     patch.object(boundary, "command", return_value="test metadata"),
+                    patch.object(boundary, "compiler_environment", return_value={
+                        "RUSTC": "/test/rustc", "RUSTDOC": "/test/rustdoc",
+                    }),
                     patch.object(boundary, "record_process", side_effect=fake_process) as run,
                     patch("builtins.print"),
                 ):
@@ -223,6 +229,30 @@ class ArtifactTests(unittest.TestCase):
             })
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
+
+    def test_compiler_selection_overrides_path_and_wrappers_locally(self):
+        original = {"PATH": "/wrong/bin", "RUSTC": "/wrong/rustc",
+                    "RUSTC_WRAPPER": "wrapper", "RUSTC_WORKSPACE_WRAPPER": "other"}
+        with (
+            patch.dict(boundary.os.environ, original, clear=True),
+            patch.object(boundary, "command", side_effect=["/selected/rustc", "/selected/rustdoc"]),
+        ):
+            selected = boundary.compiler_environment("test")
+            self.assertEqual(dict(boundary.os.environ), original)
+        self.assertEqual(selected["RUSTC"], "/selected/rustc")
+        self.assertEqual(selected["RUSTDOC"], "/selected/rustdoc")
+        self.assertEqual(selected["CARGO_BUILD_RUSTC"], "/selected/rustc")
+        self.assertEqual(selected["CARGO_BUILD_RUSTDOC"], "/selected/rustdoc")
+        self.assertEqual(selected["RUSTC_WRAPPER"], "")
+        self.assertEqual(selected["RUSTC_WORKSPACE_WRAPPER"], "")
+        self.assertEqual(selected["CARGO_BUILD_RUSTC_WRAPPER"], "")
+        self.assertEqual(selected["CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"], "")
+        self.assertEqual(selected["RUSTUP_TOOLCHAIN"], "test")
+
+    def test_compiler_path_must_be_absolute(self):
+        with patch.object(boundary, "command", return_value="rustc"):
+            with self.assertRaisesRegex(ValueError, "non-absolute"):
+                boundary.compiler_environment("test")
 
 
 if __name__ == "__main__":
