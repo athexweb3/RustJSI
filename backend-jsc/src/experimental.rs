@@ -259,7 +259,7 @@ struct JsString(NonNull<sys::OpaqueString>);
 impl Runtime {
     /// Creates an isolated `JavaScriptCore` global context.
     ///
-    /// Uses a limit of 4096 persistent registry slots.
+    /// Uses limits of 4096 persistent registry slots and 4096 local root slots.
     ///
     /// # Errors
     ///
@@ -275,6 +275,7 @@ impl Runtime {
     /// disables new persistent roots; locals and JavaScript execution still work.
     /// The limit doesn't reserve memory or bound local roots, lease clones, native
     /// registrations or the JavaScript heap. It cannot change after creation.
+    /// The local root limit remains at its default of 4096.
     ///
     /// # Errors
     ///
@@ -432,7 +433,7 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns a lifecycle, backend, or JavaScript exception error.
+    /// Returns a lifecycle, local-admission, backend, or JavaScript exception error.
     pub fn eval(&mut self, source: &str, source_url: &str) -> Result<Local<'cx>, JsError> {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
         let reservation = self
@@ -491,7 +492,7 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead, foreign, or stale handle.
+    /// Returns an error for a dead, foreign, or stale handle, or a full local budget.
     pub fn resolve(&mut self, persistent: &Persistent) -> Result<Local<'cx>, JsError> {
         let runtime = persistent
             .lease
@@ -602,7 +603,8 @@ impl<'cx> Context<'cx> {
     ///
     /// # Errors
     ///
-    /// Returns an error for a dead/foreign handle, conversion failure, or exception.
+    /// Returns an error for a dead/foreign handle, local-admission failure,
+    /// conversion failure, or exception.
     pub fn call(
         &mut self,
         function: &HostFunction,

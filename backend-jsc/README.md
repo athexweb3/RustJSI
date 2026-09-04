@@ -33,7 +33,22 @@ common backend already supports sequential short `open_scope` lifetimes.
 Scopes only limit local retention when callers keep their batches small. They
 don't impose a root-count/heap quota, undo JS effects or native registrations,
 or drain pending persistent releases and native finalizers. Those still follow
-host-entry maintenance. Explicit resource budgets remain required.
+host-entry maintenance. Scope cleanup is separate from runtime admission.
+
+`Runtime::new_with_root_limits(RootLimits { persistent_slots, local_roots })`
+configures both budgets; each defaults to 4096. Local admission counts active
+protections and in-flight result reservations across all scopes in the runtime.
+Evaluation/calls reserve before JS execution; common externalization reserves
+before accepting the owner. Rejection leaves that operation unexecuted and
+returns rejected external bytes unchanged. Exceptions and unwind refund unused
+reservations; scope cleanup returns committed slots.
+
+Unknown-result operations require headroom even if they would return scalars.
+Context refunds scalar reservations immediately. Common evaluation/resolution
+keeps its existing protection for every result; direct common primitive
+constructors don't reserve. Zero local capacity rejects evaluation, but those
+primitive constructors still work. Neither budget covers total heap bytes,
+temporary arguments, callback registrations or exception metadata.
 
 Last `Persistent` lease drop marks its existing registry slot for release. It
 doesn't allocate or call JSC. Both entry paths drain requests before user code
