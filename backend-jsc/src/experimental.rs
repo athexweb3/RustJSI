@@ -1206,6 +1206,83 @@ mod tests {
     use super::*;
     use std::thread;
 
+    fn retained_roots(shared: &Shared) -> usize {
+        shared
+            .roots
+            .borrow()
+            .slots
+            .iter()
+            .filter(|slot| slot.value.is_some())
+            .count()
+    }
+
+    fn object_root(runtime: &mut Runtime) -> Persistent {
+        runtime
+            .with_context(|cx| {
+                let local = cx.eval("({ answer: 42 })", "release.js").unwrap();
+                cx.persist(&local).unwrap()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn last_lease_drop_waits_for_either_host_entry_path() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let clone = root.clone();
+            drop(root);
+            assert_eq!(retained_roots(&shared), 1);
+            drop(clone);
+            assert_eq!(shared.gate.active_entries(), 0);
+            assert_eq!(retained_roots(&shared), 1, "Drop must only request release");
+            if common_entry {
+                runtime
+                    .with_backend(|_| assert_eq!(retained_roots(&shared), 0))
+                    .unwrap();
+            } else {
+                runtime
+                    .with_context(|_| assert_eq!(retained_roots(&shared), 0))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn lease_drop_inside_entry_waits_for_exit_maintenance() {
+        for common_entry in [false, true] {
+            let mut runtime = Runtime::new().unwrap();
+            let root = object_root(&mut runtime);
+            let shared = Rc::clone(&runtime.shared);
+            let operation = || {
+                drop(root);
+                assert_eq!(retained_roots(&shared), 1);
+            };
+            if common_entry {
+                runtime.with_backend(|_| operation()).unwrap();
+            } else {
+                runtime.with_context(|_| operation()).unwrap();
+            }
+            assert_eq!(retained_roots(&shared), 0);
+        }
+    }
+
+    #[test]
+    fn shutdown_releases_pending_and_live_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let pending = object_root(&mut runtime);
+        let live = object_root(&mut runtime);
+        let shared = Rc::clone(&runtime.shared);
+        drop(pending);
+        assert_eq!(retained_roots(&shared), 2);
+        runtime.invalidate().unwrap();
+        assert_eq!(retained_roots(&shared), 0);
+        drop(live);
+        runtime.invalidate().unwrap();
+        assert_eq!(retained_roots(&shared), 0);
+    }
+
     #[test]
     fn context_locals_in_heap_storage_have_balanced_roots() {
         let mut runtime = Runtime::new().unwrap();
