@@ -2,11 +2,27 @@
 
 use crate::{ModelBackend, ModelBufferView, ModelRoot, ModelScope, ModelValue};
 use rustjsi_backend::{
-    BackendBase, BackendError, BackendManifest, BackendScope, BorrowedBufferScope,
+    BackendBase, BackendError, BackendFamily, BackendManifest, BackendScope, BorrowedBufferScope,
     OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use std::marker::PhantomData;
 use std::rc::Rc;
+
+/// Type family for borrowed deterministic-model entries and scopes.
+#[derive(Debug)]
+pub enum ModelBackendFamily {}
+
+impl BackendFamily for ModelBackendFamily {
+    type Backend<'entry> = ModelEntry<'entry>;
+    type Scope<'scope> = ModelEntryScope<'scope, 'scope>;
+
+    fn try_with_scope<R>(
+        backend: &mut ModelEntry<'_>,
+        operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> Result<R, BackendError>,
+    ) -> Result<R, BackendError> {
+        operation(backend.open_scope()?)
+    }
+}
 
 /// A borrowed adapter for testing entry-confined backend access.
 ///

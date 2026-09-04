@@ -25,4 +25,4 @@ pub use model::{
     Evaluation, ExternalBufferStats, ModelBackend, ModelBufferView, ModelRoot, ModelScope,
     ModelValue, Primitive,
 };
-pub use model_entry::{ModelEntry, ModelEntryScope};
+pub use model_entry::{ModelBackendFamily, ModelEntry, ModelEntryScope};

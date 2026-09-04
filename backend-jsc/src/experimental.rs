@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
-pub use common::{JscBackend, JscRoot, JscScope, JscValue};
+pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
 
