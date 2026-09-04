@@ -310,8 +310,9 @@ impl Runtime {
     /// Local-producing operations reserve a result slot before engine execution
     /// or external-owner acceptance. Unknown result types require headroom even
     /// if the result is scalar. Exceptions and unwind return unused reservations.
-    /// Scope exit returns committed local slots. These limits do not bound heap
-    /// bytes, callback registrations, temporary arguments or exception metadata.
+    /// Scope exit returns committed local slots. String arguments reserve slots
+    /// for the call duration. These limits do not bound heap bytes, scalar
+    /// argument storage, callback registrations or exception metadata.
     ///
     /// # Errors
     ///
