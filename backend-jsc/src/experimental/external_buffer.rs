@@ -318,7 +318,7 @@ unsafe extern "C" fn external_bytes_deallocator(
     if owner.is_null() {
         return;
     }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = super::contain_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: JSC invokes the registered deallocator exactly once with the
         // context whose unique ownership was transferred at construction.
         let mut owner = unsafe { Box::from_raw(owner.cast::<ExternalOwner>()) };

@@ -33,6 +33,16 @@ local scopes and finalizer drains have returned. Invalidation checks that no
 entry remains before releasing roots or the context. The gate supplies only
 lifecycle accounting; engine thread and lifetime checks remain in the host.
 
+Callback dispatch holds an `Rc` lease, not a registry borrow, while running
+user code. Teardown removes registrations before destroying captures, contains
+each unwinding drop panic, and continues cleanup. Callback, native-state, and
+external-buffer unwind boundaries also guard panic-payload destruction:
+[`catch_unwind` can return a payload whose destructor panics](https://doc.rust-lang.org/std/panic/fn.catch_unwind.html).
+Ordinary payloads are reclaimed. If that destruction panics, the secondary
+payload is deliberately forgotten; this can leak memory on each such failure.
+Abort-mode panics, aborting hooks, and double panics during unwinding remain
+fatal. Containing a panic does not restore arbitrary user state.
+
 ## Required documentation
 
 Every future unsafe block must have a nearby explanation of:
