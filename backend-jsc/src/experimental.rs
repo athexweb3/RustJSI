@@ -3,7 +3,9 @@
 //! Experimental direct integration with the macOS `JavaScriptCore` C API.
 
 use crate::sys;
-use rustjsi_host::{EntryGate, FinalEntryPolicy, GateError, HostState};
+use rustjsi_host::{
+    AttachmentId, EntryGate, FinalEntryPolicy, GateError, HostState, RuntimeIdentity,
+};
 mod argument_roots;
 #[cfg(test)]
 mod argument_tests;
@@ -39,7 +41,6 @@ use std::num::NonZeroU32;
 use std::ptr::{self, NonNull};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
 pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
@@ -71,7 +72,6 @@ thread_local! {
 const INLINE_ARGUMENTS: usize = 8;
 const MAX_HOST_FUNCTIONS: usize = 4096;
 const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
-static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A standalone `JavaScriptCore` runtime owned by the current thread.
 ///
@@ -105,7 +105,7 @@ pub struct Context<'cx> {
 /// drop(local);
 /// ```
 pub struct Local<'cx> {
-    runtime: *const Shared,
+    attachment: AttachmentId,
     value: NonNull<sys::OpaqueValue>,
     _scope: PhantomData<&'cx Context<'cx>>,
     _affine: PhantomData<Rc<()>>,
@@ -129,6 +129,7 @@ pub struct Persistent {
 /// An installed Rust host function.
 pub struct HostFunction {
     runtime: Weak<Shared>,
+    attachment: AttachmentId,
     key: usize,
 }
 
@@ -213,7 +214,7 @@ pub enum JsError {
 type Callback = dyn for<'call> Fn(Call<'call>) -> Result<Value, HostError> + 'static;
 
 struct Shared {
-    id: u64,
+    id: AttachmentId,
     owner: ThreadId,
     gate: EntryGate,
     context: Cell<Option<NonNull<sys::OpaqueContext>>>,
@@ -240,6 +241,7 @@ struct HostFunctionEntry {
 
 struct RootLease {
     runtime: Weak<Shared>,
+    attachment: AttachmentId,
     id: RootId,
 }
 
@@ -318,10 +320,10 @@ impl Runtime {
     ///
     /// Returns a creation or runtime-identity error if initialization fails.
     pub fn new_with_root_limits(limits: RootLimits) -> Result<Self, RuntimeError> {
-        let id = NEXT_RUNTIME_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
+        let mut identity =
+            RuntimeIdentity::allocate().map_err(|_| RuntimeError::IdentityExhausted)?;
+        let id = identity
+            .next_attachment()
             .map_err(|_| RuntimeError::IdentityExhausted)?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
@@ -444,6 +446,12 @@ impl Runtime {
     pub fn callback_drop_panics(&self) -> usize {
         self.shared.callback_drop_panics.get()
     }
+
+    /// Returns the identity of this standalone engine attachment.
+    #[must_use]
+    pub fn attachment_id(&self) -> AttachmentId {
+        self.shared.id
+    }
 }
 
 impl Drop for Runtime {
@@ -507,6 +515,7 @@ impl<'cx> Context<'cx> {
         Ok(Persistent {
             lease: Rc::new(RootLease {
                 runtime: Rc::downgrade(self.shared),
+                attachment: self.shared.id,
                 id,
             }),
         })
@@ -523,7 +532,7 @@ impl<'cx> Context<'cx> {
             .runtime
             .upgrade()
             .ok_or(JsError::Runtime(RuntimeError::Invalidated))?;
-        if !Rc::ptr_eq(&runtime, self.shared) {
+        if persistent.lease.attachment != self.shared.id || !Rc::ptr_eq(&runtime, self.shared) {
             return Err(JsError::Runtime(RuntimeError::WrongRuntime));
         }
         let value = self
@@ -616,6 +625,7 @@ impl<'cx> Context<'cx> {
 
         Ok(HostFunction {
             runtime: Rc::downgrade(self.shared),
+            attachment: self.shared.id,
             key,
         })
     }
@@ -649,7 +659,7 @@ impl<'cx> Context<'cx> {
             .runtime
             .upgrade()
             .ok_or(JsError::Runtime(RuntimeError::Invalidated))?;
-        if !Rc::ptr_eq(&runtime, self.shared) {
+        if function.attachment != self.shared.id || !Rc::ptr_eq(&runtime, self.shared) {
             return Err(JsError::Runtime(RuntimeError::WrongRuntime));
         }
         let function = self
@@ -802,7 +812,7 @@ impl<'cx> Context<'cx> {
     }
 
     fn ensure_local_runtime(&self, local: &Local<'_>) -> Result<(), JsError> {
-        if ptr::eq(local.runtime, Rc::as_ptr(self.shared)) {
+        if local.attachment == self.shared.id {
             Ok(())
         } else {
             Err(JsError::Runtime(RuntimeError::WrongRuntime))
@@ -845,7 +855,7 @@ impl<'cx> Context<'cx> {
                 .context_local_roots
                 .set(self.shared.context_local_roots.get() + 1);
         }
-        Local::new(Rc::as_ptr(self.shared), value)
+        Local::new(self.shared.id, value)
     }
 }
 
@@ -865,9 +875,9 @@ impl Drop for Context<'_> {
 }
 
 impl Local<'_> {
-    fn new(runtime: *const Shared, value: NonNull<sys::OpaqueValue>) -> Self {
+    fn new(attachment: AttachmentId, value: NonNull<sys::OpaqueValue>) -> Self {
         Self {
-            runtime,
+            attachment,
             value,
             _scope: PhantomData,
             _affine: PhantomData,
@@ -1099,7 +1109,10 @@ impl Drop for RootLease {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        if runtime.ensure_thread().is_err() || runtime.gate.state() != HostState::Active {
+        if runtime.id != self.attachment
+            || runtime.ensure_thread().is_err()
+            || runtime.gate.state() != HostState::Active
+        {
             return;
         }
         // Root-registry borrows never span user execution. Queue links live in
@@ -2250,6 +2263,7 @@ mod tests {
     fn rejects_cross_runtime_locals_before_entering_jsc() {
         let mut first = Runtime::new().unwrap();
         let mut second = Runtime::new().unwrap();
+        assert_ne!(first.attachment_id(), second.attachment_id());
         first
             .with_context(|first_context| {
                 let local = first_context.eval("42", "first.js").unwrap();

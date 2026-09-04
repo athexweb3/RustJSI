@@ -20,9 +20,9 @@ calls.
 
 The older `Context` API also roots managed locals returned by evaluation,
 calls, and persistent resolution until its Context scope exits. Moving a local
-into a Rust container or dropping its original persistent lease cannot remove that local
-protection. Scalar primitives skip root storage. Both scope implementations
-share inline storage for 16 roots, then spill to a vector.
+into a Rust container or dropping its original persistent lease cannot remove
+that local protection. Scalar primitives skip root storage. Both scope
+implementations share inline storage for 16 roots, then spill to a vector.
 
 Use `Context::with_scope` for short batches inside a long host entry. Each child
 has separate root storage, released on return or unwind. Parent values stay
@@ -86,6 +86,11 @@ rejects outstanding entries before releasing roots or the engine. Panic
 unwinding restores the previous active runtime and releases admission counts;
 it does not run engine destruction. The internal entry limit counts host
 admissions, not JavaScript recursion or callbacks within an admitted frame.
+
+Standalone runtimes receive an owner-issued `AttachmentId`. Scoped values,
+persistent leases, host-function handles, deferred root releases, and common
+backend roots capture that complete logical-runtime/epoch pair. Cross-runtime
+and stale-attachment checks therefore do not rely on a reusable raw pointer.
 
 Invalidation holds an exclusive cleanup guard while releasing roots and
 callback captures. The guard closes before engine release; cleanup does not

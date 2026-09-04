@@ -30,6 +30,14 @@ identity. An enclosing host must do that before lending a backend, perform
 cleanup when the gate reports drain-ready, and then record invalidation and
 engine release. Gate operations contain no heap allocations or locks.
 
+`RuntimeIdentity` allocates one logical runtime ID and issues monotonically
+increasing attachment epochs as that host replaces engines. The issuer cannot
+be cloned and callers cannot construct IDs from arbitrary integers. Cheap,
+copyable `AttachmentId` snapshots let roots, backend state, and future queued
+work reject another runtime or an earlier attachment. This allocator is shared
+within one linked `rustjsi-host` domain; an eventual binary Host ABI must define
+its own single identity authority.
+
 Schedulers, cross-thread handles, attached-engine leases, and the portable Host
 interface are not implemented yet. Policy/outcome accounting does not grant
 engine access or perform cleanup itself.
