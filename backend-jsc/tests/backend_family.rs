@@ -21,13 +21,13 @@ where
     for<'scope> F::Backend<'scope>: RootBackend<Root = R>,
     for<'scope> F::Scope<'scope>: RootScope + OwnedExternalBufferScope,
 {
-    F::with_scope(backend, |scope| {
+    F::try_with_scope(backend, |scope| {
         let buffer = scope
             .externalize(Box::from([1_u8, 2, 3]))
             .map_err(|error| error.error().clone())?;
         assert_eq!(scope.kind(buffer)?, ValueKind::Buffer);
         create_number_root(&scope)
-    })?
+    })
 }
 
 fn check<F, R>(backend: &mut F::Backend<'_>, root: R) -> Result<(), BackendError>
@@ -36,9 +36,9 @@ where
     for<'scope> F::Backend<'scope>: RootBackend<Root = R>,
     for<'scope> F::Scope<'scope>: RootScope,
 {
-    F::with_scope(backend, |scope| {
+    F::try_with_scope(backend, |scope| {
         verify_number_root_and_release(&scope, root)
-    })?
+    })
 }
 
 #[test]
@@ -51,6 +51,33 @@ fn both_families_use_the_same_capability_consumers() {
     assert_eq!(model.external_buffer_stats().finalized, 1);
 
     let mut runtime = Runtime::new().unwrap();
+    let root = runtime
+        .with_backend(create::<JscBackendFamily, _>)
+        .unwrap()
+        .unwrap();
+    runtime
+        .with_backend(|backend| check::<JscBackendFamily, _>(backend, root))
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn fallible_scope_preserves_javascript_exceptions() {
+    let mut runtime = Runtime::new().unwrap();
+    let result = runtime
+        .with_backend(|backend| {
+            JscBackendFamily::try_with_scope(backend, |scope| {
+                scope.evaluate("throw new Error('family failure')", "family.js")?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    match result {
+        Err(BackendError::Exception(exception)) => {
+            assert!(exception.message().contains("family failure"));
+        }
+        result => panic!("unexpected result: {result:?}"),
+    }
     let root = runtime
         .with_backend(create::<JscBackendFamily, _>)
         .unwrap()

@@ -16,11 +16,11 @@ impl BackendFamily for ModelBackendFamily {
     type Backend<'entry> = ModelEntry<'entry>;
     type Scope<'scope> = ModelEntryScope<'scope, 'scope>;
 
-    fn with_scope<R>(
+    fn try_with_scope<R>(
         backend: &mut ModelEntry<'_>,
-        operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> R,
+        operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> Result<R, BackendError>,
     ) -> Result<R, BackendError> {
-        Ok(operation(backend.open_scope()?))
+        operation(backend.open_scope()?)
     }
 }
 

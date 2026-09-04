@@ -45,5 +45,27 @@ pub trait BackendFamily {
     fn with_scope<R>(
         backend: &mut Self::Backend<'_>,
         operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> R,
+    ) -> Result<R, BackendError> {
+        Self::try_with_scope(backend, |scope| Ok(operation(scope)))
+    }
+
+    /// Runs a fallible operation without nesting its backend error result.
+    ///
+    /// Has the same entry, identity and cleanup requirements as [`Self::with_scope`].
+    ///
+    /// ```compile_fail
+    /// use rustjsi_backend::BackendFamily;
+    /// fn escape<F: BackendFamily>(backend: &mut F::Backend<'_>) {
+    ///     let _scope = F::try_with_scope(backend, |scope| Ok(scope));
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns scope-creation errors without invoking `operation`, or the
+    /// operation's error after normal scope cleanup.
+    fn try_with_scope<R>(
+        backend: &mut Self::Backend<'_>,
+        operation: impl for<'scope> FnOnce(Self::Scope<'scope>) -> Result<R, BackendError>,
     ) -> Result<R, BackendError>;
 }

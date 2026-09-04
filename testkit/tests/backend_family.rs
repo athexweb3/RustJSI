@@ -15,12 +15,12 @@ where
     for<'scope> F::Backend<'scope>: RootBackend<Root = R>,
     for<'scope> F::Scope<'scope>: RootScope + OwnedExternalBufferScope,
 {
-    F::with_scope(backend, |scope| {
+    F::try_with_scope(backend, |scope| {
         let value = scope
             .externalize(owner)
             .map_err(|error| error.error().clone())?;
         scope.persist(value)
-    })?
+    })
 }
 
 fn check_and_release<F, R>(
@@ -34,7 +34,7 @@ where
     for<'scope> F::Backend<'scope>: RootBackend<Root = R>,
     for<'scope> F::Scope<'scope>: RootScope + BorrowedBufferScope,
 {
-    F::with_scope(backend, |scope| {
+    F::try_with_scope(backend, |scope| {
         let value = scope.resolve(root)?;
         {
             let view = scope.buffer_bytes(value)?;
@@ -42,7 +42,7 @@ where
             assert_eq!(view.as_ref().as_ptr(), pointer);
         }
         scope.release(root)
-    })?
+    })
 }
 
 fn retain_with_view<F, R>(backend: &mut F::Backend<'_>) -> Result<R, BackendError>
@@ -51,7 +51,7 @@ where
     for<'scope> F::Backend<'scope>: RootBackend<Root = R>,
     for<'scope> F::Scope<'scope>: RootScope + OwnedExternalBufferScope + BorrowedBufferScope,
 {
-    F::with_scope(backend, |scope| {
+    F::try_with_scope(backend, |scope| {
         let owner: Box<[u8]> = Box::from([2, 3, 5]);
         let pointer = owner.as_ptr();
         let value = scope
@@ -63,7 +63,7 @@ where
             assert_eq!(view.as_ref(), &[2, 3, 5]);
         }
         scope.persist(value)
-    })?
+    })
 }
 
 #[test]
@@ -82,6 +82,28 @@ fn three_capabilities_are_available_in_one_generic_scope() {
         .unwrap();
     assert_eq!(model.external_buffer_stats().live_bytes, 0);
     assert_eq!(model.external_buffer_stats().finalized, 1);
+}
+
+#[test]
+fn fallible_operation_cleans_up_before_returning_its_error() {
+    let mut model = ModelBackend::new();
+    let result: Result<(), BackendError> = model.with_entry(|backend| {
+        ModelBackendFamily::try_with_scope(backend, |scope| {
+            scope.externalize(Box::from([1_u8, 2, 3])).unwrap();
+            Err(BackendError::Failure("operation failed"))
+        })
+    });
+    assert_eq!(result, Err(BackendError::Failure("operation failed")));
+    assert_eq!(model.external_buffer_stats().live_bytes, 0);
+    assert_eq!(model.external_buffer_stats().finalized, 1);
+    let root = model
+        .with_entry(retain_with_view::<ModelBackendFamily, _>)
+        .unwrap();
+    model
+        .with_entry(|backend| {
+            ModelBackendFamily::try_with_scope(backend, |scope| scope.release(root))
+        })
+        .unwrap();
 }
 
 #[test]
