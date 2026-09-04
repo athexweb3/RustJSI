@@ -273,6 +273,7 @@ pub enum ValueKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendException {
     message: String,
+    truncated: bool,
 }
 
 impl BackendException {
@@ -281,6 +282,18 @@ impl BackendException {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            truncated: false,
+        }
+    }
+
+    /// Creates metadata from a message already truncated by the backend.
+    ///
+    /// This records truncation; it does not impose a budget on the input.
+    #[must_use]
+    pub fn new_truncated(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            truncated: true,
         }
     }
 
@@ -288,6 +301,12 @@ impl BackendException {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Reports whether the backend omitted part of the message.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -604,6 +623,17 @@ pub trait BorrowedBufferScope: BackendScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exception_metadata_preserves_truncation() {
+        let complete = BackendException::new("short");
+        let truncated = BackendException::new_truncated("prefix");
+        assert!(!complete.is_truncated());
+        assert!(truncated.clone().is_truncated());
+        assert_eq!(truncated.message(), "prefix");
+        assert_eq!(truncated.to_string(), "prefix");
+        assert_ne!(truncated, BackendException::new("prefix"));
+    }
 
     #[test]
     fn capability_negotiation_is_explicit() {

@@ -6,7 +6,7 @@ use super::external_buffer::{make_external_object, new_observation};
 use super::local_budget::Reservation;
 use super::local_roots::LocalRoots;
 use super::{
-    ActiveRuntimeGuard, JsError, JsString, RootId, Runtime, RuntimeError, Shared,
+    ActiveRuntimeGuard, JsError, JsException, JsString, RootId, Runtime, RuntimeError, Shared,
     exception_to_owned, value_to_string,
 };
 use crate::sys;
@@ -196,9 +196,9 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
             )
         };
         if !exception.is_null() {
-            return Err(BackendError::Exception(BackendException::new(
-                exception_to_owned(self.backend.raw, exception).message,
-            )));
+            return Err(BackendError::Exception(
+                exception_to_owned(self.backend.raw, exception).into(),
+            ));
         }
         self.rooted(raw, reservation)
     }
@@ -242,9 +242,9 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
         if exception.is_null() {
             Ok(number)
         } else {
-            Err(BackendError::Exception(BackendException::new(
-                exception_to_owned(self.backend.raw, exception).message,
-            )))
+            Err(BackendError::Exception(
+                exception_to_owned(self.backend.raw, exception).into(),
+            ))
         }
     }
 
@@ -453,9 +453,9 @@ impl JscScope<'_, '_> {
             )
         };
         if !exception.is_null() {
-            return Err(BackendError::Exception(BackendException::new(
-                exception_to_owned(self.backend.raw, exception).message,
-            )));
+            return Err(BackendError::Exception(
+                exception_to_owned(self.backend.raw, exception).into(),
+            ));
         }
         if typed_array == sys::TYPED_ARRAY_NONE {
             Ok(ValueKind::Object)
@@ -513,10 +513,20 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
     }
 }
 
+impl From<JsException> for BackendException {
+    fn from(error: JsException) -> Self {
+        if error.truncated {
+            Self::new_truncated(error.message)
+        } else {
+            Self::new(error.message)
+        }
+    }
+}
+
 fn map_js_error(error: JsError) -> BackendError {
     match error {
         JsError::Runtime(error) => map_runtime_error(error),
-        JsError::Exception(error) => BackendError::Exception(BackendException::new(error.message)),
+        JsError::Exception(error) => BackendError::Exception(error.into()),
         JsError::Type { .. } => BackendError::Failure("JavaScriptCore type mismatch"),
         JsError::Backend(message) => BackendError::Failure(message),
     }

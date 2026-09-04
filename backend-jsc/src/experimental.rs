@@ -9,6 +9,9 @@ mod callback_budget_tests;
 #[cfg(test)]
 mod cleanup_tests;
 mod common;
+mod exception_message;
+#[cfg(test)]
+mod exception_tests;
 mod external_buffer;
 mod local_budget;
 #[cfg(test)]
@@ -158,6 +161,7 @@ pub struct HostError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsException {
     message: String,
+    truncated: bool,
 }
 
 /// A runtime initialization, lifecycle, affinity or resource-limit failure.
@@ -896,6 +900,12 @@ impl JsException {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// Reports whether diagnostic capture omitted part of the message.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl fmt::Display for HostError {
@@ -1317,18 +1327,21 @@ fn exception_to_owned(
     if !nested.is_null() {
         return JsException {
             message: "exception could not be converted to a string".to_owned(),
+            truncated: false,
         };
     }
     let Some(string) = NonNull::new(string) else {
         return JsException {
             message: "JavaScriptCore returned an unprintable exception".to_owned(),
+            truncated: false,
         };
     };
-    let message = copy_js_string(string)
-        .unwrap_or_else(|_| "JavaScriptCore returned an invalid exception string".to_owned());
-    // SAFETY: `value_to_string_copy` returned one owned string reference.
-    unsafe { sys::string_release(string.as_ptr()) };
-    JsException { message }
+    // The owned string reference must also be released if copying unwinds.
+    let string = JsString(string);
+    exception_message::copy(&string).unwrap_or_else(|_| JsException {
+        message: "JavaScriptCore returned an invalid exception string".to_owned(),
+        truncated: false,
+    })
 }
 
 fn copy_js_string(string: NonNull<sys::OpaqueString>) -> Result<String, JsError> {
