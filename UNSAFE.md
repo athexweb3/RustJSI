@@ -33,6 +33,11 @@ local scopes and finalizer drains have returned. Invalidation checks that no
 entry remains before releasing roots or the context. The gate supplies only
 lifecycle accounting; engine thread and lifetime checks remain in the host.
 
+The legacy JSC `Context` path now gives managed `Local` results independent
+entry-owned protections too, including values resolved from persistent roots.
+Context teardown releases these protections before the admission guard exits,
+on normal return or unwind. Scalar results do not accumulate local roots.
+
 Callback dispatch holds an `Rc` lease, not a registry borrow, while running
 user code. Teardown removes registrations before destroying captures, contains
 each unwinding drop panic, and continues cleanup. Callback, native-state, and

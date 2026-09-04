@@ -1297,9 +1297,37 @@ mod tests {
                 .unwrap();
         }));
         assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"context unwind")
+        );
         assert_eq!(shared.context_local_roots.get(), 0);
         assert_eq!(shared.gate.active_entries(), 0);
         runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn context_roots_managed_kinds_without_retaining_scalar_primitives() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                for source in ["undefined", "null", "true", "NaN", "Infinity", "-0"] {
+                    let _value = cx.eval(source, "scalar.js").unwrap();
+                }
+                assert_eq!(shared.context_local_roots.get(), 0);
+                let symbol = Box::new(cx.eval("Symbol('local')", "symbol.js").unwrap());
+                let bigint = Box::new(cx.eval("123n", "bigint.js").unwrap());
+                let string = Box::new(cx.eval("'rooted string'", "string.js").unwrap());
+                assert_eq!(shared.context_local_roots.get(), 3);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&bigint).unwrap(), "123");
+                assert_eq!(cx.string(&string).unwrap(), "rooted string");
+                let root = cx.persist(&symbol).unwrap();
+                drop(root);
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
     }
 
     struct DropProbe(Rc<Cell<usize>>);
