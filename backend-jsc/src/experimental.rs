@@ -74,7 +74,17 @@ pub struct Local<'cx> {
     _affine: PhantomData<Rc<()>>,
 }
 
-/// A JavaScript value protected from collection until its last lease is dropped.
+/// A JavaScript value protected from collection while any lease remains.
+///
+/// Last drop requests release without calling JSC. The standalone host drains
+/// requests at the next entry boundary or during invalidation. An idle runtime
+/// retains pending roots; an empty entry explicitly flushes them.
+///
+/// ```compile_fail
+/// use rustjsi_backend_jsc::Persistent;
+/// fn require_send<T: Send>() {}
+/// require_send::<Persistent>();
+/// ```
 pub struct Persistent {
     lease: Rc<RootLease>,
 }
@@ -192,11 +202,19 @@ struct RootId {
 struct RootRegistry {
     slots: Vec<RootSlot>,
     free: Vec<usize>,
+    pending_head: Option<usize>,
 }
 
 struct RootSlot {
     generation: u64,
     value: Option<NonNull<sys::OpaqueValue>>,
+    release: RootRelease,
+}
+
+#[derive(Clone, Copy)]
+enum RootRelease {
+    Live,
+    Pending { next: Option<usize> },
 }
 
 struct ActiveRuntimeGuard {
@@ -253,9 +271,10 @@ impl Runtime {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        self.shared.drain_native_finalizers();
         let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(context);
         let result = {
             let mut scoped = Context {
                 shared: &self.shared,
@@ -265,8 +284,9 @@ impl Runtime {
             };
             operation(&mut scoped)
         };
-        drop(active);
         self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(context);
+        drop(active);
         Ok(result)
     }
 
@@ -375,7 +395,7 @@ impl<'cx> Context<'cx> {
         let id = self.shared.roots.borrow_mut().insert(local.value);
 
         // SAFETY: The local belongs to this context and the registry will balance this
-        // protection on last lease drop or runtime invalidation.
+        // protection during host entry maintenance or runtime invalidation.
         unsafe { sys::value_protect(self.raw.as_ptr(), local.value.as_ptr()) };
 
         Ok(Persistent {
@@ -854,6 +874,19 @@ impl Shared {
         native_state::reclaim_finalized(self, finalized);
     }
 
+    fn drain_root_releases(&self, context: NonNull<sys::OpaqueContext>) {
+        debug_assert!(self.gate.active_entries() > 0);
+        debug_assert!(ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), self)));
+        loop {
+            let value = self.roots.borrow_mut().take_pending();
+            let Some(value) = value else { break };
+            // SAFETY: The standalone host owns this active context and calls this
+            // only inside its admitted entry. Each queued slot owns one protection;
+            // it is removed exactly once, with no registry borrow held across JSC.
+            unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
+        }
+    }
+
     fn close_native_finalizers(&self) {
         let finalized = self.native_finalizers.close();
         native_state::reclaim_finalized(self, finalized);
@@ -868,16 +901,9 @@ impl Drop for RootLease {
         if runtime.ensure_thread().is_err() || runtime.gate.state() != HostState::Active {
             return;
         }
-        let Some(context) = runtime.context.get() else {
-            return;
-        };
-        let Some(value) = runtime.roots.borrow_mut().remove(self.id) else {
-            return;
-        };
-
-        // SAFETY: This is the last Rust lease, the registry removed the matching
-        // generation, and the owning context/thread are still active.
-        unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
+        // Root-registry borrows never span user execution. Queue links live in
+        // existing slots, so this performs no allocation or engine operation.
+        runtime.roots.borrow_mut().request_release(self.id);
     }
 }
 
@@ -896,6 +922,7 @@ impl RootRegistry {
         self.slots.push(RootSlot {
             generation: 1,
             value: Some(value),
+            release: RootRelease::Live,
         });
         RootId {
             slot,
@@ -905,14 +932,14 @@ impl RootRegistry {
 
     fn get(&self, id: RootId) -> Option<NonNull<sys::OpaqueValue>> {
         let slot = self.slots.get(id.slot)?;
-        (slot.generation == id.generation)
+        (slot.generation == id.generation && matches!(slot.release, RootRelease::Live))
             .then_some(slot.value)
             .flatten()
     }
 
     fn remove(&mut self, id: RootId) -> Option<NonNull<sys::OpaqueValue>> {
         let slot = self.slots.get_mut(id.slot)?;
-        if slot.generation != id.generation {
+        if slot.generation != id.generation || !matches!(slot.release, RootRelease::Live) {
             return None;
         }
         let value = slot.value.take()?;
@@ -923,10 +950,43 @@ impl RootRegistry {
         Some(value)
     }
 
+    fn request_release(&mut self, id: RootId) {
+        let Some(slot) = self.slots.get_mut(id.slot) else {
+            return;
+        };
+        if slot.generation != id.generation
+            || slot.value.is_none()
+            || !matches!(slot.release, RootRelease::Live)
+        {
+            return;
+        }
+        slot.release = RootRelease::Pending {
+            next: self.pending_head,
+        };
+        self.pending_head = Some(id.slot);
+    }
+
+    fn take_pending(&mut self) -> Option<NonNull<sys::OpaqueValue>> {
+        let index = self.pending_head?;
+        let slot = &mut self.slots[index];
+        let RootRelease::Pending { next } = slot.release else {
+            unreachable!("pending root list contains a live slot");
+        };
+        self.pending_head = next;
+        slot.release = RootRelease::Live;
+        let id = RootId {
+            slot: index,
+            generation: slot.generation,
+        };
+        self.remove(id)
+    }
+
     fn drain(&mut self) -> Vec<NonNull<sys::OpaqueValue>> {
         let mut values = Vec::new();
         self.free.clear();
+        self.pending_head = None;
         for (index, slot) in self.slots.iter_mut().enumerate() {
+            slot.release = RootRelease::Live;
             if let Some(value) = slot.value.take() {
                 values.push(value);
             }
