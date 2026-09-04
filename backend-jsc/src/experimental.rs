@@ -154,6 +154,8 @@ struct Shared {
     native_finalizers: Arc<native_state::FinalizerQueue>,
     native_drop_panics: Cell<usize>,
     callback_drop_panics: Cell<usize>,
+    #[cfg(test)]
+    context_local_roots: Cell<usize>,
     external_buffers: Arc<external_buffer::ExternalLedger>,
 }
 
@@ -220,6 +222,8 @@ impl Runtime {
                 native_finalizers,
                 native_drop_panics: Cell::new(0),
                 callback_drop_panics: Cell::new(0),
+                #[cfg(test)]
+                context_local_roots: Cell::new(0),
                 external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
         })
@@ -1153,6 +1157,102 @@ fn value_to_raw_callback(
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn context_locals_in_heap_storage_have_balanced_roots() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let mut values = Vec::new();
+                for index in 0..40 {
+                    values.push(
+                        cx.eval(
+                            &format!("({{ toString() {{ return 'object-{index}'; }} }})"),
+                            "heap.js",
+                        )
+                        .unwrap(),
+                    );
+                }
+                assert_eq!(shared.context_local_roots.get(), 40);
+                cx.collect_garbage().unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(cx.string(value).unwrap(), format!("object-{index}"));
+                }
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn resolved_local_survives_last_persistent_lease_drop() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let persistent = runtime
+            .with_context(|cx| {
+                let value = cx
+                    .eval("({ toString() { return 'kept'; } })", "persist.js")
+                    .unwrap();
+                cx.persist(&value).unwrap()
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+        runtime
+            .with_context(|cx| {
+                let local = Box::new(cx.resolve(&persistent).unwrap());
+                drop(persistent);
+                assert_eq!(shared.context_local_roots.get(), 1);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&local).unwrap(), "kept");
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn context_call_roots_strings_but_not_scalar_results() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        runtime
+            .with_context(|cx| {
+                let text = cx
+                    .install_host_function("text", |_| Ok(Value::String("kept string".to_owned())))
+                    .unwrap();
+                let scalar = cx
+                    .install_host_function("scalar", |_| Ok(Value::Number(42.0)))
+                    .unwrap();
+                let local = Box::new(cx.call(&text, &[]).unwrap());
+                assert_eq!(shared.context_local_roots.get(), 1);
+                for _ in 0..100 {
+                    let value = cx.call(&scalar, &[]).unwrap();
+                    assert!((cx.number(&value).unwrap() - 42.0).abs() < f64::EPSILON);
+                }
+                assert_eq!(shared.context_local_roots.get(), 1);
+                cx.collect_garbage().unwrap();
+                assert_eq!(cx.string(&local).unwrap(), "kept string");
+            })
+            .unwrap();
+        assert_eq!(shared.context_local_roots.get(), 0);
+    }
+
+    #[test]
+    fn context_root_cleanup_runs_on_unwind() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime
+                .with_context(|cx| {
+                    let _local = cx.eval("({})", "unwind.js").unwrap();
+                    assert_eq!(shared.context_local_roots.get(), 1);
+                    panic!("context unwind");
+                })
+                .unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(shared.context_local_roots.get(), 0);
+        assert_eq!(shared.gate.active_entries(), 0);
+        runtime.invalidate().unwrap();
+    }
 
     struct DropProbe(Rc<Cell<usize>>);
 
