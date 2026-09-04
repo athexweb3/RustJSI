@@ -133,7 +133,7 @@ pub struct JsException {
     message: String,
 }
 
-/// A runtime lifecycle or affinity failure.
+/// A runtime initialization, lifecycle, affinity or resource-limit failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     /// `JavaScriptCore` could not create a context.
@@ -159,7 +159,7 @@ pub enum RuntimeError {
 /// A `JavaScriptCore` operation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JsError {
-    /// Runtime lifecycle or affinity failure.
+    /// Runtime initialization, lifecycle, affinity or resource-limit failure.
     Runtime(RuntimeError),
     /// JavaScript threw an exception.
     Exception(JsException),

@@ -44,8 +44,15 @@ roots still use `RootScope::release` inside an entry.
 An idle runtime retains pending roots. Use an empty `with_context` or
 `with_backend` entry to flush them. If user code unwinds, exit maintenance waits
 until the next entry or invalidation. Pending links need no separate queue
-allocation, but root registration still has no quota, slots retain capacity,
-and draining a backlog has no time budget. `Persistent` remains thread-affine.
+allocation. Slots retain capacity, and draining a backlog has no time budget.
+`Persistent` remains thread-affine.
+
+`Runtime::new` limits persistent registry slots to 4096. Use
+`Runtime::new_with_persistent_root_limit(limit)` to choose a different budget
+at creation. Both entry APIs share it. Pending releases and generation-exhausted
+slots count; reusable slots are used first. Exhaustion rejects `persist` before
+adding an engine protection. Zero disables persistence, not local operations.
+This limits slot count, not allocator bytes, lease clones or the JS heap.
 
 Both standalone entry paths use `rustjsi-host` entry accounting. Teardown
 rejects outstanding entries before releasing roots or the engine. Panic
