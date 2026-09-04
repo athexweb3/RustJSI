@@ -59,7 +59,8 @@ Context refunds scalar reservations immediately. Common evaluation/resolution
 keeps its existing protection for every result; direct common primitive
 constructors don't reserve. Zero local capacity rejects evaluation, but those
 primitive constructors still work. Neither budget covers total heap bytes,
-temporary arguments, callback registrations or exception metadata.
+scalar argument storage, input string sizes, callback registrations or exception
+metadata.
 
 Last `Persistent` lease drop marks its existing registry slot for release. It
 doesn't allocate or call JSC. Both entry paths drain requests before user code
