@@ -3,6 +3,7 @@
 //! Common `RustJSI` backend contract over one host-authorized JSC entry.
 
 use super::external_buffer::{make_external_object, new_observation};
+use super::local_budget::Reservation;
 use super::local_roots::LocalRoots;
 use super::{
     ActiveRuntimeGuard, JsError, JsString, RootId, Runtime, RuntimeError, Shared,
@@ -161,13 +162,25 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
     }
 
     fn string(&self, value: &str) -> Result<Self::Value<'_>, BackendError> {
+        let reservation = self
+            .backend
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(map_runtime_error)?;
         let string = JsString::new(value).map_err(map_js_error)?;
         // SAFETY: JSC retains the string contents in the created value.
         let raw = unsafe { sys::value_make_string(self.backend.raw.as_ptr(), string.as_ptr()) };
-        self.rooted(raw)
+        self.rooted(raw, reservation)
     }
 
     fn evaluate(&self, source: &str, source_url: &str) -> Result<Self::Value<'_>, BackendError> {
+        let reservation = self
+            .backend
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(map_runtime_error)?;
         let script = JsString::new(source).map_err(map_js_error)?;
         let url = JsString::new(source_url).map_err(map_js_error)?;
         let mut exception = ptr::null();
@@ -187,7 +200,7 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
                 exception_to_owned(self.backend.raw, exception).message,
             )));
         }
-        self.rooted(raw)
+        self.rooted(raw, reservation)
     }
 
     fn kind<'value>(&'value self, value: Self::Value<'value>) -> Result<ValueKind, BackendError> {
@@ -277,7 +290,13 @@ impl RootScope for JscScope<'_, '_> {
             .borrow()
             .get(root.id)
             .ok_or(BackendError::StaleHandle)?;
-        Ok(self.root_nonnull(value))
+        let reservation = self
+            .backend
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(map_runtime_error)?;
+        Ok(self.root_nonnull(value, reservation))
     }
 
     fn release(&self, root: JscRoot) -> Result<(), BackendError> {
@@ -300,6 +319,15 @@ impl OwnedExternalBufferScope for JscScope<'_, '_> {
         &self,
         owner: Box<[u8]>,
     ) -> Result<Self::Value<'_>, OwnershipTransferError<Box<[u8]>>> {
+        let reservation = match self.backend.shared.local_budget.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(OwnershipTransferError::Rejected {
+                    error: map_runtime_error(error),
+                    owner,
+                });
+            }
+        };
         if let Err(error) = self.backend.shared.external_buffers.reserve(owner.len()) {
             return Err(OwnershipTransferError::Rejected {
                 error: map_js_error(error),
@@ -321,7 +349,7 @@ impl OwnedExternalBufferScope for JscScope<'_, '_> {
                 });
             }
         };
-        Ok(self.root_nonnull(object))
+        Ok(self.root_nonnull(object, reservation))
     }
 }
 
@@ -330,6 +358,7 @@ impl Drop for JscScope<'_, '_> {
         for value in self.roots.get_mut().drain() {
             // SAFETY: Each local root was protected once by this live scope.
             unsafe { sys::value_unprotect(self.backend.raw.as_ptr(), value.as_ptr()) };
+            self.backend.shared.local_budget.release();
         }
     }
 }
@@ -342,18 +371,27 @@ impl JscScope<'_, '_> {
         Ok(self.value(raw))
     }
 
-    fn rooted(&self, raw: sys::ValueRef) -> Result<JscValue<'_>, BackendError> {
+    fn rooted(
+        &self,
+        raw: sys::ValueRef,
+        reservation: Reservation<'_>,
+    ) -> Result<JscValue<'_>, BackendError> {
         let raw = NonNull::new(raw.cast_mut()).ok_or(BackendError::Failure(
             "JavaScriptCore returned a null value",
         ))?;
-        Ok(self.root_nonnull(raw))
+        Ok(self.root_nonnull(raw, reservation))
     }
 
-    fn root_nonnull(&self, raw: NonNull<sys::OpaqueValue>) -> JscValue<'_> {
+    fn root_nonnull(
+        &self,
+        raw: NonNull<sys::OpaqueValue>,
+        reservation: Reservation<'_>,
+    ) -> JscValue<'_> {
+        self.roots.borrow_mut().push(raw);
         // SAFETY: The value and context belong to this authorized entry. The scope
         // balances this protection in `Drop`.
         unsafe { sys::value_protect(self.backend.raw.as_ptr(), raw.as_ptr()) };
-        self.roots.borrow_mut().push(raw);
+        reservation.commit();
         self.value(raw)
     }
 
@@ -465,6 +503,9 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::ScopeDepthExceeded => BackendError::Failure("Context scope depth exceeded"),
         RuntimeError::PersistentRootLimitReached => {
             BackendError::Failure("persistent root slot limit reached")
+        }
+        RuntimeError::LocalRootLimitReached => {
+            BackendError::Failure("local result root limit reached")
         }
     }
 }

@@ -13,5 +13,6 @@ mod sys;
 #[cfg(all(feature = "experimental-jsc", target_os = "macos"))]
 pub use experimental::{
     Call, Context, ExternalBuffer, HostError, HostFunction, JsError, JsException, JscBackend,
-    JscRoot, JscScope, JscValue, Local, NativeObject, Persistent, Runtime, RuntimeError, Value,
+    JscRoot, JscScope, JscValue, Local, NativeObject, Persistent, RootLimits, Runtime,
+    RuntimeError, Value,
 };
