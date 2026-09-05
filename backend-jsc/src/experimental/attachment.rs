@@ -156,30 +156,15 @@ impl Attachment {
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
         let raw = borrowed_global_context(context)?;
-        let roots = self.shared.roots.borrow_mut().drain();
-        let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
-        let released_persistent_roots = roots.len();
-        let released_host_functions = functions.len();
-
-        for value in roots
-            .into_iter()
-            .chain(functions.values().map(|entry| entry.function))
-        {
-            // SAFETY: The host guarantees this is the attachment's live context.
-            // Every registry entry owns exactly one protection in that context.
-            unsafe { sys::value_unprotect(raw.as_ptr(), value.as_ptr()) };
-        }
-        for entry in functions.into_values() {
-            self.shared.drop_callback(entry);
-        }
-        self.shared.close_native_finalizers();
+        let (released_persistent_roots, released_host_functions) =
+            self.shared.release_engine_resources(raw);
         cleanup.complete();
         let final_entry = self
             .shared
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let retired_native_states = self.retire_native_states();
+        let retired_native_states = self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -217,8 +202,9 @@ impl Attachment {
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let (unresolved_persistent_roots, unresolved_host_functions, retired_native_states) =
-            self.abandon_rust_state();
+        let (unresolved_persistent_roots, unresolved_host_functions) =
+            self.shared.abandon_engine_resources();
+        let retired_native_states = self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -282,26 +268,6 @@ impl Attachment {
             native_state_drop_panics: self.shared.native_drop_panics.get(),
         }
     }
-
-    fn retire_native_states(&self) -> usize {
-        let states = self.shared.native_states.borrow_mut().drain();
-        let count = states.len();
-        super::native_state::drop_states(&self.shared, states);
-        count
-    }
-
-    fn abandon_rust_state(&self) -> (usize, usize, usize) {
-        let roots = self.shared.roots.borrow_mut().drain();
-        let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
-        let root_count = roots.len();
-        let function_count = functions.len();
-        drop(roots);
-        for entry in functions.into_values() {
-            self.shared.drop_callback(entry);
-        }
-        self.shared.close_native_finalizers();
-        (root_count, function_count, self.retire_native_states())
-    }
 }
 
 impl Drop for Attachment {
@@ -311,14 +277,16 @@ impl Drop for Attachment {
         }
         self.shared.gate.request_drain();
         if self.shared.gate.finish_drain().is_ok() {
-            let _ = self.abandon_rust_state();
+            let _ = self.shared.abandon_engine_resources();
+            self.shared.retire_native_states();
             let _ = self.shared.gate.mark_destroyed();
             return;
         }
 
         // A Guaranteed attachment dropped without final entry has violated its
         // host contract. Release Rust payloads safely, but never touch JSC here.
-        let _ = self.abandon_rust_state();
+        let _ = self.shared.abandon_engine_resources();
+        self.shared.retire_native_states();
     }
 }
 
