@@ -189,6 +189,11 @@ mod tests {
                 active_entries: Cell::new(0),
             }
         }
+
+        fn bind(&mut self, attachment: AttachmentId) {
+            assert_eq!(self.active_entries.get(), 0);
+            self.attachment = attachment;
+        }
     }
 
     struct ActiveEntry<'owner>(&'owner Cell<usize>);
@@ -347,5 +352,35 @@ mod tests {
         );
         assert_eq!(host.state(), HostState::Destroyed);
         assert_eq!(host.source.active_entries.get(), 0);
+    }
+
+    #[test]
+    fn foreign_owner_rebinds_across_attachment_epochs() {
+        const CYCLES: u64 = 1_024;
+
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let runtime_id = identity.runtime_id();
+        let mut owner = None;
+
+        for epoch in 1..=CYCLES {
+            let mut attachment =
+                Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+            let attachment_id = attachment.attachment_id();
+            assert_eq!(attachment_id.runtime_id(), runtime_id);
+            assert_eq!(attachment_id.epoch().get(), epoch);
+
+            let source = owner.get_or_insert_with(|| ForeignOwner::new(attachment_id));
+            source.bind(attachment_id);
+            let mut host = JscAttachedHost::new(&mut attachment, source);
+            host.with_backend(|_| ()).unwrap();
+            assert_eq!(
+                host.detach_with_entry().unwrap().final_entry(),
+                FinalEntryOutcome::Completed
+            );
+            assert_eq!(host.state(), HostState::Destroyed);
+            assert_eq!(host.source.active_entries.get(), 0);
+        }
+
+        assert_eq!(owner.unwrap().entries, usize::try_from(CYCLES * 2).unwrap());
     }
 }
