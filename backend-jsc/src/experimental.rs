@@ -9,6 +9,7 @@ use rustjsi_host::{
 mod argument_roots;
 #[cfg(test)]
 mod argument_tests;
+mod attachment;
 #[cfg(test)]
 mod callback_budget_tests;
 #[cfg(test)]
@@ -43,11 +44,12 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
+pub use attachment::{Attachment, DetachReport};
 pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
 
-/// Creation-time root admission limits for the experimental standalone host.
+/// Creation-time root admission limits for an experimental JSC attachment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RootLimits {
     /// Persistent registry slots, including pending and exhausted identities.
@@ -179,6 +181,8 @@ pub struct JsException {
 pub enum RuntimeError {
     /// `JavaScriptCore` could not create a context.
     CreationFailed,
+    /// A host supplied a null JSC context.
+    NullContext,
     /// The runtime is no longer active.
     Invalidated,
     /// The operation was attempted from a different thread.
@@ -997,6 +1001,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::CreationFailed => "JavaScriptCore runtime creation failed",
+            Self::NullContext => "host supplied a null JavaScriptCore context",
             Self::Invalidated => "runtime is invalidated",
             Self::WrongThread => "runtime entered from the wrong thread",
             Self::WrongRuntime => "handle belongs to another runtime",

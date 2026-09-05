@@ -522,6 +522,7 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::StaleHandle => BackendError::StaleHandle,
         RuntimeError::Host(_) => BackendError::Failure("JavaScriptCore host entry rejected"),
         RuntimeError::CreationFailed => BackendError::Failure("JavaScriptCore creation failed"),
+        RuntimeError::NullContext => BackendError::Failure("JavaScriptCore context is null"),
         RuntimeError::Invalidated => BackendError::Failure("JavaScriptCore runtime is invalid"),
         RuntimeError::WrongThread => {
             BackendError::Failure("JavaScriptCore runtime thread mismatch")

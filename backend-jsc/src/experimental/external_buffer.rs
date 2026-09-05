@@ -130,12 +130,10 @@ impl ExternalLedger {
         self.deallocations.fetch_add(1, Ordering::AcqRel);
     }
 
-    #[cfg(test)]
     pub(super) fn live_allocations(&self) -> usize {
         self.live_allocations.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
     pub(super) fn live_bytes(&self) -> usize {
         self.live_bytes.load(Ordering::Acquire)
     }
