@@ -525,6 +525,51 @@ mod tests {
     }
 
     #[test]
+    fn foreign_owner_loss_reconciles_callbacks_roots_and_external_bytes() {
+        let owner = ForeignContext::new();
+        let callback_drops = Rc::new(Cell::new(0));
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let (root, function, buffer) = unsafe {
+            attachment.with_context(owner.as_raw(), |cx| {
+                let local = cx.eval("({})", "owner-loss.js").unwrap();
+                let root = cx.persist(&local).unwrap();
+                let callback_probe = DropProbe(Rc::clone(&callback_drops));
+                let function = cx
+                    .install_host_function("ownerLossCallback", move |_| {
+                        let _ = &callback_probe;
+                        Ok(Value::Undefined)
+                    })
+                    .unwrap();
+                let buffer = cx
+                    .install_external_buffer(
+                        "ownerLossBytes",
+                        vec![1_u8, 2, 3, 4].into_boxed_slice(),
+                    )
+                    .unwrap();
+                (root, function, buffer)
+            })
+        }
+        .unwrap();
+
+        drop(owner);
+        assert_eq!(callback_drops.get(), 0);
+        assert!(buffer.is_deallocated());
+        assert_eq!(buffer.deallocator_received_origin(), Some(true));
+
+        let report = attachment.detach_without_context().unwrap();
+        assert_eq!(report.final_entry(), FinalEntryOutcome::Unavailable);
+        assert_eq!(report.unresolved_persistent_roots(), 1);
+        assert_eq!(report.unresolved_host_functions(), 1);
+        assert_eq!(report.remaining_external_allocations(), 0);
+        assert_eq!(report.remaining_external_bytes(), 0);
+        assert_eq!(callback_drops.get(), 1);
+        assert_eq!(attachment.state(), HostState::Destroyed);
+
+        drop((root, function, buffer));
+    }
+
+    #[test]
     fn detach_report_exposes_contained_payload_destructor_panics() {
         let owner = ForeignContext::new();
         let mut identity = RuntimeIdentity::allocate().unwrap();
