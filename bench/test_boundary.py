@@ -136,6 +136,8 @@ class SampleTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    HASHES = {name: "a" * 64 for name in boundary.BENCHMARKS}
+
     def test_cargo_executable_selection(self):
         output = json.dumps({"reason": "build-finished", "success": True}) + "\n"
         with self.assertRaises(ValueError):
@@ -170,7 +172,7 @@ class ArtifactTests(unittest.TestCase):
             metadata = {
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
                 "source": {"head": "test"},
-                "binary_sha256": {name: f"{name}-digest" for name in boundary.BENCHMARKS},
+                "binary_sha256": self.HASHES,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(10):
@@ -299,7 +301,7 @@ class ArtifactTests(unittest.TestCase):
             metadata = {
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
                 "source": {"head": "before"},
-                "binary_sha256": {name: f"{name}-digest" for name in boundary.BENCHMARKS},
+                "binary_sha256": self.HASHES,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             boundary.write_json(directory / "complete.json", {
@@ -307,6 +309,25 @@ class ArtifactTests(unittest.TestCase):
             })
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
+
+    def test_report_rejects_invalid_binary_hash_metadata(self):
+        for hashes in ("digest", {"boundary": "a" * 64}, {
+            name: "not-a-hash" for name in boundary.BENCHMARKS
+        }):
+            with self.subTest(hashes=hashes), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                boundary.write_json(directory / "metadata.json", {
+                    "schema": boundary.SCHEMA,
+                    "benchmark": "boundary",
+                    "runs": 10,
+                    "source": {"head": "before"},
+                    "binary_sha256": hashes,
+                })
+                boundary.write_json(directory / "complete.json", {
+                    "source": {"head": "before"}, "binary_sha256": hashes,
+                })
+                with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
+                    boundary.read_report(directory)
 
     def test_compiler_selection_overrides_path_and_wrappers_locally(self):
         original = {"PATH": "/wrong/bin", "RUSTC": "/wrong/rustc",

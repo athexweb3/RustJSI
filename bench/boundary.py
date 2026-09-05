@@ -323,6 +323,17 @@ def record_process(arguments, directory, name, *, environment=None):
     return result.stdout
 
 
+def valid_binary_hashes(value):
+    return (
+        isinstance(value, dict)
+        and value.keys() == set(BENCHMARKS)
+        and all(
+            isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in value.values()
+        )
+    )
+
+
 def read_report(directory):
     if (directory / "failure.json").exists():
         raise ValueError("collection failed; saved samples are diagnostic only")
@@ -332,7 +343,11 @@ def read_report(directory):
         completion = json.load(source)
     if not isinstance(metadata, dict) or not isinstance(completion, dict):
         raise ValueError("metadata and completion must be objects")
-    if metadata.get("schema") != SCHEMA or metadata.get("benchmark") != "boundary":
+    if (
+        metadata.get("schema") != SCHEMA
+        or metadata.get("benchmark") != "boundary"
+        or not valid_binary_hashes(metadata.get("binary_sha256"))
+    ):
         raise ValueError("unsupported benchmark metadata")
     count = metadata.get("runs")
     if type(count) is not int or not 10 <= count <= 1_000:
