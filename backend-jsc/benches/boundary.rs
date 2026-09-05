@@ -3,6 +3,10 @@
 //! Direct JSC host-function boundary microbenchmark.
 
 #[cfg(target_os = "macos")]
+#[global_allocator]
+static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
+
+#[cfg(target_os = "macos")]
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Attachment, Runtime, Value};
@@ -13,18 +17,19 @@ fn main() {
 
     const WARMUP: u32 = 10_000;
     const ITERATIONS: u32 = 1_000_000;
+    const ENTRY_BATCHES: u32 = 1_000;
 
     let direct = raw::measure(WARMUP, ITERATIONS);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
     let gate = EntryGate::new(NonZeroU32::new(64).unwrap(), FinalEntryPolicy::Unavailable);
-    let gate_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let gate_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         let entry = black_box(&gate).try_enter().expect("admit host entry");
         black_box(&entry);
         drop(entry);
     });
-    let common_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         black_box(&mut runtime)
             .with_backend(|_| black_box(()))
             .expect("enter common backend");
@@ -33,7 +38,7 @@ fn main() {
     let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
     let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
         .expect("create foreign attachment");
-    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         // SAFETY: The benchmark owner keeps this context live on the current
         // thread and lends the same global context to every entry.
         unsafe {
@@ -93,9 +98,9 @@ fn main() {
         .expect("enter common JSC backend");
 
     println!("direct_jsc_lower_bound: {direct:.2} ns/call");
-    println!("host_gate_admit_and_exit: {gate_entry:.2} ns/entry");
-    println!("jsc_common_empty_entry: {common_entry:.2} ns/entry");
-    println!("jsc_foreign_common_empty_entry: {foreign_common_entry:.2} ns/entry");
+    print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
+    print_entry_measurement("jsc_common_empty_entry", &common_entry);
+    print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
     println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
@@ -121,19 +126,179 @@ fn assert_answer(value: f64) {
 }
 
 #[cfg(target_os = "macos")]
-fn measure_entry(warmup: u32, iterations: u32, mut operation: impl FnMut()) -> f64 {
+fn measure_entry(
+    warmup: u32,
+    iterations: u32,
+    batches: u32,
+    mut operation: impl FnMut(),
+) -> EntryMeasurement {
+    assert!(batches > 0 && iterations % batches == 0);
     for _ in 0..warmup {
         operation();
     }
-    let started = std::time::Instant::now();
-    for _ in 0..iterations {
-        operation();
+
+    let iterations_per_batch = iterations / batches;
+    let mut batch_means = Vec::with_capacity(batches as usize);
+    let allocations_before = allocation::snapshot();
+    for _ in 0..batches {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations_per_batch {
+            operation();
+        }
+        batch_means.push(
+            started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations_per_batch),
+        );
     }
-    started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    let allocations = allocation::snapshot().difference(allocations_before);
+    EntryMeasurement {
+        iterations,
+        batches,
+        iterations_per_batch,
+        batch_means,
+        allocations,
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct EntryMeasurement {
+    iterations: u32,
+    batches: u32,
+    iterations_per_batch: u32,
+    batch_means: Vec<f64>,
+    allocations: allocation::Snapshot,
+}
+
+#[cfg(target_os = "macos")]
+impl EntryMeasurement {
+    fn mean(&self) -> f64 {
+        self.batch_means.iter().sum::<f64>() / f64::from(self.batches)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_entry_measurement(name: &str, measurement: &EntryMeasurement) {
+    use std::fmt::Write;
+
+    println!("{name}: {:.2} ns/entry", measurement.mean());
+
+    let mut samples = String::new();
+    for (index, sample) in measurement.batch_means.iter().enumerate() {
+        if index > 0 {
+            samples.push(',');
+        }
+        write!(&mut samples, "{sample:.4}").expect("write batch sample");
+    }
+    println!(
+        "entry_batches_{name}: {} ops/batch {samples} ns/entry",
+        measurement.iterations_per_batch
+    );
+    println!(
+        "rust_alloc_{name}: {} calls {} bytes {} deallocations {} deallocated-bytes ({} iterations)",
+        measurement.allocations.allocations,
+        measurement.allocations.allocated_bytes,
+        measurement.allocations.deallocations,
+        measurement.allocations.deallocated_bytes,
+        measurement.iterations,
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {}
+
+#[cfg(target_os = "macos")]
+mod allocation {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) struct CountingAllocator;
+
+    // SAFETY: Every operation delegates to `System` with the original pointer and
+    // layout. The counters are observational and do not affect allocator state.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The caller supplies the allocation contract required by
+            // `GlobalAlloc`; it is forwarded unchanged to `System`.
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The caller supplies the allocation contract required by
+            // `GlobalAlloc`; it is forwarded unchanged to `System`.
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            record_deallocation(layout.size());
+            // SAFETY: The pointer and layout come from the caller's matching
+            // allocation contract and are forwarded unchanged to `System`.
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            // SAFETY: The caller supplies a live allocation, its original layout,
+            // and the requested new size; all are forwarded to `System`.
+            let replacement = unsafe { System.realloc(pointer, layout, size) };
+            if !replacement.is_null() {
+                record_deallocation(layout.size());
+                record_allocation(size);
+            }
+            replacement
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Snapshot {
+        pub(super) allocations: u64,
+        pub(super) allocated_bytes: u64,
+        pub(super) deallocations: u64,
+        pub(super) deallocated_bytes: u64,
+    }
+
+    impl Snapshot {
+        pub(super) fn difference(self, earlier: Self) -> Self {
+            Self {
+                allocations: self.allocations.wrapping_sub(earlier.allocations),
+                allocated_bytes: self.allocated_bytes.wrapping_sub(earlier.allocated_bytes),
+                deallocations: self.deallocations.wrapping_sub(earlier.deallocations),
+                deallocated_bytes: self
+                    .deallocated_bytes
+                    .wrapping_sub(earlier.deallocated_bytes),
+            }
+        }
+    }
+
+    pub(super) fn snapshot() -> Snapshot {
+        Snapshot {
+            allocations: ALLOCATIONS.load(Ordering::Relaxed),
+            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+            deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
+            deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_allocation(size: usize) {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
+
+    fn record_deallocation(size: usize) {
+        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod raw {
