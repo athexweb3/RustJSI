@@ -11,7 +11,7 @@ from unittest.mock import patch
 import boundary
 
 
-SAMPLE = """direct_jsc_lower_bound: 100.00 ns/call
+BASE_SAMPLE = """direct_jsc_lower_bound: 100.00 ns/call
 host_gate_admit_and_exit: 4.00 ns/entry
 jsc_common_empty_entry: 9.00 ns/entry
 jsc_foreign_common_empty_entry: 11.00 ns/entry
@@ -21,13 +21,31 @@ direct_jsc_scalar: 25.00 ns/round-trip
 rustjsi_common_scalar: 27.00 ns/round-trip
 common_scalar_over_direct: 1.080x (1000000 iterations)
 """
+ENTRY_VALUES = {
+    "host_gate_admit_and_exit": 4.0,
+    "jsc_common_empty_entry": 9.0,
+    "jsc_foreign_common_empty_entry": 11.0,
+}
+SAMPLE = BASE_SAMPLE + "".join(
+    f"entry_batches_{name}: 1000 ops/batch "
+    + ",".join([f"{value:.4f}"] * 1000)
+    + " ns/entry\n"
+    + f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
+    + "0 deallocated-bytes (1000000 iterations)\n"
+    for name, value in ENTRY_VALUES.items()
+)
 
 
 class SampleTests(unittest.TestCase):
     def test_all_metrics_and_units(self):
         sample = boundary.parse_sample(SAMPLE)
-        self.assertEqual(sample["rustjsi_experimental"], 125)
-        self.assertEqual(sample.keys(), boundary.METRICS.keys())
+        self.assertEqual(sample["metrics"]["rustjsi_experimental"], 125)
+        self.assertEqual(sample["metrics"].keys(), boundary.METRICS.keys())
+        self.assertEqual(sample["entry_batches"].keys(), boundary.ENTRY_METRICS)
+        self.assertEqual(len(sample["entry_batches"]["jsc_common_empty_entry"]), 1000)
+        self.assertEqual(
+            sample["rust_allocations"]["jsc_common_empty_entry"]["allocations"], 0
+        )
 
     def test_bad_samples(self):
         cases = [
@@ -40,6 +58,10 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("1000000 iterations", "10 iterations"),
             SAMPLE.replace("1.250x", "0.000x"),
             SAMPLE.replace("direct_jsc_lower_bound: ", "direct_jsc_lower_bound="),
+            SAMPLE.replace("4.0000", "NaN", 1),
+            SAMPLE.replace("4.0000,", "", 1),
+            SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
+            SAMPLE.replace("0 calls 0 bytes", "-1 calls 0 bytes", 1),
             "\n".join(SAMPLE.splitlines()[:-1]),
         ]
         for value in cases:
@@ -57,15 +79,47 @@ class SampleTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 boundary.describe(values)
 
+    def test_nonnegative_statistics_accept_zero(self):
+        result = boundary.describe_nonnegative([0, 0, 0])
+        self.assertEqual(result["mean"], 0)
+        self.assertEqual(result["sample_cv"], 0)
+        self.assertEqual(result["mean_per_entry"], 0)
+
+    def test_nearest_rank_percentiles(self):
+        values = list(range(1, 101))
+        self.assertEqual(boundary.nearest_rank(values, 0.50), 50)
+        self.assertEqual(boundary.nearest_rank(values, 0.95), 95)
+        self.assertEqual(boundary.nearest_rank(values, 0.99), 99)
+
     def test_ratios_are_paired_and_no_call_percentile_is_invented(self):
         samples = [boundary.parse_sample(SAMPLE) for _ in range(10)]
-        samples[0]["direct_jsc_lower_bound"] = 50
+        samples[0]["metrics"]["direct_jsc_lower_bound"] = 50
         report = boundary.summarize(samples)
         ratios = report["paired_ratios"]["call_over_lower_bound"]
         self.assertEqual(ratios["mean"], (2.5 + 9 * 1.25) / 10)
         self.assertFalse(report["all_run_mean_cv_at_most_5_percent"])
         self.assertIsNone(report["individual_call_p99"])
         self.assertFalse(report["performance_gate_qualified"])
+
+    def test_entry_tail_and_allocator_scope_are_explicit(self):
+        samples = [boundary.parse_sample(SAMPLE) for _ in range(10)]
+        samples[0]["entry_batches"]["host_gate_admit_and_exit"][-1] = 40
+        report = boundary.summarize(samples)
+        latency = report["entry_batch_latency"]
+        self.assertEqual(latency["sample_kind"], "contiguous_batch_mean")
+        self.assertEqual(latency["operations_per_batch"], 1000)
+        self.assertEqual(
+            latency["metrics"]["host_gate_admit_and_exit"]["samples"], 10_000
+        )
+        self.assertLessEqual(
+            latency["metrics"]["host_gate_admit_and_exit"]["p99"], 40
+        )
+        allocations = report["rust_allocator_activity"]
+        self.assertIn("excludes", allocations)
+        self.assertEqual(
+            allocations["metrics"]["jsc_common_empty_entry"]["allocations"]["mean"],
+            0,
+        )
 
     def test_at_least_ten_runs(self):
         with self.assertRaises(ValueError):

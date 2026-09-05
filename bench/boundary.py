@@ -26,14 +26,26 @@ METRICS = {
     "rustjsi_common_scalar": "ns/round-trip",
 }
 RATIOS = {"rustjsi_over_direct", "common_scalar_over_direct"}
+ENTRY_METRICS = {
+    "host_gate_admit_and_exit",
+    "jsc_common_empty_entry",
+    "jsc_foreign_common_empty_entry",
+}
 ITERATIONS = 1_000_000
-SCHEMA = 2
+ENTRY_BATCHES = 1_000
+ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
+ALLOCATION_FIELDS = (
+    "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
+)
+SCHEMA = 3
 
 
 def parse_sample(output):
     """Reject partial, duplicated, unknown, or non-finite benchmark output."""
     values = {}
     ratios = set()
+    entry_batches = {}
+    rust_allocations = {}
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -59,11 +71,50 @@ def parse_sample(output):
             ):
                 raise ValueError(f"invalid ratio or iteration count: {name}")
             ratios.add(name)
+        elif name.startswith("entry_batches_"):
+            metric = name.removeprefix("entry_batches_")
+            match = re.fullmatch(r"([0-9]+) ops/batch (.+) ns/entry", payload)
+            if not match or metric not in ENTRY_METRICS or metric in entry_batches:
+                raise ValueError(f"invalid or duplicate entry batch metric: {metric}")
+            samples = [float(value) for value in match[2].split(",")]
+            if (
+                int(match[1]) != ENTRY_BATCH_ITERATIONS
+                or len(samples) != ENTRY_BATCHES
+                or any(not math.isfinite(value) or value <= 0 for value in samples)
+            ):
+                raise ValueError(f"invalid entry batch samples: {metric}")
+            entry_batches[metric] = samples
+        elif name.startswith("rust_alloc_"):
+            metric = name.removeprefix("rust_alloc_")
+            match = re.fullmatch(
+                r"([0-9]+) calls ([0-9]+) bytes ([0-9]+) deallocations "
+                r"([0-9]+) deallocated-bytes \(([0-9]+) iterations\)",
+                payload,
+            )
+            if not match or metric not in ENTRY_METRICS or metric in rust_allocations:
+                raise ValueError(f"invalid or duplicate allocation metric: {metric}")
+            if int(match[5]) != ITERATIONS:
+                raise ValueError(f"invalid allocation iteration count: {metric}")
+            rust_allocations[metric] = dict(zip(
+                ALLOCATION_FIELDS, (int(value) for value in match.groups()[:4]), strict=True
+            ))
         else:
             raise ValueError(f"unknown benchmark metric: {name}")
-    if values.keys() != METRICS.keys() or ratios != RATIOS:
+    if (
+        values.keys() != METRICS.keys()
+        or ratios != RATIOS
+        or entry_batches.keys() != ENTRY_METRICS
+        or rust_allocations.keys() != ENTRY_METRICS
+    ):
         raise ValueError("incomplete benchmark output")
-    return values
+    for name, samples in entry_batches.items():
+        if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
+            raise ValueError(f"entry batch mean does not match metric: {name}")
+    return {
+        "metrics": values,
+        "entry_batches": entry_batches,
+        "rust_allocations": rust_allocations,
+    }
 
 
 def describe(values):
@@ -81,11 +132,38 @@ def describe(values):
     }
 
 
+def describe_nonnegative(values):
+    """Describe counters where an exact zero is a valid and useful result."""
+    if len(values) < 2 or any(not math.isfinite(x) or x < 0 for x in values):
+        raise ValueError("need at least two finite nonnegative samples")
+    mean = statistics.mean(values)
+    return {
+        "samples": len(values),
+        "mean": mean,
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+        "sample_cv": statistics.stdev(values) / mean if mean else 0.0,
+        "mean_per_entry": mean / ITERATIONS,
+    }
+
+
+def nearest_rank(values, percentile):
+    """Return a nearest-rank percentile from finite positive observations."""
+    if not values or not 0 < percentile <= 1:
+        raise ValueError("need observations and a percentile in (0, 1]")
+    ordered = sorted(values)
+    return ordered[math.ceil(percentile * len(ordered)) - 1]
+
+
 def summarize(samples):
     if len(samples) < 10:
         raise ValueError("need at least ten independent process runs")
     metrics = {
-        name: {"unit": unit, **describe([sample[name] for sample in samples])}
+        name: {
+            "unit": unit,
+            **describe([sample["metrics"][name] for sample in samples]),
+        }
         for name, unit in METRICS.items()
     }
     pairs = {
@@ -97,8 +175,37 @@ def summarize(samples):
         "sample_kind": "process_batch_mean",
         "metrics": metrics,
         "paired_ratios": {
-            name: describe([sample[top] / sample[bottom] for sample in samples])
+            name: describe([
+                sample["metrics"][top] / sample["metrics"][bottom]
+                for sample in samples
+            ])
             for name, (top, bottom) in pairs.items()
+        },
+        "entry_batch_latency": {
+            "sample_kind": "contiguous_batch_mean",
+            "operations_per_batch": ENTRY_BATCH_ITERATIONS,
+            "metrics": {
+                name: describe_entry_batches([
+                    value
+                    for sample in samples
+                    for value in sample["entry_batches"][name]
+                ], len(samples))
+                for name in ENTRY_METRICS
+            },
+        },
+        "rust_allocator_activity": {
+            "scope": "Rust global allocator calls in the timed entry region",
+            "excludes": "JavaScriptCore, system-framework, and foreign allocator activity",
+            "iterations_per_process": ITERATIONS,
+            "metrics": {
+                name: {
+                    field: describe_nonnegative([
+                        sample["rust_allocations"][name][field] for sample in samples
+                    ])
+                    for field in ALLOCATION_FIELDS
+                }
+                for name in ENTRY_METRICS
+            },
         },
         "all_run_mean_cv_at_most_5_percent": all(
             item["sample_cv"] <= 0.05 for item in metrics.values()
@@ -106,6 +213,20 @@ def summarize(samples):
         "individual_call_p99": None,
         "performance_gate_qualified": False,
     }
+
+
+def describe_entry_batches(values, processes):
+    """Describe pooled, equal-sized block means without calling them call tails."""
+    result = describe(values)
+    result.update({
+        "unit": "ns/entry",
+        "processes": processes,
+        "batches_per_process": ENTRY_BATCHES,
+        "p50": nearest_rank(values, 0.50),
+        "p95": nearest_rank(values, 0.95),
+        "p99": nearest_rank(values, 0.99),
+    })
+    return result
 
 
 def command(arguments, *, cwd=ROOT):
@@ -258,6 +379,8 @@ def collect(directory, runs, toolchain):
             "runs": runs,
             "warmup_iterations": 10_000,
             "measured_iterations": ITERATIONS,
+            "entry_batches": ENTRY_BATCHES,
+            "entry_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
             "build_command": build,
