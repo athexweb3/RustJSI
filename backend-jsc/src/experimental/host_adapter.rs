@@ -148,6 +148,8 @@ mod tests {
     use crate::sys;
     use rustjsi_backend::{BackendFamily, BackendScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::NonNull;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +174,7 @@ mod tests {
         attachment: AttachmentId,
         admit: bool,
         entries: usize,
+        active_entries: Cell<usize>,
     }
 
     impl ForeignOwner {
@@ -183,7 +186,16 @@ mod tests {
                 attachment,
                 admit: true,
                 entries: 0,
+                active_entries: Cell::new(0),
             }
+        }
+    }
+
+    struct ActiveEntry<'owner>(&'owner Cell<usize>);
+
+    impl Drop for ActiveEntry<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
         }
     }
 
@@ -204,6 +216,8 @@ mod tests {
                 return Err(EntryDenied::WrongAttachment);
             }
             self.entries += 1;
+            self.active_entries.set(self.active_entries.get() + 1);
+            let _active = ActiveEntry(&self.active_entries);
             Ok(operation(self.context.as_ptr().cast()))
         }
     }
@@ -290,5 +304,48 @@ mod tests {
         assert_eq!(host.state(), HostState::Active);
         assert_eq!(host.source.entries, 1);
         let _ = host.detach_without_entry().unwrap();
+    }
+
+    #[test]
+    fn unwind_restores_foreign_entry_before_reentry() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = host.with_backend(|_| panic!("host operation failed"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        host.with_backend(|_| ()).unwrap();
+        assert_eq!(host.source.entries, 2);
+        assert_eq!(host.source.active_entries.get(), 0);
+        let _ = host.detach_without_entry().unwrap();
+    }
+
+    #[test]
+    fn guaranteed_detach_remains_retryable_after_entry_denial() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        owner.admit = false;
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        assert!(matches!(
+            host.detach_with_entry(),
+            Err(JscHostError::Entry(EntryDenied::Unavailable))
+        ));
+        assert_eq!(host.state(), HostState::Active);
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        host.source.admit = true;
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
+        assert_eq!(host.state(), HostState::Destroyed);
+        assert_eq!(host.source.active_entries.get(), 0);
     }
 }
