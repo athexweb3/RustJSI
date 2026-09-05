@@ -151,7 +151,7 @@ impl Attachment {
         operation: impl for<'entry> FnOnce(&mut JscBackend<'entry>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
-        let raw = unsafe { super::attachment::canonical_context(context)? };
+        let raw = super::attachment::borrowed_global_context(context)?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();

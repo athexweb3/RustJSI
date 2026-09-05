@@ -85,16 +85,16 @@ impl Attachment {
 
     /// Enters the host-owned context for the duration of `operation`.
     ///
-    /// The context is canonicalized to its global context for callback checks.
     /// The returned `Context` and all scoped values are unable to escape.
     ///
     /// # Safety
     ///
-    /// `context` must be a live `JSContextRef` for this attachment's one global
-    /// context. The caller must be on the context's legal thread and hold every
-    /// VM lock or host synchronization required by `JavaScriptCore`. The host must
-    /// prevent context destruction for the full call and must never use this
-    /// attachment with a replacement or different context.
+    /// `context` must be this attachment's live `JSGlobalContextRef`, not an
+    /// arbitrary `JSContextRef`. The caller must be on the context's legal thread
+    /// and hold every VM lock or host synchronization required by
+    /// `JavaScriptCore`. The host must prevent context destruction for the full
+    /// call and must never use this attachment with a replacement or different
+    /// context.
     ///
     /// # Errors
     ///
@@ -105,7 +105,7 @@ impl Attachment {
         operation: impl for<'cx> FnOnce(&mut Context<'cx>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
-        let raw = unsafe { canonical_context(context)? };
+        let raw = borrowed_global_context(context)?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
@@ -155,7 +155,7 @@ impl Attachment {
             .gate
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
-        let raw = unsafe { canonical_context(context)? };
+        let raw = borrowed_global_context(context)?;
         let roots = self.shared.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
         let released_persistent_roots = roots.len();
@@ -384,14 +384,10 @@ impl DetachReport {
     }
 }
 
-pub(super) unsafe fn canonical_context(
+pub(super) fn borrowed_global_context(
     context: *mut c_void,
 ) -> Result<NonNull<sys::OpaqueContext>, RuntimeError> {
-    let context =
-        NonNull::new(context.cast::<sys::OpaqueContext>()).ok_or(RuntimeError::NullContext)?;
-    // SAFETY: The caller guarantees a live JSC context for the duration of entry.
-    let global = unsafe { sys::context_get_global_context(context.as_ptr()) };
-    NonNull::new(global).ok_or(RuntimeError::NullContext)
+    NonNull::new(context.cast::<sys::OpaqueContext>()).ok_or(RuntimeError::NullContext)
 }
 
 #[cfg(test)]
