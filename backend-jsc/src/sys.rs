@@ -80,6 +80,9 @@ unsafe extern "C" {
     #[link_name = "JSContextGetGlobalObject"]
     pub(crate) fn context_get_global_object(context: ContextRef) -> ObjectRef;
 
+    #[link_name = "JSContextGetGlobalContext"]
+    pub(crate) fn context_get_global_context(context: ContextRef) -> GlobalContextRef;
+
     #[link_name = "JSEvaluateScript"]
     pub(crate) fn evaluate_script(
         context: ContextRef,

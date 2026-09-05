@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{ACTIVE_RUNTIME, GateError, RuntimeError};
+use super::{ACTIVE_CONTEXT, ACTIVE_RUNTIME, GateError, RuntimeError};
 use super::{HostState, Runtime, Shared, Value};
 use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy};
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
-type Snapshot = (HostState, bool, bool);
+type Snapshot = (HostState, bool);
 
 struct DropSnapshot {
     runtime: Weak<Shared>,
@@ -19,7 +19,6 @@ impl Drop for DropSnapshot {
         self.observed.set(Some((
             shared.gate.state(),
             shared.gate.cleanup_in_progress(),
-            shared.context.get().is_some(),
         )));
     }
 }
@@ -47,8 +46,9 @@ fn invalidation_separates_cleanup_entry_from_post_engine_destruction() {
         })
         .unwrap();
     runtime.invalidate().unwrap();
-    assert_eq!(callback.get(), Some((HostState::Draining, true, true)));
-    assert_eq!(native.get(), Some((HostState::Invalid, false, false)));
+    assert_eq!(callback.get(), Some((HostState::Draining, true)));
+    assert_eq!(native.get(), Some((HostState::Invalid, false)));
+    assert!(runtime.context.is_none());
     assert!(!runtime.shared.gate.cleanup_in_progress());
     assert_eq!(runtime.shared.gate.state(), HostState::Destroyed);
     assert_eq!(
@@ -71,10 +71,10 @@ fn outstanding_cleanup_guard_rejects_teardown_before_engine_release() {
         runtime.invalidate(),
         Err(RuntimeError::Host(GateError::CleanupInProgress))
     );
-    assert!(shared.context.get().is_some());
+    assert!(runtime.context.is_some());
     drop(cleanup);
     runtime.invalidate().unwrap();
-    assert!(shared.context.get().is_none());
+    assert!(runtime.context.is_none());
 }
 
 #[test]
@@ -92,6 +92,7 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
     }
     let mut outer = Runtime::new().unwrap();
     let outer_shared = Rc::clone(&outer.shared);
+    let outer_context = outer.context.unwrap();
     let mut inner = Runtime::new().unwrap();
     let observed = Rc::new(Cell::new(false));
     let probe = PanicDrop {
@@ -113,6 +114,7 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
             assert!(
                 ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), Rc::as_ptr(&outer_shared)))
             );
+            assert_eq!(ACTIVE_CONTEXT.with(Cell::get), outer_context.as_ptr());
             let value = cx.eval("42", "outer.js").unwrap();
             assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
         })
