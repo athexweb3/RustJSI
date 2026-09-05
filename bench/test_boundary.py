@@ -26,14 +26,18 @@ ENTRY_VALUES = {
     "jsc_common_empty_entry": 9.0,
     "jsc_foreign_common_empty_entry": 11.0,
 }
-SAMPLE = BASE_SAMPLE + "".join(
+TIMING_SAMPLE = BASE_SAMPLE + "".join(
     f"entry_batches_{name}: 1000 ops/batch "
     + ",".join([f"{value:.4f}"] * 1000)
     + " ns/entry\n"
-    + f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
-    + "0 deallocated-bytes (1000000 iterations)\n"
     for name, value in ENTRY_VALUES.items()
 )
+ALLOCATION_SAMPLE = "".join(
+    f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
+    + "0 deallocated-bytes (1000000 iterations)\n"
+    for name in ENTRY_VALUES
+)
+SAMPLE = TIMING_SAMPLE + ALLOCATION_SAMPLE
 
 
 class SampleTests(unittest.TestCase):
@@ -133,18 +137,24 @@ class SampleTests(unittest.TestCase):
 
 class ArtifactTests(unittest.TestCase):
     def test_cargo_executable_selection(self):
-        artifact = {
-            "reason": "compiler-artifact", "target": {"name": "boundary", "kind": ["bench"]},
-            "executable": "/tmp/boundary",
-        }
         output = json.dumps({"reason": "build-finished", "success": True}) + "\n"
         with self.assertRaises(ValueError):
-            boundary.executable_from_cargo(output)
-        output += json.dumps(artifact)
-        self.assertEqual(boundary.executable_from_cargo(output), Path("/tmp/boundary"))
-        artifact["executable"] = "/tmp/other"
+            boundary.executables_from_cargo(output)
+        artifacts = [
+            {
+                "reason": "compiler-artifact",
+                "target": {"name": name, "kind": ["bench"]},
+                "executable": f"/tmp/{name}",
+            }
+            for name in boundary.BENCHMARKS
+        ]
+        output += "\n".join(json.dumps(artifact) for artifact in artifacts)
+        self.assertEqual(boundary.executables_from_cargo(output), {
+            name: Path(f"/tmp/{name}") for name in boundary.BENCHMARKS
+        })
+        artifacts[0]["executable"] = "/tmp/other"
         with self.assertRaises(ValueError):
-            boundary.executable_from_cargo(output + "\n" + json.dumps(artifact))
+            boundary.executables_from_cargo(output + "\n" + json.dumps(artifacts[0]))
 
     def test_outputs_are_never_overwritten(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -159,11 +169,15 @@ class ArtifactTests(unittest.TestCase):
             directory = Path(temporary)
             metadata = {
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
-                "source": {"head": "test"}, "binary_sha256": "test-digest",
+                "source": {"head": "test"},
+                "binary_sha256": {name: f"{name}-digest" for name in boundary.BENCHMARKS},
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(10):
-                (directory / f"run-{index:03}.stdout").write_text(SAMPLE)
+                (directory / f"run-{index:03}.stdout").write_text(TIMING_SAMPLE)
+                (directory / f"allocation-run-{index:03}.stdout").write_text(
+                    ALLOCATION_SAMPLE
+                )
             with self.assertRaises(FileNotFoundError):
                 boundary.read_report(directory)
             completion = {key: metadata[key] for key in ("source", "binary_sha256")}
@@ -225,23 +239,31 @@ class ArtifactTests(unittest.TestCase):
         for changed in (None, "source", "binary"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                executable = root / "binary"
-                executable.write_bytes(b"original binary")
+                executables = {
+                    name: root / name for name in boundary.BENCHMARKS
+                }
+                for executable in executables.values():
+                    executable.write_bytes(b"original binary")
                 directory = root / "results"
-                artifact = json.dumps({
+                artifacts = "\n".join(json.dumps({
                     "reason": "compiler-artifact",
-                    "target": {"name": "boundary", "kind": ["bench"]},
+                    "target": {"name": name, "kind": ["bench"]},
                     "executable": str(executable),
-                })
+                }) for name, executable in executables.items())
 
                 def fake_process(arguments, destination, name, *, environment=None):
                     if name == "build":
                         self.assertEqual(environment["RUSTC"], "/test/rustc")
-                    output = artifact if name == "build" else SAMPLE
+                    if name == "build":
+                        output = artifacts
+                    elif name.startswith("allocation-run-"):
+                        output = ALLOCATION_SAMPLE
+                    else:
+                        output = TIMING_SAMPLE
                     (destination / f"{name}.stdout").write_text(output)
                     (destination / f"{name}.stderr").write_text("")
-                    if changed == "binary" and name == "run-009":
-                        executable.write_bytes(b"changed binary")
+                    if changed == "binary" and name == "allocation-run-009":
+                        executables["boundary_allocations"].write_bytes(b"changed binary")
                     return output
 
                 stamp = {"head": "original"}
@@ -266,7 +288,7 @@ class ArtifactTests(unittest.TestCase):
                     else:
                         report = boundary.collect(directory, 10, "test-toolchain")
                         self.assertEqual(boundary.read_report(directory), report)
-                    self.assertEqual(run.call_count, 11)
+                    self.assertEqual(run.call_count, 21)
                     # An existing collection is never reused, including failed ones.
                     with self.assertRaises(FileExistsError):
                         boundary.collect(directory, 10, "test-toolchain")
@@ -276,7 +298,8 @@ class ArtifactTests(unittest.TestCase):
             directory = Path(temporary)
             metadata = {
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
-                "source": {"head": "before"}, "binary_sha256": "test-digest",
+                "source": {"head": "before"},
+                "binary_sha256": {name: f"{name}-digest" for name in boundary.BENCHMARKS},
             }
             boundary.write_json(directory / "metadata.json", metadata)
             boundary.write_json(directory / "complete.json", {

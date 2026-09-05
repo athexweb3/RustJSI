@@ -37,6 +37,7 @@ ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
 ALLOCATION_FIELDS = (
     "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
 )
+BENCHMARKS = ("boundary", "boundary_allocations")
 SCHEMA = 3
 
 
@@ -273,20 +274,23 @@ def write_json(path, value):
         output.write("\n")
 
 
-def executable_from_cargo(output):
-    executables = set()
+def executables_from_cargo(output):
+    executables = {}
     for line in output.splitlines():
         message = json.loads(line)
+        name = message.get("target", {}).get("name")
         if (
             message.get("reason") == "compiler-artifact"
-            and message.get("target", {}).get("name") == "boundary"
+            and name in BENCHMARKS
             and "bench" in message.get("target", {}).get("kind", [])
             and message.get("executable")
         ):
-            executables.add(message["executable"])
-    if len(executables) != 1:
-        raise ValueError("Cargo did not report exactly one boundary benchmark executable")
-    return Path(executables.pop())
+            if name in executables and executables[name] != message["executable"]:
+                raise ValueError(f"Cargo reported multiple executables for {name}")
+            executables[name] = Path(message["executable"])
+    if executables.keys() != set(BENCHMARKS):
+        raise ValueError("Cargo did not report both boundary benchmark executables")
+    return executables
 
 
 def compiler_environment(toolchain):
@@ -341,7 +345,12 @@ def read_report(directory):
     ):
         raise ValueError("source or binary changed during collection")
     samples = [
-        parse_sample((directory / f"run-{index:03}.stdout").read_text(encoding="utf-8"))
+        parse_sample(
+            (directory / f"run-{index:03}.stdout").read_text(encoding="utf-8")
+            + (directory / f"allocation-run-{index:03}.stdout").read_text(
+                encoding="utf-8"
+            )
+        )
         for index in range(count)
     ]
     report = summarize(samples)
@@ -368,11 +377,16 @@ def collect(directory, runs, toolchain):
         build = [
             "rustup", "run", toolchain, "cargo", "bench", "--locked",
             "-p", "rustjsi-backend-jsc", "--features", "experimental-jsc",
-            "--bench", "boundary", "--no-run", "--message-format=json",
+            "--bench", "boundary", "--bench", "boundary_allocations",
+            "--no-run", "--message-format=json",
         ]
-        executable = executable_from_cargo(record_process(
+        executables = executables_from_cargo(record_process(
             build, directory, "build", environment=build_environment,
         ))
+        binary_hashes = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in executables.items()
+        }
         metadata = {
             "schema": SCHEMA,
             "benchmark": "boundary",
@@ -395,7 +409,7 @@ def collect(directory, runs, toolchain):
             "architecture": platform.machine(),
             "cpu": command(["sysctl", "-n", "machdep.cpu.brand_string"]),
             "sdk": command(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
-            "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+            "binary_sha256": binary_hashes,
             "environment_overrides": {
                 key: value for key, value in os.environ.items()
                 if key in {"RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
@@ -406,22 +420,31 @@ def collect(directory, runs, toolchain):
         write_json(directory / "metadata.json", metadata)
         samples = []
         for index in range(runs):
-            samples.append(parse_sample(
-                record_process([str(executable)], directory, f"run-{index:03}")
-            ))
+            timing = record_process(
+                [str(executables["boundary"])], directory, f"run-{index:03}"
+            )
+            allocations = record_process(
+                [str(executables["boundary_allocations"])],
+                directory,
+                f"allocation-run-{index:03}",
+            )
+            samples.append(parse_sample(timing + allocations))
             print(f"boundary run {index + 1}/{runs}", file=sys.stderr)
         final_stamp = source_stamp()
         if final_stamp != stamp:
             raise RuntimeError("source state changed during collection; results are incomplete")
-        final_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
-        if final_hash != metadata["binary_sha256"]:
-            raise RuntimeError("benchmark executable changed during collection")
+        final_hashes = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in executables.items()
+        }
+        if final_hashes != metadata["binary_sha256"]:
+            raise RuntimeError("a benchmark executable changed during collection")
         report = summarize(samples)
         report["compiler_selection"] = "explicit"
         write_json(directory / "summary.json", report)
         write_json(directory / "complete.json", {
             "source": final_stamp,
-            "binary_sha256": final_hash,
+            "binary_sha256": final_hashes,
             "completed_utc": datetime.datetime.now(datetime.UTC).isoformat(),
         })
         return report

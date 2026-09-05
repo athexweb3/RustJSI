@@ -7,11 +7,12 @@ python3 -B bench/boundary.py run --output bench/results/boundary-001
 python3 -B bench/boundary.py report bench/results/boundary-001
 ```
 
-The runner builds `boundary` once with Rust 1.98.0, then launches ten separate
-processes. `--toolchain` selects another installed toolchain; `--runs` accepts
-10–1000. Each workload has 10,000 warmup iterations and 1,000,000 measured
-iterations per process. The three entry workloads divide those iterations into
-1,000 contiguous batches of 1,000 operations. Startup, runtime creation and
+The runner builds the timing and allocation-probe executables once with Rust
+1.98.0, then launches each executable in ten separate process pairs.
+`--toolchain` selects another installed toolchain; `--runs` accepts 10–1000.
+Each workload has 10,000 warmup iterations and 1,000,000 measured iterations
+per process. The three timed entry workloads divide those iterations into 1,000
+contiguous batches of 1,000 operations. Startup, runtime creation and
 compilation are outside the workload timers.
 
 The collector passes absolute `RUSTC` and `RUSTDOC` paths from `rustup which`
@@ -52,11 +53,12 @@ callback function has an explicit root outside the timer; RAII releases the
 root before its context, including if a validation assertion unwinds.
 macOS CI checks successful benchmark execution, not timing thresholds.
 
-For each entry workload, the benchmark also records the four-decimal mean of
-every 1,000-operation batch. A counting global allocator snapshots successful
-Rust allocation, reallocation and deallocation activity around the same
-1,000,000 operations. The batch-sample vector is reserved before the allocator
-snapshot. The counter covers Rust allocations made by the benchmark and linked
+For each entry workload, the timing executable also records the four-decimal
+mean of every 1,000-operation batch. A separate executable with a counting
+global allocator snapshots successful Rust allocation, reallocation and
+deallocation activity around the equivalent 1,000,000 operations. Keeping the
+probe out of the timing executable prevents its atomics from changing workloads
+that allocate. The counter covers Rust allocations made by the probe and linked
 Rust code in that region. It does not observe JavaScriptCore, Objective-C,
 system-framework or other foreign allocator activity.
 
