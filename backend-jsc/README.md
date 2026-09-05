@@ -41,7 +41,8 @@ establish that entry. `JscAttachedHost` combines it with `Attachment` and expose
 the safe source-linked `Host` contract without storing or returning the raw
 context. The integration remains responsible for its actual thread and VM
 synchronization; implementing the trait is not evidence that a framework meets
-those requirements.
+those requirements. The adapter exposes both final-entry and no-entry detach;
+the attachment's declared final-entry policy decides whether the latter is legal.
 
 Explicit detach follows the declared final-entry policy. `detach_with_context`
 balances protected roots without releasing the context. Best-effort and

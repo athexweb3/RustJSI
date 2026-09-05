@@ -34,7 +34,7 @@ pub unsafe trait JscEntrySource {
 }
 
 /// Error from a source-linked host adapter over a foreign JSC context.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JscHostError<E> {
     /// The foreign owner could not establish legal engine entry.
     Entry(E),
@@ -80,6 +80,11 @@ where
     /// Returns a host entry failure or the attachment's lifecycle/cleanup error.
     pub fn detach_with_entry(&mut self) -> Result<DetachReport, JscHostError<S::Error>> {
         let attachment = &mut *self.attachment;
+        if attachment.state() == HostState::Destroyed {
+            return attachment
+                .detach_without_context()
+                .map_err(JscHostError::Runtime);
+        }
         self.source
             .with_global_context(|context| {
                 // SAFETY: JscEntrySource's unsafe contract establishes every
@@ -87,6 +92,18 @@ where
                 unsafe { attachment.detach_with_context(context) }
             })
             .map_err(JscHostError::Entry)?
+            .map_err(JscHostError::Runtime)
+    }
+
+    /// Detaches when the host cannot provide a final engine entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the attachment's lifecycle failure. A guaranteed-final-entry
+    /// attachment rejects this path and remains retryable.
+    pub fn detach_without_entry(&mut self) -> Result<DetachReport, JscHostError<S::Error>> {
+        self.attachment
+            .detach_without_context()
             .map_err(JscHostError::Runtime)
     }
 }
@@ -207,7 +224,12 @@ mod tests {
             FinalEntryOutcome::Completed
         );
         assert_eq!(host.state(), HostState::Destroyed);
-        assert_eq!(owner.entries, 2);
+        host.source.admit = false;
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
+        assert_eq!(host.source.entries, 2);
     }
 
     #[test]
@@ -216,15 +238,17 @@ mod tests {
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
         let mut owner = ForeignOwner::new();
         owner.admit = false;
-        {
-            let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
 
-            assert!(matches!(
-                host.with_backend(|_| panic!("denied operation ran")),
-                Err(JscHostError::Entry(EntryDenied))
-            ));
-            assert_eq!(host.state(), HostState::Active);
-        }
-        let _ = attachment.detach_without_context().unwrap();
+        assert!(matches!(
+            host.with_backend(|_| panic!("denied operation ran")),
+            Err(JscHostError::Entry(EntryDenied))
+        ));
+        assert_eq!(host.state(), HostState::Active);
+        assert_eq!(
+            host.detach_without_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Unavailable
+        );
+        assert_eq!(host.state(), HostState::Destroyed);
     }
 }
