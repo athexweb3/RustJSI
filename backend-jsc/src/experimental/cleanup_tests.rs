@@ -6,7 +6,7 @@ use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy};
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
-type Snapshot = (HostState, bool, bool);
+type Snapshot = (HostState, bool);
 
 struct DropSnapshot {
     runtime: Weak<Shared>,
@@ -19,7 +19,6 @@ impl Drop for DropSnapshot {
         self.observed.set(Some((
             shared.gate.state(),
             shared.gate.cleanup_in_progress(),
-            shared.context.get().is_some(),
         )));
     }
 }
@@ -47,8 +46,9 @@ fn invalidation_separates_cleanup_entry_from_post_engine_destruction() {
         })
         .unwrap();
     runtime.invalidate().unwrap();
-    assert_eq!(callback.get(), Some((HostState::Draining, true, true)));
-    assert_eq!(native.get(), Some((HostState::Invalid, false, false)));
+    assert_eq!(callback.get(), Some((HostState::Draining, true)));
+    assert_eq!(native.get(), Some((HostState::Invalid, false)));
+    assert!(runtime.context.is_none());
     assert!(!runtime.shared.gate.cleanup_in_progress());
     assert_eq!(runtime.shared.gate.state(), HostState::Destroyed);
     assert_eq!(
@@ -71,10 +71,10 @@ fn outstanding_cleanup_guard_rejects_teardown_before_engine_release() {
         runtime.invalidate(),
         Err(RuntimeError::Host(GateError::CleanupInProgress))
     );
-    assert!(shared.context.get().is_some());
+    assert!(runtime.context.is_some());
     drop(cleanup);
     runtime.invalidate().unwrap();
-    assert!(shared.context.get().is_none());
+    assert!(runtime.context.is_none());
 }
 
 #[test]

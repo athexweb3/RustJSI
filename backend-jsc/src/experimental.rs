@@ -67,6 +67,7 @@ impl Default for RootLimits {
 
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
+    static ACTIVE_CONTEXT: Cell<sys::ContextRef> = const { Cell::new(ptr::null()) };
 }
 
 const INLINE_ARGUMENTS: usize = 8;
@@ -82,6 +83,7 @@ const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 /// ```
 pub struct Runtime {
     shared: Rc<Shared>,
+    context: Option<NonNull<sys::OpaqueContext>>,
 }
 
 /// A scoped, legal entry into a runtime.
@@ -217,7 +219,6 @@ struct Shared {
     id: AttachmentId,
     owner: ThreadId,
     gate: EntryGate,
-    context: Cell<Option<NonNull<sys::OpaqueContext>>>,
     roots: RefCell<RootRegistry>,
     local_budget: LocalBudget,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
@@ -271,7 +272,8 @@ enum RootRelease {
 }
 
 struct ActiveRuntimeGuard {
-    previous: *const Shared,
+    previous_runtime: *const Shared,
+    previous_context: sys::ContextRef,
 }
 
 struct JsString(NonNull<sys::OpaqueString>);
@@ -336,7 +338,6 @@ impl Runtime {
                 id,
                 owner: thread::current().id(),
                 gate: EntryGate::new(ENTRY_LIMIT, FinalEntryPolicy::Guaranteed),
-                context: Cell::new(Some(context)),
                 roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
                 local_budget: LocalBudget::new(limits.local_roots),
                 host_functions: RefCell::new(HashMap::new()),
@@ -352,6 +353,7 @@ impl Runtime {
                 argument_gc: Cell::new(false),
                 external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
             }),
+            context: Some(context),
         })
     }
 
@@ -366,8 +368,8 @@ impl Runtime {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        let context = self.context.ok_or(RuntimeError::Invalidated)?;
+        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), context);
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(context);
         let result = {
@@ -403,7 +405,7 @@ impl Runtime {
             .gate
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
-        let context = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
+        let context = self.context.ok_or(RuntimeError::Invalidated)?;
         let roots = self.shared.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
 
@@ -428,7 +430,7 @@ impl Runtime {
         // SAFETY: `Runtime` owns the retained global context, all RustJSI roots have
         // been released, and the owning thread is performing the single release.
         unsafe { sys::global_context_release(context.as_ptr()) };
-        self.shared.context.set(None);
+        self.context = None;
         let native_states = self.shared.native_states.borrow_mut().drain();
         native_state::drop_states(&self.shared, native_states);
         self.shared
@@ -1088,6 +1090,7 @@ impl Shared {
     fn drain_root_releases(&self, context: NonNull<sys::OpaqueContext>) {
         debug_assert!(self.gate.active_entries() > 0);
         debug_assert!(ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), self)));
+        debug_assert_eq!(ACTIVE_CONTEXT.with(Cell::get), context.as_ptr());
         loop {
             let value = self.roots.borrow_mut().take_pending();
             let Some(value) = value else { break };
@@ -1226,15 +1229,20 @@ impl RootRegistry {
 }
 
 impl ActiveRuntimeGuard {
-    fn enter(runtime: *const Shared) -> Self {
-        let previous = ACTIVE_RUNTIME.with(|active| active.replace(runtime));
-        Self { previous }
+    fn enter(runtime: *const Shared, context: NonNull<sys::OpaqueContext>) -> Self {
+        let previous_runtime = ACTIVE_RUNTIME.with(|active| active.replace(runtime));
+        let previous_context = ACTIVE_CONTEXT.with(|active| active.replace(context.as_ptr()));
+        Self {
+            previous_runtime,
+            previous_context,
+        }
     }
 }
 
 impl Drop for ActiveRuntimeGuard {
     fn drop(&mut self) {
-        ACTIVE_RUNTIME.with(|active| active.set(self.previous));
+        ACTIVE_CONTEXT.with(|active| active.set(self.previous_context));
+        ACTIVE_RUNTIME.with(|active| active.set(self.previous_runtime));
     }
 }
 
@@ -1278,7 +1286,11 @@ unsafe extern "C" fn host_function_callback(
         // SAFETY: `ACTIVE_RUNTIME` is installed from a live `Rc<Shared>` for the
         // duration of runtime entry and restored only after nested execution returns.
         let shared = unsafe { shared.as_ref() };
-        if shared.context.get().map(NonNull::as_ptr) != Some(context.cast_mut()) {
+        // SAFETY: JSC supplied a live callback context. Comparing its global
+        // context with the entry-scoped context rejects another runtime without
+        // retaining either context.
+        let callback_context = unsafe { sys::context_get_global_context(context) };
+        if ACTIVE_CONTEXT.with(Cell::get) != callback_context.cast_const() {
             return Err(HostError::new(
                 "host function called with the wrong JSC context",
             ));
@@ -2021,7 +2033,7 @@ mod tests {
         assert!(result.is_ok(), "capture panic escaped invalidation");
         result.unwrap().unwrap();
         assert_eq!(&*observations.borrow(), &[true; 4]);
-        assert!(shared.context.get().is_none());
+        assert!(runtime.context.is_none());
         assert_eq!(shared.gate.state(), HostState::Destroyed);
         assert_eq!(runtime.callback_drop_panics(), 1);
         runtime.invalidate().unwrap();
@@ -2130,7 +2142,7 @@ mod tests {
         runtime.invalidate().unwrap();
         assert_eq!(runtime.shared.native_drop_panics.get(), 1);
         assert_eq!(runtime.shared.gate.state(), HostState::Destroyed);
-        assert!(runtime.shared.context.get().is_none());
+        assert!(runtime.context.is_none());
     }
 
     #[test]
@@ -2347,12 +2359,12 @@ mod tests {
 
         let outer = shared.gate.try_enter().unwrap();
         let inner = shared.gate.try_enter().unwrap();
-        let raw = shared.context.get();
+        let raw = runtime.context;
         assert_eq!(
             runtime.invalidate(),
             Err(RuntimeError::Host(GateError::EntriesRemain(2)))
         );
-        assert_eq!(shared.context.get(), raw);
+        assert_eq!(runtime.context, raw);
         assert!(shared.roots.borrow().get(persistent.lease.id).is_some());
         assert_eq!(drops.get(), 0);
         assert_eq!(
@@ -2370,11 +2382,11 @@ mod tests {
         );
         drop(outer);
         assert!(shared.gate.is_drain_ready());
-        assert_eq!(shared.context.get(), raw);
+        assert_eq!(runtime.context, raw);
         assert_eq!(drops.get(), 0);
         runtime.invalidate().unwrap();
         runtime.invalidate().unwrap();
-        assert!(shared.context.get().is_none());
+        assert!(runtime.context.is_none());
         assert_eq!(shared.gate.state(), HostState::Destroyed);
         assert!(shared.roots.borrow().get(persistent.lease.id).is_none());
         assert_eq!(drops.get(), 1);

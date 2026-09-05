@@ -115,8 +115,8 @@ impl Runtime {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let raw = self.shared.context.get().ok_or(RuntimeError::Invalidated)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared));
+        let raw = self.context.ok_or(RuntimeError::Invalidated)?;
+        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
         let result = {
