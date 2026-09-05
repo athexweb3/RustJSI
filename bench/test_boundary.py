@@ -14,6 +14,7 @@ import boundary
 SAMPLE = """direct_jsc_lower_bound: 100.00 ns/call
 host_gate_admit_and_exit: 4.00 ns/entry
 jsc_common_empty_entry: 9.00 ns/entry
+jsc_foreign_common_empty_entry: 11.00 ns/entry
 rustjsi_experimental: 125.00 ns/call
 rustjsi_over_direct: 1.250x (1000000 iterations)
 direct_jsc_scalar: 25.00 ns/round-trip

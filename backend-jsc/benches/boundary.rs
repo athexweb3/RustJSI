@@ -5,8 +5,8 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
-    use rustjsi_backend_jsc::{Runtime, Value};
-    use rustjsi_host::{EntryGate, FinalEntryPolicy};
+    use rustjsi_backend_jsc::{Attachment, Runtime, Value};
+    use rustjsi_host::{EntryGate, FinalEntryPolicy, RuntimeIdentity};
     use std::hint::black_box;
     use std::num::NonZeroU32;
     use std::time::Instant;
@@ -28,6 +28,19 @@ fn main() {
         black_box(&mut runtime)
             .with_backend(|_| black_box(()))
             .expect("enter common backend");
+    });
+    let foreign_owner = raw::OwnedContext::new();
+    let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
+    let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
+        .expect("create foreign attachment");
+    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, || {
+        // SAFETY: The benchmark owner keeps this context live on the current
+        // thread and lends the same global context to every entry.
+        unsafe {
+            black_box(&mut attachment)
+                .with_backend(foreign_owner.as_void(), |_| black_box(()))
+                .expect("enter foreign common backend");
+        }
     });
     let mut rustjsi = 0.0;
     runtime
@@ -82,6 +95,7 @@ fn main() {
     println!("direct_jsc_lower_bound: {direct:.2} ns/call");
     println!("host_gate_admit_and_exit: {gate_entry:.2} ns/entry");
     println!("jsc_common_empty_entry: {common_entry:.2} ns/entry");
+    println!("jsc_foreign_common_empty_entry: {foreign_common_entry:.2} ns/entry");
     println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
@@ -93,6 +107,9 @@ fn main() {
         "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
         common_scalar / direct_scalar
     );
+    // SAFETY: This is the same still-live context used for every measured entry.
+    let _ = unsafe { attachment.detach_with_context(foreign_owner.as_void()) }
+        .expect("detach foreign benchmark attachment");
 }
 
 #[cfg(target_os = "macos")]
@@ -170,14 +187,18 @@ mod raw {
         fn unprotect(context: Context, value: Value);
     }
 
-    struct OwnedContext(GlobalContext);
+    pub(super) struct OwnedContext(GlobalContext);
 
     impl OwnedContext {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             // SAFETY: A null class requests the default global. Check before use.
             let context = unsafe { context_create(ptr::null_mut()) };
             assert!(!context.is_null(), "create direct JSC context");
             Self(context)
+        }
+
+        pub(super) fn as_void(&self) -> *mut c_void {
+            self.0.cast()
         }
     }
 

@@ -20,13 +20,14 @@ METRICS = {
     "direct_jsc_lower_bound": "ns/call",
     "host_gate_admit_and_exit": "ns/entry",
     "jsc_common_empty_entry": "ns/entry",
+    "jsc_foreign_common_empty_entry": "ns/entry",
     "rustjsi_experimental": "ns/call",
     "direct_jsc_scalar": "ns/round-trip",
     "rustjsi_common_scalar": "ns/round-trip",
 }
 RATIOS = {"rustjsi_over_direct", "common_scalar_over_direct"}
 ITERATIONS = 1_000_000
-SCHEMA = 1
+SCHEMA = 2
 
 
 def parse_sample(output):
