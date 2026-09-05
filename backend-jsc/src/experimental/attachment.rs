@@ -570,4 +570,29 @@ mod tests {
         .unwrap();
         let _ = unsafe { replacement.detach_with_context(owner.as_raw()) }.unwrap();
     }
+
+    #[test]
+    fn repeated_foreign_attachments_advance_epochs_and_balance_roots() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let runtime_id = identity.runtime_id();
+
+        for expected_epoch in 1..=1_000 {
+            let mut attachment =
+                Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+            assert_eq!(attachment.attachment_id().runtime_id(), runtime_id);
+            assert_eq!(attachment.attachment_id().epoch().get(), expected_epoch);
+            let root = unsafe {
+                attachment.with_context(owner.as_raw(), |cx| {
+                    let local = cx.eval("({ cycle: true })", "cycle.js").unwrap();
+                    cx.persist(&local).unwrap()
+                })
+            }
+            .unwrap();
+            let report = unsafe { attachment.detach_with_context(owner.as_raw()) }.unwrap();
+            assert_eq!(report.released_persistent_roots(), 1);
+            assert_eq!(report.unresolved_persistent_roots(), 0);
+            drop(root);
+        }
+    }
 }
