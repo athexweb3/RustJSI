@@ -33,7 +33,6 @@ permissions:
   contents: read
 
 env:
-  ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:abort_on_error=1"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Zsanitizer=address -Cdebuginfo=1"
@@ -62,6 +61,8 @@ jobs:
           key: jsc-asan-nightly-2026-08-27
 
       - name: Test JavaScriptCore with AddressSanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1:abort_on_error=1"
         run: >-
           cargo +nightly-2026-08-27 test
           -Zbuild-std
@@ -71,3 +72,17 @@ jobs:
           --lib
           --tests
           --locked
+
+      - name: Check foreign attachment cycles for leaks
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:abort_on_error=1"
+          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/backend-jsc/tests/lsan.supp:print_suppressions=1"
+        run: >-
+          cargo +nightly-2026-08-27 test
+          -Zbuild-std
+          --target aarch64-apple-darwin
+          -p rustjsi-backend-jsc
+          --features experimental-jsc
+          --lib
+          --locked
+          foreign_owner_rebinds_across_attachment_epochs
