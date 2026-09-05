@@ -9,6 +9,7 @@ use rustjsi_host::{
 mod argument_roots;
 #[cfg(test)]
 mod argument_tests;
+mod attachment;
 #[cfg(test)]
 mod callback_budget_tests;
 #[cfg(test)]
@@ -43,11 +44,12 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
+pub use attachment::{Attachment, DetachReport};
 pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use native_state::NativeObject;
 
-/// Creation-time root admission limits for the experimental standalone host.
+/// Creation-time root admission limits for an experimental JSC attachment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RootLimits {
     /// Persistent registry slots, including pending and exhausted identities.
@@ -179,6 +181,8 @@ pub struct JsException {
 pub enum RuntimeError {
     /// `JavaScriptCore` could not create a context.
     CreationFailed,
+    /// A host supplied a null JSC context.
+    NullContext,
     /// The runtime is no longer active.
     Invalidated,
     /// The operation was attempted from a different thread.
@@ -336,27 +340,8 @@ impl Runtime {
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
 
-        let native_finalizers = Arc::new(native_state::FinalizerQueue::new());
         Ok(Self {
-            shared: Rc::new(Shared {
-                id,
-                owner: thread::current().id(),
-                gate: EntryGate::new(ENTRY_LIMIT, FinalEntryPolicy::Guaranteed),
-                roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
-                local_budget: LocalBudget::new(limits.local_roots),
-                host_functions: RefCell::new(HashMap::new()),
-                native_states: RefCell::new(native_state::NativeRegistry::default()),
-                native_finalizers,
-                native_drop_panics: Cell::new(0),
-                callback_drop_panics: Cell::new(0),
-                #[cfg(test)]
-                context_local_roots: Cell::new(0),
-                #[cfg(test)]
-                argument_roots: Cell::new(0),
-                #[cfg(test)]
-                argument_gc: Cell::new(false),
-                external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
-            }),
+            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, limits),
             context: Some(context),
         })
     }
@@ -410,21 +395,7 @@ impl Runtime {
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
         let context = self.context.ok_or(RuntimeError::Invalidated)?;
-        let roots = self.shared.roots.borrow_mut().drain();
-        let functions = std::mem::take(&mut *self.shared.host_functions.borrow_mut());
-
-        for value in roots
-            .into_iter()
-            .chain(functions.values().map(|entry| entry.function))
-        {
-            // SAFETY: Every value was protected exactly once in this context and is
-            // unprotected before the context is released, on its owning thread.
-            unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
-        }
-        for entry in functions.into_values() {
-            self.shared.drop_callback(entry);
-        }
-        self.shared.close_native_finalizers();
+        self.shared.release_engine_resources(context);
         cleanup.complete();
         self.shared
             .gate
@@ -435,8 +406,7 @@ impl Runtime {
         // been released, and the owning thread is performing the single release.
         unsafe { sys::global_context_release(context.as_ptr()) };
         self.context = None;
-        let native_states = self.shared.native_states.borrow_mut().drain();
-        native_state::drop_states(&self.shared, native_states);
+        self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -1016,6 +986,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::CreationFailed => "JavaScriptCore runtime creation failed",
+            Self::NullContext => "host supplied a null JavaScriptCore context",
             Self::Invalidated => "runtime is invalidated",
             Self::WrongThread => "runtime entered from the wrong thread",
             Self::WrongRuntime => "handle belongs to another runtime",
@@ -1062,6 +1033,28 @@ impl Error for JsError {
 }
 
 impl Shared {
+    fn new(id: AttachmentId, final_entry_policy: FinalEntryPolicy, limits: RootLimits) -> Rc<Self> {
+        Rc::new(Self {
+            id,
+            owner: thread::current().id(),
+            gate: EntryGate::new(ENTRY_LIMIT, final_entry_policy),
+            roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
+            local_budget: LocalBudget::new(limits.local_roots),
+            host_functions: RefCell::new(HashMap::new()),
+            native_states: RefCell::new(native_state::NativeRegistry::default()),
+            native_finalizers: Arc::new(native_state::FinalizerQueue::new()),
+            native_drop_panics: Cell::new(0),
+            callback_drop_panics: Cell::new(0),
+            #[cfg(test)]
+            context_local_roots: Cell::new(0),
+            #[cfg(test)]
+            argument_roots: Cell::new(0),
+            #[cfg(test)]
+            argument_gc: Cell::new(false),
+            external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
+        })
+    }
+
     fn drop_callback(&self, entry: HostFunctionEntry) {
         if contain_unwind(std::panic::AssertUnwindSafe(|| drop(entry))).is_err() {
             self.callback_drop_panics
@@ -1108,6 +1101,45 @@ impl Shared {
     fn close_native_finalizers(&self) {
         let finalized = self.native_finalizers.close();
         native_state::reclaim_finalized(self, finalized);
+    }
+
+    fn release_engine_resources(&self, context: NonNull<sys::OpaqueContext>) -> (usize, usize) {
+        let roots = self.roots.borrow_mut().drain();
+        let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
+        let root_count = roots.len();
+        let function_count = functions.len();
+        for value in roots
+            .into_iter()
+            .chain(functions.values().map(|entry| entry.function))
+        {
+            // SAFETY: The caller established legal entry to this attachment's
+            // context. Each detached registry value owns one protection there.
+            unsafe { sys::value_unprotect(context.as_ptr(), value.as_ptr()) };
+        }
+        for entry in functions.into_values() {
+            self.drop_callback(entry);
+        }
+        self.close_native_finalizers();
+        (root_count, function_count)
+    }
+
+    fn abandon_engine_resources(&self) -> (usize, usize) {
+        let roots = self.roots.borrow_mut().drain();
+        let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
+        let counts = (roots.len(), functions.len());
+        drop(roots);
+        for entry in functions.into_values() {
+            self.drop_callback(entry);
+        }
+        self.close_native_finalizers();
+        counts
+    }
+
+    fn retire_native_states(&self) -> usize {
+        let states = self.native_states.borrow_mut().drain();
+        let count = states.len();
+        native_state::drop_states(self, states);
+        count
     }
 }
 

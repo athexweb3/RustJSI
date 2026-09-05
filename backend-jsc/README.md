@@ -24,6 +24,21 @@ engine-entry authority. An admitted entry temporarily installs the runtime and
 global-context pair used to validate callbacks. Nested entries restore the
 previous pair on normal return or panic unwind.
 
+`Attachment` is the non-owning counterpart for a JSC context created by another
+host. It stores no context pointer and never calls `JSGlobalContextRetain` or
+`JSGlobalContextRelease`. Its unsafe `with_context` and `with_backend` methods
+require the host to lend the same live `JSGlobalContextRef` on its legal thread
+with the required VM synchronization. `RuntimeIdentity` issues a new attachment
+epoch when the host replaces an engine.
+
+Explicit detach follows the declared final-entry policy. `detach_with_context`
+balances protected roots without releasing the context. Best-effort and
+unavailable hosts may use `detach_without_context`, whose `DetachReport` counts
+protections left for context destruction, retired native state, live external
+allocations, and contained destructor panics. Guaranteed policy rejects that
+path. `Attachment::drop` never enters JSC; callers that need cleanup evidence
+must detach explicitly and retain the report.
+
 The older `Context` API also roots managed locals returned by evaluation,
 calls, and persistent resolution until its Context scope exits. Moving a local
 into a Rust container or dropping its original persistent lease cannot remove

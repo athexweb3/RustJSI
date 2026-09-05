@@ -6,8 +6,8 @@ use super::external_buffer::{make_external_object, new_observation};
 use super::local_budget::Reservation;
 use super::local_roots::LocalRoots;
 use super::{
-    ActiveRuntimeGuard, JsError, JsException, JsString, RootId, Runtime, RuntimeError, Shared,
-    exception_to_owned, value_to_string,
+    ActiveRuntimeGuard, Attachment, JsError, JsException, JsString, RootId, Runtime, RuntimeError,
+    Shared, exception_to_owned, value_to_string,
 };
 use crate::sys;
 use rustjsi_backend::{
@@ -116,6 +116,43 @@ impl Runtime {
         self.shared.ensure_active()?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let raw = self.context.ok_or(RuntimeError::Invalidated)?;
+        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
+        self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(raw);
+        let result = {
+            let mut backend = JscBackend {
+                shared: &self.shared,
+                raw,
+                _affine: PhantomData,
+            };
+            operation(&mut backend)
+        };
+        self.shared.drain_native_finalizers();
+        self.shared.drain_root_releases(raw);
+        drop(active);
+        Ok(result)
+    }
+}
+
+impl Attachment {
+    /// Lends common JSC backend mechanics for one host-authorized entry.
+    ///
+    /// # Safety
+    ///
+    /// `context` must satisfy the lifetime, identity, thread, and synchronization
+    /// requirements documented by [`Attachment::with_context`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an affinity, lifecycle, admission, or null-context error.
+    pub unsafe fn with_backend<R>(
+        &mut self,
+        context: *mut std::ffi::c_void,
+        operation: impl for<'entry> FnOnce(&mut JscBackend<'entry>) -> R,
+    ) -> Result<R, RuntimeError> {
+        self.shared.ensure_active()?;
+        let raw = super::attachment::borrowed_global_context(context)?;
+        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
@@ -522,6 +559,7 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::StaleHandle => BackendError::StaleHandle,
         RuntimeError::Host(_) => BackendError::Failure("JavaScriptCore host entry rejected"),
         RuntimeError::CreationFailed => BackendError::Failure("JavaScriptCore creation failed"),
+        RuntimeError::NullContext => BackendError::Failure("JavaScriptCore context is null"),
         RuntimeError::Invalidated => BackendError::Failure("JavaScriptCore runtime is invalid"),
         RuntimeError::WrongThread => {
             BackendError::Failure("JavaScriptCore runtime thread mismatch")
@@ -563,6 +601,7 @@ fn map_js_error(error: JsError) -> BackendError {
 mod tests {
     use super::*;
     use rustjsi_backend::{BackendBase, BackendScope, RootScope};
+    use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
     use rustjsi_testkit::{
         create_number_root, verify_base_values, verify_number_root_and_release,
         verify_owned_external_buffer,
@@ -724,6 +763,44 @@ mod tests {
             .with_backend(|backend| {
                 let scope = backend.open_scope().unwrap();
                 scope.release(root).unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn foreign_attachment_lends_the_common_backend_without_owning_jsc() {
+        let mut owner = Runtime::new().unwrap();
+        let raw = owner.context.unwrap().as_ptr().cast();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+
+        let root = unsafe {
+            attachment.with_backend(raw, |backend| {
+                let scope = backend.open_scope().unwrap();
+                let value = scope.evaluate("21 * 2", "foreign-common.js").unwrap();
+                scope.persist(value).unwrap()
+            })
+        }
+        .unwrap();
+        unsafe {
+            attachment.with_backend(raw, |backend| {
+                let scope = backend.open_scope().unwrap();
+                let value = scope.resolve(root).unwrap();
+                assert_eq!(
+                    scope.as_number(value).unwrap().to_bits(),
+                    42.0_f64.to_bits()
+                );
+            })
+        }
+        .unwrap();
+
+        let report = unsafe { attachment.detach_with_context(raw) }.unwrap();
+        assert_eq!(report.final_entry(), FinalEntryOutcome::Completed);
+        assert_eq!(report.released_persistent_roots(), 1);
+        owner
+            .with_context(|cx| {
+                let value = cx.eval("40 + 2", "owner-still-live.js").unwrap();
+                assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
             })
             .unwrap();
     }

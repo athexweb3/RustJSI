@@ -37,6 +37,7 @@ the saved summary. Results under `bench/results/` are ignored by Git.
 | `rustjsi_experimental` | RustJSI call preparation, JSC callback dispatch, checked addition and result capture |
 | `host_gate_admit_and_exit` | Entry accounting guard creation and drop, without engine entry |
 | `jsc_common_empty_entry` | Empty authorized common-backend entry, including maintenance checks |
+| `jsc_foreign_common_empty_entry` | Empty non-owning attachment entry, including host-context validation and maintenance checks |
 | `direct_jsc_scalar` | Direct number creation, strict type check and number read |
 | `rustjsi_common_scalar` | Common-backend number creation, strict type check and number read |
 
