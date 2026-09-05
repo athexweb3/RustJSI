@@ -61,9 +61,9 @@ relies on that contract to expose safe source-linked entry.
 
 The AddressSanitizer workflow instruments Rust and a rebuilt standard library
 on ARM64 macOS. It checks the full JSC suite for address errors and runs leak
-detection over focused foreign-owner lifecycle tests, including 1,024
-attachment epochs and owner loss before detach. That focused leak check
-suppresses only JavaScriptCore's process-lifetime run-loop singleton. The
+detection over focused foreign-host lifecycle tests, including 1,024 attachment
+epochs, owner loss before detach, and callback-panic recovery. That focused leak
+check suppresses only JavaScriptCore's process-lifetime run-loop singleton. The
 system JavaScriptCore binary is not instrumented, so this is boundary evidence
 rather than proof that the engine or integration is memory-safe.
 
