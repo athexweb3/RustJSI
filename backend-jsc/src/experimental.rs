@@ -336,27 +336,8 @@ impl Runtime {
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
 
-        let native_finalizers = Arc::new(native_state::FinalizerQueue::new());
         Ok(Self {
-            shared: Rc::new(Shared {
-                id,
-                owner: thread::current().id(),
-                gate: EntryGate::new(ENTRY_LIMIT, FinalEntryPolicy::Guaranteed),
-                roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
-                local_budget: LocalBudget::new(limits.local_roots),
-                host_functions: RefCell::new(HashMap::new()),
-                native_states: RefCell::new(native_state::NativeRegistry::default()),
-                native_finalizers,
-                native_drop_panics: Cell::new(0),
-                callback_drop_panics: Cell::new(0),
-                #[cfg(test)]
-                context_local_roots: Cell::new(0),
-                #[cfg(test)]
-                argument_roots: Cell::new(0),
-                #[cfg(test)]
-                argument_gc: Cell::new(false),
-                external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
-            }),
+            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, limits),
             context: Some(context),
         })
     }
@@ -1062,6 +1043,28 @@ impl Error for JsError {
 }
 
 impl Shared {
+    fn new(id: AttachmentId, final_entry_policy: FinalEntryPolicy, limits: RootLimits) -> Rc<Self> {
+        Rc::new(Self {
+            id,
+            owner: thread::current().id(),
+            gate: EntryGate::new(ENTRY_LIMIT, final_entry_policy),
+            roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
+            local_budget: LocalBudget::new(limits.local_roots),
+            host_functions: RefCell::new(HashMap::new()),
+            native_states: RefCell::new(native_state::NativeRegistry::default()),
+            native_finalizers: Arc::new(native_state::FinalizerQueue::new()),
+            native_drop_panics: Cell::new(0),
+            callback_drop_panics: Cell::new(0),
+            #[cfg(test)]
+            context_local_roots: Cell::new(0),
+            #[cfg(test)]
+            argument_roots: Cell::new(0),
+            #[cfg(test)]
+            argument_gc: Cell::new(false),
+            external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
+        })
+    }
+
     fn drop_callback(&self, entry: HostFunctionEntry) {
         if contain_unwind(std::panic::AssertUnwindSafe(|| drop(entry))).is_err() {
             self.callback_drop_panics
