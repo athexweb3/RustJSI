@@ -30,6 +30,8 @@ generates static bindings for ordinary calls.
 - Persistence, copying, sharing, and transfer will be explicit operations.
 - Hosts own runtime lifecycle and scheduling; backends implement engine
   mechanics.
+- Source-linked hosts lend backend access through a closure so engine-bound
+  state cannot escape the host-authorized entry.
 - Engine capabilities will be declared rather than silently emulated.
 - Unsafe engine and ABI work will stay confined to small boundary crates.
 - Async work will operate on owned native data and return to JavaScript through

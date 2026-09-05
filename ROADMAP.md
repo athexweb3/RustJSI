@@ -31,8 +31,11 @@ production readiness.
 
 The shared host entry gate now provides bounded admission and deferred
 invalidation accounting, exercised against the lifecycle model and both JSC
-entry paths. A complete host contract still needs attached-runtime leases,
-runtime/epoch validation, scheduling, and an explicit final-entry policy.
+entry paths. An experimental source-linked `Host` contract confines backend
+access to a host-authorized closure, including foreign-owned JSC contexts. A
+complete host architecture still needs attached-runtime leases, active
+runtime/epoch validation, scheduling, and synchronization evidence from a real
+framework integration.
 
 ## Deferred work
 
