@@ -53,6 +53,12 @@ allocations, and contained destructor panics. Guaranteed policy rejects that
 path. `Attachment::drop` never enters JSC; callers that need cleanup evidence
 must detach explicitly and retain the report.
 
+If the foreign owner destroys its context first, a permitted no-entry detach
+still retires RustJSI state without touching JSC. The report conservatively
+counts protections that RustJSI could not release itself; only the foreign owner
+can reconcile those counts with its completed context destruction. Repeating
+detach is safe and returns no new unresolved resources.
+
 The older `Context` API also roots managed locals returned by evaluation,
 calls, and persistent resolution until its Context scope exits. Moving a local
 into a Rust container or dropping its original persistent lease cannot remove
