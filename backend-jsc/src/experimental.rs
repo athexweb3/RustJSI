@@ -76,6 +76,10 @@ const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 
 /// A standalone `JavaScriptCore` runtime owned by the current thread.
 ///
+/// The `Runtime` owns the global context. Its shared attachment state carries
+/// only identity, admission, roots, and native resources so those registries
+/// cannot independently enter or release the engine.
+///
 /// ```compile_fail
 /// use rustjsi_backend_jsc::Runtime;
 /// fn require_send<T: Send>() {}

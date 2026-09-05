@@ -18,6 +18,12 @@ owned external buffers. They deliberately do not advertise borrowed buffer
 bytes because JSC documents its backing-store pointer as temporary across API
 calls.
 
+The standalone `Runtime` is also the sole owner of its JSC global context.
+Shared attachment registries never cache that raw context or gain independent
+engine-entry authority. An admitted entry temporarily installs the runtime and
+global-context pair used to validate callbacks. Nested entries restore the
+previous pair on normal return or panic unwind.
+
 The older `Context` API also roots managed locals returned by evaluation,
 calls, and persistent resolution until its Context scope exits. Moving a local
 into a Rust container or dropping its original persistent lease cannot remove
