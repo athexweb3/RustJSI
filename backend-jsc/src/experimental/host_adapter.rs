@@ -11,13 +11,14 @@ use std::fmt;
 ///
 /// # Safety
 ///
-/// For every successful call, the implementation must invoke `operation`
-/// exactly once with the same live `JSGlobalContextRef` used by the associated
-/// [`Attachment`]. It must be on the context's legal thread, hold every VM lock
-/// or host synchronization required by `JavaScriptCore`, prevent context
-/// destruction until `operation` returns, and restore its entry state if the
-/// operation unwinds. It must return an error without invoking `operation` when
-/// any precondition cannot be established.
+/// For every successful call, the implementation must atomically validate that
+/// `attachment` is its current `RustJSI` attachment and invoke `operation` exactly
+/// once with that attachment's live `JSGlobalContextRef`. It must be on the
+/// context's legal thread, hold every VM lock or host synchronization required
+/// by `JavaScriptCore`, prevent context destruction until `operation` returns,
+/// and restore its entry state if the operation unwinds. It must return an error
+/// without invoking `operation` when the identity is stale or any other
+/// precondition cannot be established.
 pub unsafe trait JscEntrySource {
     /// Failure to establish the foreign host's legal entry.
     type Error: Error;
@@ -26,9 +27,11 @@ pub unsafe trait JscEntrySource {
     ///
     /// # Errors
     ///
-    /// Returns before invoking `operation` if host entry cannot be established.
+    /// Returns before invoking `operation` if `attachment` is not current or
+    /// host entry cannot be established.
     fn with_global_context<R>(
         &mut self,
+        attachment: AttachmentId,
         operation: impl FnOnce(*mut c_void) -> R,
     ) -> Result<R, Self::Error>;
 }
@@ -86,7 +89,7 @@ where
                 .map_err(JscHostError::Runtime);
         }
         self.source
-            .with_global_context(|context| {
+            .with_global_context(attachment.attachment_id(), |context| {
                 // SAFETY: JscEntrySource's unsafe contract establishes every
                 // Attachment::detach_with_context precondition for this call.
                 unsafe { attachment.detach_with_context(context) }
@@ -129,7 +132,7 @@ where
     ) -> Result<R, Self::Error> {
         let attachment = &mut *self.attachment;
         self.source
-            .with_global_context(|context| {
+            .with_global_context(attachment.attachment_id(), |context| {
                 // SAFETY: JscEntrySource's unsafe contract establishes every
                 // Attachment::with_backend precondition for this call.
                 unsafe { attachment.with_backend(context, operation) }
@@ -145,14 +148,22 @@ mod tests {
     use crate::sys;
     use rustjsi_backend::{BackendFamily, BackendScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::NonNull;
 
-    #[derive(Debug, Eq, PartialEq)]
-    struct EntryDenied;
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EntryDenied {
+        Unavailable,
+        WrongAttachment,
+    }
 
     impl fmt::Display for EntryDenied {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("entry denied")
+            match self {
+                Self::Unavailable => formatter.write_str("entry unavailable"),
+                Self::WrongAttachment => formatter.write_str("wrong attachment"),
+            }
         }
     }
 
@@ -160,19 +171,36 @@ mod tests {
 
     struct ForeignOwner {
         context: NonNull<sys::OpaqueContext>,
+        attachment: AttachmentId,
         admit: bool,
         entries: usize,
+        active_entries: Cell<usize>,
     }
 
     impl ForeignOwner {
-        fn new() -> Self {
+        fn new(attachment: AttachmentId) -> Self {
             // SAFETY: A null class requests JSC's default global object class.
             let context = unsafe { sys::global_context_create(std::ptr::null_mut()) };
             Self {
                 context: NonNull::new(context).expect("JSC test context"),
+                attachment,
                 admit: true,
                 entries: 0,
+                active_entries: Cell::new(0),
             }
+        }
+
+        fn bind(&mut self, attachment: AttachmentId) {
+            assert_eq!(self.active_entries.get(), 0);
+            self.attachment = attachment;
+        }
+    }
+
+    struct ActiveEntry<'owner>(&'owner Cell<usize>);
+
+    impl Drop for ActiveEntry<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
         }
     }
 
@@ -183,12 +211,18 @@ mod tests {
 
         fn with_global_context<R>(
             &mut self,
+            attachment: AttachmentId,
             operation: impl FnOnce(*mut c_void) -> R,
         ) -> Result<R, Self::Error> {
             if !self.admit {
-                return Err(EntryDenied);
+                return Err(EntryDenied::Unavailable);
+            }
+            if attachment != self.attachment {
+                return Err(EntryDenied::WrongAttachment);
             }
             self.entries += 1;
+            self.active_entries.set(self.active_entries.get() + 1);
+            let _active = ActiveEntry(&self.active_entries);
             Ok(operation(self.context.as_ptr().cast()))
         }
     }
@@ -205,7 +239,7 @@ mod tests {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
         let attachment_id = attachment.attachment_id();
-        let mut owner = ForeignOwner::new();
+        let mut owner = ForeignOwner::new(attachment_id);
 
         let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
         let number = host
@@ -236,13 +270,13 @@ mod tests {
     fn source_rejection_never_runs_the_host_operation() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
-        let mut owner = ForeignOwner::new();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
         owner.admit = false;
         let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
 
         assert!(matches!(
             host.with_backend(|_| panic!("denied operation ran")),
-            Err(JscHostError::Entry(EntryDenied))
+            Err(JscHostError::Entry(EntryDenied::Unavailable))
         ));
         assert_eq!(host.state(), HostState::Active);
         assert_eq!(
@@ -250,5 +284,103 @@ mod tests {
             FinalEntryOutcome::Unavailable
         );
         assert_eq!(host.state(), HostState::Destroyed);
+    }
+
+    #[test]
+    fn stale_source_cannot_enter_a_replacement_attachment() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut first = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let mut owner = ForeignOwner::new(first.attachment_id());
+
+        {
+            let mut host = JscAttachedHost::new(&mut first, &mut owner);
+            host.with_backend(|_| ()).unwrap();
+            let _ = host.detach_without_entry().unwrap();
+        }
+
+        let mut replacement = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let replacement_id = replacement.attachment_id();
+        let mut host = JscAttachedHost::new(&mut replacement, &mut owner);
+        assert!(matches!(
+            host.with_backend(|_| panic!("stale source entered replacement")),
+            Err(JscHostError::Entry(EntryDenied::WrongAttachment))
+        ));
+        assert_eq!(host.attachment_id(), replacement_id);
+        assert_eq!(host.state(), HostState::Active);
+        assert_eq!(host.source.entries, 1);
+        let _ = host.detach_without_entry().unwrap();
+    }
+
+    #[test]
+    fn unwind_restores_foreign_entry_before_reentry() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = host.with_backend(|_| panic!("host operation failed"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        host.with_backend(|_| ()).unwrap();
+        assert_eq!(host.source.entries, 2);
+        assert_eq!(host.source.active_entries.get(), 0);
+        let _ = host.detach_without_entry().unwrap();
+    }
+
+    #[test]
+    fn guaranteed_detach_remains_retryable_after_entry_denial() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        owner.admit = false;
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        assert!(matches!(
+            host.detach_with_entry(),
+            Err(JscHostError::Entry(EntryDenied::Unavailable))
+        ));
+        assert_eq!(host.state(), HostState::Active);
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        host.source.admit = true;
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
+        assert_eq!(host.state(), HostState::Destroyed);
+        assert_eq!(host.source.active_entries.get(), 0);
+    }
+
+    #[test]
+    fn foreign_owner_rebinds_across_attachment_epochs() {
+        const CYCLES: u64 = 1_024;
+
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let runtime_id = identity.runtime_id();
+        let mut owner = None;
+
+        for epoch in 1..=CYCLES {
+            let mut attachment =
+                Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+            let attachment_id = attachment.attachment_id();
+            assert_eq!(attachment_id.runtime_id(), runtime_id);
+            assert_eq!(attachment_id.epoch().get(), epoch);
+
+            let source = owner.get_or_insert_with(|| ForeignOwner::new(attachment_id));
+            source.bind(attachment_id);
+            let mut host = JscAttachedHost::new(&mut attachment, source);
+            host.with_backend(|_| ()).unwrap();
+            assert_eq!(
+                host.detach_with_entry().unwrap().final_entry(),
+                FinalEntryOutcome::Completed
+            );
+            assert_eq!(host.state(), HostState::Destroyed);
+            assert_eq!(host.source.active_entries.get(), 0);
+        }
+
+        assert_eq!(owner.unwrap().entries, usize::try_from(CYCLES * 2).unwrap());
     }
 }

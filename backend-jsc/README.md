@@ -37,12 +37,13 @@ with the required VM synchronization. `RuntimeIdentity` issues a new attachment
 epoch when the host replaces an engine.
 
 `JscEntrySource` is the narrow unsafe contract for a foreign integration to
-establish that entry. `JscAttachedHost` combines it with `Attachment` and exposes
-the safe source-linked `Host` contract without storing or returning the raw
-context. The integration remains responsible for its actual thread and VM
-synchronization; implementing the trait is not evidence that a framework meets
-those requirements. The adapter exposes both final-entry and no-entry detach;
-the attachment's declared final-entry policy decides whether the latter is legal.
+atomically validate the requested attachment identity and establish that entry.
+`JscAttachedHost` combines it with `Attachment` and exposes the safe
+source-linked `Host` contract without storing or returning the raw context. The
+integration remains responsible for its actual thread and VM synchronization;
+implementing the trait is not evidence that a framework meets those
+requirements. The adapter exposes both final-entry and no-entry detach; the
+attachment's declared final-entry policy decides whether the latter is legal.
 
 Explicit detach follows the declared final-entry policy. `detach_with_context`
 balances protected roots without releasing the context. Best-effort and
