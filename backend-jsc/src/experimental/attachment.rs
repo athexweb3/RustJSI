@@ -321,7 +321,8 @@ impl DetachReport {
         self.unresolved_host_functions
     }
 
-    /// Returns native Rust state payloads retired during detach.
+    /// Returns native Rust state payloads retired from queued finalizers or the
+    /// live registry during detach.
     #[must_use]
     pub const fn retired_native_states(&self) -> usize {
         self.retired_native_states
