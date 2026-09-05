@@ -24,12 +24,25 @@ engine-entry authority. An admitted entry temporarily installs the runtime and
 global-context pair used to validate callbacks. Nested entries restore the
 previous pair on normal return or panic unwind.
 
+The standalone runtime implements the experimental source-linked
+`rustjsi_host::Host` contract. Generic consumers receive `JscBackend` only
+during an admitted entry and can use the same contract with a borrowed runtime.
+This does not add a stable ABI or make a raw foreign attachment safe.
+
 `Attachment` is the non-owning counterpart for a JSC context created by another
 host. It stores no context pointer and never calls `JSGlobalContextRetain` or
 `JSGlobalContextRelease`. Its unsafe `with_context` and `with_backend` methods
 require the host to lend the same live `JSGlobalContextRef` on its legal thread
 with the required VM synchronization. `RuntimeIdentity` issues a new attachment
 epoch when the host replaces an engine.
+
+`JscEntrySource` is the narrow unsafe contract for a foreign integration to
+establish that entry. `JscAttachedHost` combines it with `Attachment` and exposes
+the safe source-linked `Host` contract without storing or returning the raw
+context. The integration remains responsible for its actual thread and VM
+synchronization; implementing the trait is not evidence that a framework meets
+those requirements. The adapter exposes both final-entry and no-entry detach;
+the attachment's declared final-entry policy decides whether the latter is legal.
 
 Explicit detach follows the declared final-entry policy. `detach_with_context`
 balances protected roots without releasing the context. Best-effort and

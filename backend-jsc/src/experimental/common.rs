@@ -15,7 +15,7 @@ use rustjsi_backend::{
     BackendManifest, BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope,
     OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
-use rustjsi_host::AttachmentId;
+use rustjsi_host::{AttachmentId, Host, HostState};
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
@@ -131,6 +131,26 @@ impl Runtime {
         self.shared.drain_root_releases(raw);
         drop(active);
         Ok(result)
+    }
+}
+
+impl Host for Runtime {
+    type Family = JscBackendFamily;
+    type Error = RuntimeError;
+
+    fn attachment_id(&self) -> AttachmentId {
+        self.shared.id
+    }
+
+    fn state(&self) -> HostState {
+        self.shared.gate.state()
+    }
+
+    fn with_backend<R>(
+        &mut self,
+        operation: impl for<'entry> FnOnce(&mut <Self::Family as BackendFamily>::Backend<'entry>) -> R,
+    ) -> Result<R, Self::Error> {
+        Runtime::with_backend(self, operation)
     }
 }
 

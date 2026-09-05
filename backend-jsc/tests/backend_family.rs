@@ -9,8 +9,10 @@ use rustjsi_backend::{
     ValueKind,
 };
 use rustjsi_backend_jsc::{JscBackendFamily, Runtime, RuntimeError};
+use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
-    ModelBackend, ModelBackendFamily, create_number_root, verify_number_root_and_release,
+    ModelBackend, ModelBackendFamily, create_number_root, verify_base_values,
+    verify_number_root_and_release,
 };
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -41,6 +43,18 @@ where
     })
 }
 
+fn verify_source_host<H>(host: &mut H) -> Result<(), RuntimeError>
+where
+    H: Host<Family = JscBackendFamily, Error = RuntimeError>,
+{
+    let attachment = host.attachment_id();
+    assert_eq!(host.state(), HostState::Active);
+    host.with_backend(|backend| verify_base_values(backend))?
+        .expect("JSC must satisfy base conformance");
+    assert_eq!(host.attachment_id(), attachment);
+    Ok(())
+}
+
 #[test]
 fn both_families_use_the_same_capability_consumers() {
     let mut model = ModelBackend::new();
@@ -59,6 +73,13 @@ fn both_families_use_the_same_capability_consumers() {
         .with_backend(|backend| check::<JscBackendFamily, _>(backend, root))
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn owning_and_borrowed_jsc_hosts_share_the_source_contract() {
+    let mut runtime = Runtime::new().unwrap();
+    verify_source_host(&mut runtime).unwrap();
+    verify_source_host(&mut &mut runtime).unwrap();
 }
 
 #[test]

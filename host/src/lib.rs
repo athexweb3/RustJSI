@@ -4,9 +4,11 @@
 
 #![forbid(unsafe_code)]
 
+mod contract;
 mod entry;
 mod identity;
 
+pub use contract::Host;
 pub use entry::{
     CleanupGuard, EntryGate, EntryGuard, FinalEntryOutcome, FinalEntryPolicy, GateError, HostState,
 };

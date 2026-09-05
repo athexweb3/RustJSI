@@ -46,6 +46,11 @@ the entry pointer and never releases the foreign context. Explicit final-entry
 detach balances engine protections; detach without entry reports unresolved
 protections. Its destructor never calls JSC.
 
+`JscEntrySource` lets a foreign integration centralize those same entry proofs.
+Its unsafe implementation must lend the same live global context, hold all
+required synchronization, and restore host state if an operation unwinds.
+`JscAttachedHost` relies on that contract to expose safe source-linked entry.
+
 The legacy JSC `Context` path now gives managed `Local` results independent
 entry-owned protections too, including values resolved from persistent roots.
 Context teardown releases these protections before the admission guard exits,

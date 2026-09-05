@@ -2,8 +2,14 @@
 
 Host lifecycle, thread entry, and scheduling for `RustJSI`.
 
-Status: `0.0.0`, unpublished. `EntryGate` provides experimental thread-affine
-entry accounting with a depth limit and monotonic shutdown state:
+Status: `0.0.0`, unpublished. `Host` is the experimental source-linked contract
+for lending backend mechanics only while a host has established legal engine
+entry. It carries attachment identity and lifecycle state but does not by itself
+create a VM lock, scheduler, or engine lease. The higher-ranked entry closure
+prevents backend adapters and scoped values from escaping.
+
+`EntryGate` provides thread-affine entry accounting with a depth limit and
+monotonic shutdown state:
 
 ```text
 Active -> Draining -> Invalid -> Destroyed
@@ -38,6 +44,7 @@ work reject another runtime or an earlier attachment. This allocator is shared
 within one linked `rustjsi-host` domain; an eventual binary Host ABI must define
 its own single identity authority.
 
-Schedulers, cross-thread handles, attached-engine leases, and the portable Host
-interface are not implemented yet. Policy/outcome accounting does not grant
-engine access or perform cleanup itself.
+Schedulers, cross-thread handles, and attached-engine synchronization adapters
+are not implemented yet. Policy/outcome accounting does not grant engine access
+or perform cleanup itself. The source-linked `Host` contract is not the stable C
+Host ABI and does not complete the runtime-facing `Context` API.

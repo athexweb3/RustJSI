@@ -12,6 +12,7 @@ mod conformance;
 mod lifecycle;
 mod model;
 mod model_entry;
+mod model_host;
 
 pub use conformance::{
     create_number_root, verify_base_values, verify_external_buffer_identity,
@@ -27,3 +28,4 @@ pub use model::{
     ModelValue, Primitive,
 };
 pub use model_entry::{ModelBackendFamily, ModelEntry, ModelEntryScope};
+pub use model_host::ModelHost;
