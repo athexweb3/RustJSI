@@ -3,10 +3,6 @@
 //! Direct JSC host-function boundary microbenchmark.
 
 #[cfg(target_os = "macos")]
-#[global_allocator]
-static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
-
-#[cfg(target_os = "macos")]
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Attachment, Runtime, Value};
@@ -139,7 +135,6 @@ fn measure_entry(
 
     let iterations_per_batch = iterations / batches;
     let mut batch_means = Vec::with_capacity(batches as usize);
-    let allocations_before = allocation::snapshot();
     for _ in 0..batches {
         let started = std::time::Instant::now();
         for _ in 0..iterations_per_batch {
@@ -149,23 +144,18 @@ fn measure_entry(
             started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations_per_batch),
         );
     }
-    let allocations = allocation::snapshot().difference(allocations_before);
     EntryMeasurement {
-        iterations,
         batches,
         iterations_per_batch,
         batch_means,
-        allocations,
     }
 }
 
 #[cfg(target_os = "macos")]
 struct EntryMeasurement {
-    iterations: u32,
     batches: u32,
     iterations_per_batch: u32,
     batch_means: Vec<f64>,
-    allocations: allocation::Snapshot,
 }
 
 #[cfg(target_os = "macos")]
@@ -192,113 +182,10 @@ fn print_entry_measurement(name: &str, measurement: &EntryMeasurement) {
         "entry_batches_{name}: {} ops/batch {samples} ns/entry",
         measurement.iterations_per_batch
     );
-    println!(
-        "rust_alloc_{name}: {} calls {} bytes {} deallocations {} deallocated-bytes ({} iterations)",
-        measurement.allocations.allocations,
-        measurement.allocations.allocated_bytes,
-        measurement.allocations.deallocations,
-        measurement.allocations.deallocated_bytes,
-        measurement.iterations,
-    );
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {}
-
-#[cfg(target_os = "macos")]
-mod allocation {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-    static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-    static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-    static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-
-    pub(super) struct CountingAllocator;
-
-    // SAFETY: Every operation delegates to `System` with the original pointer and
-    // layout. The counters are observational and do not affect allocator state.
-    unsafe impl GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // SAFETY: The caller supplies the allocation contract required by
-            // `GlobalAlloc`; it is forwarded unchanged to `System`.
-            let pointer = unsafe { System.alloc(layout) };
-            if !pointer.is_null() {
-                record_allocation(layout.size());
-            }
-            pointer
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            // SAFETY: The caller supplies the allocation contract required by
-            // `GlobalAlloc`; it is forwarded unchanged to `System`.
-            let pointer = unsafe { System.alloc_zeroed(layout) };
-            if !pointer.is_null() {
-                record_allocation(layout.size());
-            }
-            pointer
-        }
-
-        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-            record_deallocation(layout.size());
-            // SAFETY: The pointer and layout come from the caller's matching
-            // allocation contract and are forwarded unchanged to `System`.
-            unsafe { System.dealloc(pointer, layout) };
-        }
-
-        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            // SAFETY: The caller supplies a live allocation, its original layout,
-            // and the requested new size; all are forwarded to `System`.
-            let replacement = unsafe { System.realloc(pointer, layout, size) };
-            if !replacement.is_null() {
-                record_deallocation(layout.size());
-                record_allocation(size);
-            }
-            replacement
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    pub(super) struct Snapshot {
-        pub(super) allocations: u64,
-        pub(super) allocated_bytes: u64,
-        pub(super) deallocations: u64,
-        pub(super) deallocated_bytes: u64,
-    }
-
-    impl Snapshot {
-        pub(super) fn difference(self, earlier: Self) -> Self {
-            Self {
-                allocations: self.allocations.wrapping_sub(earlier.allocations),
-                allocated_bytes: self.allocated_bytes.wrapping_sub(earlier.allocated_bytes),
-                deallocations: self.deallocations.wrapping_sub(earlier.deallocations),
-                deallocated_bytes: self
-                    .deallocated_bytes
-                    .wrapping_sub(earlier.deallocated_bytes),
-            }
-        }
-    }
-
-    pub(super) fn snapshot() -> Snapshot {
-        Snapshot {
-            allocations: ALLOCATIONS.load(Ordering::Relaxed),
-            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-            deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
-            deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
-        }
-    }
-
-    fn record_allocation(size: usize) {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    }
-
-    fn record_deallocation(size: usize) {
-        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        DEALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-    }
-}
 
 #[cfg(target_os = "macos")]
 mod raw {

@@ -27,6 +27,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "boundary_allocations"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "root_release"
 harness = false
 required-features = ["experimental-jsc"]
