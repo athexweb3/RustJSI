@@ -2308,19 +2308,23 @@ mod tests {
 
         let mut runtime = Runtime::new().unwrap();
         let shared = Rc::clone(&runtime.shared);
+        let context = runtime.context.unwrap();
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.with_context(|_| {
                 assert_eq!(shared.gate.active_entries(), 1);
+                assert_eq!(ACTIVE_CONTEXT.with(Cell::get), context.as_ptr());
                 panic!("context entry panic");
             })
         }));
         assert!(panic.is_err());
         assert_eq!(shared.gate.active_entries(), 0);
         assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+        assert!(ACTIVE_CONTEXT.with(Cell::get).is_null());
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.with_backend(|backend| {
                 assert_eq!(shared.gate.active_entries(), 1);
+                assert_eq!(ACTIVE_CONTEXT.with(Cell::get), context.as_ptr());
                 let scope = backend.open_scope().unwrap();
                 let _value = scope.evaluate("({answer: 42})", "panic.js").unwrap();
                 panic!("common entry panic");
@@ -2329,6 +2333,7 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(shared.gate.active_entries(), 0);
         assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+        assert!(ACTIVE_CONTEXT.with(Cell::get).is_null());
         runtime
             .with_context(|cx| {
                 let value = cx.eval("42", "after.js").unwrap();
@@ -2429,8 +2434,11 @@ mod tests {
         let mut second = Runtime::new().unwrap();
         let first_shared = Rc::clone(&first.shared);
         let second_shared = Rc::clone(&second.shared);
+        let first_context = first.context.unwrap();
+        let second_context = second.context.unwrap();
         first
             .with_context(|cx| {
+                assert_eq!(ACTIVE_CONTEXT.with(Cell::get), first_context.as_ptr());
                 cx.install_host_function("outerAnswer", |_| Ok(Value::Number(42.0)))
                     .unwrap();
                 let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2438,18 +2446,21 @@ mod tests {
                         assert_eq!(first_shared.gate.active_entries(), 1);
                         assert_eq!(second_shared.gate.active_entries(), 1);
                         assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&second_shared));
+                        assert_eq!(ACTIVE_CONTEXT.with(Cell::get), second_context.as_ptr());
                         panic!("nested entry panic");
                     })
                 }));
                 assert!(panic.is_err());
                 assert_eq!(second_shared.gate.active_entries(), 0);
                 assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&first_shared));
+                assert_eq!(ACTIVE_CONTEXT.with(Cell::get), first_context.as_ptr());
                 let answer = cx.eval("outerAnswer()", "outer.js").unwrap();
                 assert!((cx.number(&answer).unwrap() - 42.0).abs() < f64::EPSILON);
             })
             .unwrap();
         assert_eq!(first_shared.gate.active_entries(), 0);
         assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+        assert!(ACTIVE_CONTEXT.with(Cell::get).is_null());
     }
 
     #[test]

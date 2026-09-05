@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{ACTIVE_RUNTIME, GateError, RuntimeError};
+use super::{ACTIVE_CONTEXT, ACTIVE_RUNTIME, GateError, RuntimeError};
 use super::{HostState, Runtime, Shared, Value};
 use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy};
 use std::cell::Cell;
@@ -92,6 +92,7 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
     }
     let mut outer = Runtime::new().unwrap();
     let outer_shared = Rc::clone(&outer.shared);
+    let outer_context = outer.context.unwrap();
     let mut inner = Runtime::new().unwrap();
     let observed = Rc::new(Cell::new(false));
     let probe = PanicDrop {
@@ -113,6 +114,7 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
             assert!(
                 ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), Rc::as_ptr(&outer_shared)))
             );
+            assert_eq!(ACTIVE_CONTEXT.with(Cell::get), outer_context.as_ptr());
             let value = cx.eval("42", "outer.js").unwrap();
             assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
         })
