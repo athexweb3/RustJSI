@@ -13,18 +13,19 @@ fn main() {
 
     const WARMUP: u32 = 10_000;
     const ITERATIONS: u32 = 1_000_000;
+    const ENTRY_BATCHES: u32 = 1_000;
 
     let direct = raw::measure(WARMUP, ITERATIONS);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
     let gate = EntryGate::new(NonZeroU32::new(64).unwrap(), FinalEntryPolicy::Unavailable);
-    let gate_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let gate_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         let entry = black_box(&gate).try_enter().expect("admit host entry");
         black_box(&entry);
         drop(entry);
     });
-    let common_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         black_box(&mut runtime)
             .with_backend(|_| black_box(()))
             .expect("enter common backend");
@@ -33,7 +34,7 @@ fn main() {
     let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
     let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
         .expect("create foreign attachment");
-    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, || {
+    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
         // SAFETY: The benchmark owner keeps this context live on the current
         // thread and lends the same global context to every entry.
         unsafe {
@@ -93,9 +94,9 @@ fn main() {
         .expect("enter common JSC backend");
 
     println!("direct_jsc_lower_bound: {direct:.2} ns/call");
-    println!("host_gate_admit_and_exit: {gate_entry:.2} ns/entry");
-    println!("jsc_common_empty_entry: {common_entry:.2} ns/entry");
-    println!("jsc_foreign_common_empty_entry: {foreign_common_entry:.2} ns/entry");
+    print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
+    print_entry_measurement("jsc_common_empty_entry", &common_entry);
+    print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
     println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
@@ -121,15 +122,66 @@ fn assert_answer(value: f64) {
 }
 
 #[cfg(target_os = "macos")]
-fn measure_entry(warmup: u32, iterations: u32, mut operation: impl FnMut()) -> f64 {
+fn measure_entry(
+    warmup: u32,
+    iterations: u32,
+    batches: u32,
+    mut operation: impl FnMut(),
+) -> EntryMeasurement {
+    assert!(batches > 0 && iterations % batches == 0);
     for _ in 0..warmup {
         operation();
     }
-    let started = std::time::Instant::now();
-    for _ in 0..iterations {
-        operation();
+
+    let iterations_per_batch = iterations / batches;
+    let mut batch_means = Vec::with_capacity(batches as usize);
+    for _ in 0..batches {
+        let started = std::time::Instant::now();
+        for _ in 0..iterations_per_batch {
+            operation();
+        }
+        batch_means.push(
+            started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations_per_batch),
+        );
     }
-    started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    EntryMeasurement {
+        batches,
+        iterations_per_batch,
+        batch_means,
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct EntryMeasurement {
+    batches: u32,
+    iterations_per_batch: u32,
+    batch_means: Vec<f64>,
+}
+
+#[cfg(target_os = "macos")]
+impl EntryMeasurement {
+    fn mean(&self) -> f64 {
+        self.batch_means.iter().sum::<f64>() / f64::from(self.batches)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_entry_measurement(name: &str, measurement: &EntryMeasurement) {
+    use std::fmt::Write;
+
+    println!("{name}: {:.2} ns/entry", measurement.mean());
+
+    let mut samples = String::new();
+    for (index, sample) in measurement.batch_means.iter().enumerate() {
+        if index > 0 {
+            samples.push(',');
+        }
+        write!(&mut samples, "{sample:.4}").expect("write batch sample");
+    }
+    println!(
+        "entry_batches_{name}: {} ops/batch {samples} ns/entry",
+        measurement.iterations_per_batch
+    );
 }
 
 #[cfg(not(target_os = "macos"))]

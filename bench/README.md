@@ -7,11 +7,13 @@ python3 -B bench/boundary.py run --output bench/results/boundary-001
 python3 -B bench/boundary.py report bench/results/boundary-001
 ```
 
-The runner builds `boundary` once with Rust 1.98.0, then launches ten separate
-processes. `--toolchain` selects another installed toolchain; `--runs` accepts
-10–1000. Each workload has 10,000 warmup iterations and 1,000,000 measured
-iterations per process. Startup, runtime creation and compilation are outside
-the workload timers.
+The runner builds the timing and allocation-probe executables once with Rust
+1.98.0, then launches each executable in ten separate process pairs.
+`--toolchain` selects another installed toolchain; `--runs` accepts 10–1000.
+Each workload has 10,000 warmup iterations and 1,000,000 measured iterations
+per process. The three timed entry workloads divide those iterations into 1,000
+contiguous batches of 1,000 operations. Startup, runtime creation and
+compilation are outside the workload timers.
 
 The collector passes absolute `RUSTC` and `RUSTDOC` paths from `rustup which`
 to Cargo through both direct and configuration environment keys, pins nested
@@ -51,17 +53,39 @@ callback function has an explicit root outside the timer; RAII releases the
 root before its context, including if a validation assertion unwinds.
 macOS CI checks successful benchmark execution, not timing thresholds.
 
+For each entry workload, the timing executable also records the four-decimal
+mean of every 1,000-operation batch. A separate executable with a counting
+global allocator snapshots successful Rust allocation, reallocation and
+deallocation activity around the equivalent 1,000,000 operations. Keeping the
+probe out of the timing executable prevents its atomics from changing workloads
+that allocate. The counter covers Rust allocations made by the probe and linked
+Rust code in that region. It does not observe JavaScriptCore, Objective-C,
+system-framework or other foreign allocator activity.
+
 ## Reading the report
 
-Each sample is a process-level batch mean. The report gives the mean, median,
-range and sample coefficient of variation (`sample standard deviation / mean`)
-across those samples. Ratios are calculated within each process before being
-summarized. Raw times currently have two decimal places of nanosecond precision.
+The primary metrics remain one mean per process. The report gives their mean,
+median, range and sample coefficient of variation (`sample standard deviation /
+mean`) across processes. Ratios are calculated within each process before being
+summarized. Primary times have two decimal places of nanosecond precision.
+
+`entry_batch_latency` pools the equal-sized, four-decimal batch means and
+reports p50, p95 and p99 using the nearest-rank method. These are quantiles of
+contiguous 1,000-operation block means, not individual entry latencies. Batching
+amortizes timestamp reads enough to expose scheduler and frequency disturbances
+without placing a timer around every nanosecond-scale entry. It can hide
+single-operation spikes inside a block.
+
+`rust_allocator_activity` summarizes per-process counter totals and their mean
+per entry. Zero is a valid observation. It supports a narrowly scoped
+zero-Rust-allocation claim only for the named timed region and build; it is not
+evidence of zero engine allocation or zero payload copies.
 
 `all_run_mean_cv_at_most_5_percent` is a noise diagnostic, not a performance
 pass. It is not the variability of independently estimated medians. No
-individual-call distribution exists here, so p99 is deliberately absent.
-There are no allocation/copy probes, confidence intervals or regression gates.
+individual-call distribution exists here, so `individual_call_p99` remains
+absent. JavaScriptCore allocation, payload-copy, confidence-interval and
+regression-gate work also remains open.
 
 Separate processes do not isolate CPU frequency, thermal state, OS scheduling,
 shared caches or background work. Workloads currently run in a fixed order;
