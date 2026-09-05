@@ -52,6 +52,13 @@ lend the current attachment's live global context, hold all required
 synchronization, and restore host state if an operation unwinds. `JscAttachedHost`
 relies on that contract to expose safe source-linked entry.
 
+The AddressSanitizer workflow instruments Rust and a rebuilt standard library
+on ARM64 macOS. It checks the full JSC suite for address errors and runs leak
+detection over the 1,024-cycle foreign attachment test. That focused leak check
+suppresses only JavaScriptCore's process-lifetime run-loop singleton. The system
+JavaScriptCore binary is not instrumented, so this is boundary evidence rather
+than proof that the engine or integration is memory-safe.
+
 The legacy JSC `Context` path now gives managed `Local` results independent
 entry-owned protections too, including values resolved from persistent roots.
 Context teardown releases these protections before the admission guard exits,
