@@ -36,6 +36,7 @@ the saved summary. Results under `bench/results/` are ignored by Git.
 | Metric | Timed work |
 | --- | --- |
 | `direct_jsc_lower_bound` | Direct JSC callback call with pre-created number arguments; callback checks types and adds them |
+| `direct_jsc_prepared_call` | Direct JSC number-argument creation plus the same checked callback and exception capture on every call |
 | `rustjsi_experimental` | RustJSI call preparation, JSC callback dispatch, checked addition and result capture |
 | `host_gate_admit_and_exit` | Entry accounting guard creation and drop, without engine entry |
 | `jsc_common_empty_entry` | Empty authorized common-backend entry, including maintenance checks |
@@ -43,10 +44,15 @@ the saved summary. Results under `bench/results/` are ignored by Git.
 | `direct_jsc_scalar` | Direct number creation, strict type check and number read |
 | `rustjsi_common_scalar` | Common-backend number creation, strict type check and number read |
 
-The callback comparison is a lower-bound comparison, not equal setup work:
-the direct path reuses arguments while RustJSI translates them per call.
-The scalar comparison has closer operation parity, but still excludes host
-entry from its timer. Neither comparison measures application throughput.
+The reused-argument callback remains a lower-work baseline, not equal setup
+work. The prepared direct path creates both JSC number arguments per call,
+performs the same strict callback reads and captures the exception output. It
+does not perform RustJSI handle identity, registry and local-budget checks;
+those are part of the RustJSI boundary cost being compared. The metric name
+`lower_bound` describes workload construction, not a guarantee that every noisy
+run will report a smaller number. The scalar comparison has closer operation
+parity, but still excludes host entry from its timer. None of the comparisons
+measures application throughput.
 Callback and scalar results are checked against `42` before and after each
 timed workload. These checks do not validate every timed iteration. The direct
 callback function has an explicit root outside the timer; RAII releases the
