@@ -27,8 +27,8 @@ previous pair on normal return or panic unwind.
 `Attachment` is the non-owning counterpart for a JSC context created by another
 host. It stores no context pointer and never calls `JSGlobalContextRetain` or
 `JSGlobalContextRelease`. Its unsafe `with_context` and `with_backend` methods
-require the host to lend the same live global context on its legal thread with
-the required VM synchronization. `RuntimeIdentity` issues a new attachment
+require the host to lend the same live `JSGlobalContextRef` on its legal thread
+with the required VM synchronization. `RuntimeIdentity` issues a new attachment
 epoch when the host replaces an engine.
 
 Explicit detach follows the declared final-entry policy. `detach_with_context`
