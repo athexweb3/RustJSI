@@ -315,6 +315,24 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
+    def test_prepared_baseline_requires_schema_four(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": 3,
+                "benchmark": "boundary",
+                "runs": 10,
+                "source": {"head": "before"},
+                "binary_sha256": self.HASHES,
+            }
+            boundary.write_json(directory / "metadata.json", metadata)
+            boundary.write_json(directory / "complete.json", {
+                "source": metadata["source"],
+                "binary_sha256": metadata["binary_sha256"],
+            })
+            with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
+                boundary.read_report(directory)
+
     def test_report_rejects_invalid_binary_hash_metadata(self):
         for hashes in ("digest", {"boundary": "a" * 64}, {
             name: "not-a-hash" for name in boundary.BENCHMARKS

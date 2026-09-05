@@ -43,7 +43,7 @@ ALLOCATION_FIELDS = (
     "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
 )
 BENCHMARKS = ("boundary", "boundary_allocations")
-SCHEMA = 3
+SCHEMA = 4
 
 
 def parse_sample(output):
