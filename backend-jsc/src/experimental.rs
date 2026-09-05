@@ -1100,12 +1100,15 @@ impl Shared {
         }
     }
 
-    fn close_native_finalizers(&self) {
+    fn close_native_finalizers(&self) -> usize {
         let finalized = self.native_finalizers.close();
-        native_state::reclaim_finalized(self, finalized);
+        native_state::reclaim_finalized(self, finalized)
     }
 
-    fn release_engine_resources(&self, context: NonNull<sys::OpaqueContext>) -> (usize, usize) {
+    fn release_engine_resources(
+        &self,
+        context: NonNull<sys::OpaqueContext>,
+    ) -> (usize, usize, usize) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let root_count = roots.len();
@@ -1121,11 +1124,11 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        self.close_native_finalizers();
-        (root_count, function_count)
+        let finalized_native_states = self.close_native_finalizers();
+        (root_count, function_count, finalized_native_states)
     }
 
-    fn abandon_engine_resources(&self) -> (usize, usize) {
+    fn abandon_engine_resources(&self) -> (usize, usize, usize) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let counts = (roots.len(), functions.len());
@@ -1133,8 +1136,8 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        self.close_native_finalizers();
-        counts
+        let finalized_native_states = self.close_native_finalizers();
+        (counts.0, counts.1, finalized_native_states)
     }
 
     fn retire_native_states(&self) -> usize {

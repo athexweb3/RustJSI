@@ -49,7 +49,9 @@ protections. Its destructor never calls JSC.
 When a best-effort or unavailable foreign owner destroys its context before
 RustJSI detaches, `detach_without_context` retires Rust state without engine
 re-entry. Its unresolved counts describe cleanup RustJSI could not perform,
-not resources known to remain live after context destruction.
+not resources known to remain live after context destruction. Native finalizer
+tokens queued by context destruction are reclaimed on the attachment thread and
+included in detach accounting.
 
 `JscEntrySource` lets a foreign integration centralize those same entry proofs.
 Its unsafe implementation must atomically reject a stale attachment identity,

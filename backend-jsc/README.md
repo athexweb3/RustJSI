@@ -57,7 +57,9 @@ If the foreign owner destroys its context first, a permitted no-entry detach
 still retires RustJSI state without touching JSC. The report conservatively
 counts protections that RustJSI could not release itself; only the foreign owner
 can reconcile those counts with its completed context destruction. Repeating
-detach is safe and returns no new unresolved resources.
+detach is safe and returns no new unresolved resources. Native objects finalized
+by context destruction remain queued until detach; their retirement is included
+in `DetachReport::retired_native_states`.
 
 The older `Context` API also roots managed locals returned by evaluation,
 calls, and persistent resolution until its Context scope exits. Moving a local
