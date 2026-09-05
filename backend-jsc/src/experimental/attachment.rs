@@ -18,6 +18,17 @@ use std::rc::Rc;
 /// fn require_send<T: Send>() {}
 /// require_send::<Attachment>();
 /// ```
+///
+/// ```compile_fail
+/// use rustjsi_backend_jsc::Attachment;
+/// use rustjsi_host::{FinalEntryPolicy, RuntimeIdentity};
+/// let mut identity = RuntimeIdentity::allocate().unwrap();
+/// let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+/// let local = unsafe {
+///     attachment.with_context(std::ptr::null_mut(), |cx| cx.eval("({})", "escape.js").unwrap())
+/// }.unwrap();
+/// drop(local);
+/// ```
 pub struct Attachment {
     pub(super) shared: Rc<Shared>,
 }
@@ -491,6 +502,28 @@ mod tests {
         assert_eq!(report.retired_native_states(), 1);
         assert_eq!(attachment.state(), HostState::Destroyed);
         drop(handles);
+    }
+
+    #[test]
+    fn external_owner_outlives_detach_and_reconciles_at_context_destruction() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Unavailable).unwrap();
+        let buffer = unsafe {
+            attachment.with_context(owner.as_raw(), |cx| {
+                cx.install_external_buffer("foreignBytes", vec![1, 2, 3, 4].into_boxed_slice())
+                    .unwrap()
+            })
+        }
+        .unwrap();
+
+        let report = attachment.detach_without_context().unwrap();
+        assert_eq!(report.remaining_external_allocations(), 1);
+        assert_eq!(report.remaining_external_bytes(), 4);
+        assert!(!buffer.is_deallocated());
+        drop(owner);
+        assert!(buffer.is_deallocated());
+        assert_eq!(buffer.deallocator_received_origin(), Some(true));
     }
 
     #[test]
