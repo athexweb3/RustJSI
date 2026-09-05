@@ -146,7 +146,7 @@ where
 mod tests {
     use super::*;
     use crate::sys;
-    use rustjsi_backend::{BackendFamily, BackendScope, RootScope};
+    use rustjsi_backend::{BackendError, BackendFamily, BackendScope, RootScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -415,5 +415,55 @@ mod tests {
         let repeated = attachment.detach_without_context().unwrap();
         assert_eq!(repeated.final_entry(), FinalEntryOutcome::Unavailable);
         assert_eq!(repeated.unresolved_persistent_roots(), 0);
+    }
+
+    #[test]
+    fn foreign_callback_panic_preserves_source_entry_and_detach() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let attachment_id = attachment.attachment_id();
+        let mut owner = ForeignOwner::new(attachment_id);
+        let function = owner
+            .with_global_context(attachment_id, |context| unsafe {
+                attachment.with_context(context, |cx| {
+                    cx.install_host_function("foreignPanic", |_| panic!("foreign callback panic"))
+                })
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+        let error = host
+            .with_backend(|backend| {
+                JscBackendFamily::try_with_scope(backend, |scope| {
+                    scope
+                        .evaluate("foreignPanic()", "foreign-callback.js")
+                        .map(|_| ())
+                })
+            })
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, BackendError::Exception(_)));
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        let answer = host
+            .with_backend(|backend| {
+                JscBackendFamily::try_with_scope(backend, |scope| {
+                    let value = scope.evaluate("40 + 2", "reentry.js")?;
+                    scope.as_number(value)
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.to_bits(), 42.0_f64.to_bits());
+        assert_eq!(host.source.active_entries.get(), 0);
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
+        assert_eq!(host.state(), HostState::Destroyed);
+        assert_eq!(host.source.entries, 4);
+        drop(function);
     }
 }

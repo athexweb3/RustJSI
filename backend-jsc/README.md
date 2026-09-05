@@ -44,6 +44,9 @@ integration remains responsible for its actual thread and VM synchronization;
 implementing the trait is not evidence that a framework meets those
 requirements. The adapter exposes both final-entry and no-entry detach; the
 attachment's declared final-entry policy decides whether the latter is legal.
+Callback panics remain inside the existing JSC callback boundary: the host sees
+a JavaScript exception, source entry is restored, and later entry or detach can
+proceed. This does not recover arbitrary state modified before the panic.
 
 Explicit detach follows the declared final-entry policy. `detach_with_context`
 balances protected roots without releasing the context. Best-effort and
