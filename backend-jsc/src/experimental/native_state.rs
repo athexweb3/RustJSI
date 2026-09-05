@@ -395,7 +395,8 @@ impl Context<'_> {
     }
 }
 
-pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken) {
+pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken) -> usize {
+    let mut retired = 0;
     while let Some(current) = NonNull::new(token) {
         // SAFETY: The queue transferred unique ownership of this detached list to the
         // runtime thread. `next` was initialized before publication.
@@ -403,8 +404,10 @@ pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken)
         token = boxed.next.load(Ordering::Relaxed);
         let state = shared.native_states.borrow_mut().remove(boxed.id);
         drop(boxed);
+        retired += usize::from(state.is_some());
         drop_state(shared, state);
     }
+    retired
 }
 
 pub(super) fn drop_states(shared: &Shared, states: Vec<Rc<dyn Any>>) {

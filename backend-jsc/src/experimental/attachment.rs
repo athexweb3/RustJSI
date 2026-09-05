@@ -156,7 +156,7 @@ impl Attachment {
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
         let raw = borrowed_global_context(context)?;
-        let (released_persistent_roots, released_host_functions) =
+        let (released_persistent_roots, released_host_functions, finalized_native_states) =
             self.shared.release_engine_resources(raw);
         cleanup.complete();
         let final_entry = self
@@ -164,7 +164,7 @@ impl Attachment {
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let retired_native_states = self.shared.retire_native_states();
+        let retired_native_states = finalized_native_states + self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -202,9 +202,9 @@ impl Attachment {
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let (unresolved_persistent_roots, unresolved_host_functions) =
+        let (unresolved_persistent_roots, unresolved_host_functions, finalized_native_states) =
             self.shared.abandon_engine_resources();
-        let retired_native_states = self.shared.retire_native_states();
+        let retired_native_states = finalized_native_states + self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -362,6 +362,7 @@ pub(super) fn borrowed_global_context(
 mod tests {
     use super::*;
     use crate::{Value, sys};
+    use std::cell::Cell;
 
     struct ForeignContext(NonNull<sys::OpaqueContext>);
 
@@ -389,6 +390,14 @@ mod tests {
     impl Drop for PanicDrop {
         fn drop(&mut self) {
             panic!("attachment payload destructor");
+        }
+    }
+
+    struct DropProbe(Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
         }
     }
 
@@ -488,6 +497,31 @@ mod tests {
         drop(owner);
         assert!(buffer.is_deallocated());
         assert_eq!(buffer.deallocator_received_origin(), Some(true));
+    }
+
+    #[test]
+    fn foreign_owner_loss_counts_queued_native_state_retirement() {
+        let owner = ForeignContext::new();
+        let drops = Rc::new(Cell::new(0));
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let native = unsafe {
+            attachment.with_context(owner.as_raw(), |cx| {
+                cx.install_native_state("ownerLossState", DropProbe(Rc::clone(&drops)))
+                    .unwrap()
+            })
+        }
+        .unwrap();
+
+        drop(owner);
+        assert_eq!(drops.get(), 0);
+
+        let report = attachment.detach_without_context().unwrap();
+        assert_eq!(report.final_entry(), FinalEntryOutcome::Unavailable);
+        assert_eq!(report.retired_native_states(), 1);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(attachment.state(), HostState::Destroyed);
+        drop(native);
     }
 
     #[test]
