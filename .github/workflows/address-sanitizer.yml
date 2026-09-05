@@ -73,7 +73,7 @@ jobs:
           --tests
           --locked
 
-      - name: Check foreign attachment cycles for leaks
+      - name: Check foreign owner lifecycle for leaks
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:abort_on_error=1"
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/backend-jsc/tests/lsan.supp:print_suppressions=1"
@@ -85,4 +85,4 @@ jobs:
           --features experimental-jsc
           --lib
           --locked
-          foreign_owner_rebinds_across_attachment_epochs
+          foreign_owner_
