@@ -37,6 +37,14 @@ local scopes and finalizer drains have returned. Invalidation checks that no
 entry remains before releasing roots or the context. The gate supplies only
 lifecycle accounting; engine thread and lifetime checks remain in the host.
 
+The experimental JSC `Attachment` accepts a foreign `JSContextRef` only through
+documented unsafe entry methods. The caller guarantees that every entry uses the
+same live global context, legal thread, VM lock, and host synchronization.
+`Attachment` canonicalizes callback contexts but cannot prove those host facts.
+It neither stores nor retains the pointer and never releases the foreign
+context. Explicit final-entry detach balances engine protections; detach without
+entry reports unresolved protections. Its destructor never calls JSC.
+
 The legacy JSC `Context` path now gives managed `Local` results independent
 entry-owned protections too, including values resolved from persistent roots.
 Context teardown releases these protections before the admission guard exits,
