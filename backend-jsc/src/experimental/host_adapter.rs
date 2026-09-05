@@ -146,7 +146,7 @@ where
 mod tests {
     use super::*;
     use crate::sys;
-    use rustjsi_backend::{BackendFamily, BackendScope};
+    use rustjsi_backend::{BackendFamily, BackendScope, RootScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -382,5 +382,38 @@ mod tests {
         }
 
         assert_eq!(owner.unwrap().entries, usize::try_from(CYCLES * 2).unwrap());
+    }
+
+    #[test]
+    fn foreign_owner_loss_retires_attachment_without_engine_reentry() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+
+        let _root = {
+            let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+            host.with_backend(|backend| {
+                JscBackendFamily::try_with_scope(backend, |scope| {
+                    let value = scope.number(42.0)?;
+                    scope.persist(value)
+                })
+            })
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(owner.entries, 1);
+        assert_eq!(attachment.state(), HostState::Active);
+
+        drop(owner);
+
+        let report = attachment.detach_without_context().unwrap();
+        assert_eq!(report.final_entry(), FinalEntryOutcome::Unavailable);
+        assert_eq!(report.released_persistent_roots(), 0);
+        assert_eq!(report.unresolved_persistent_roots(), 1);
+        assert_eq!(attachment.state(), HostState::Destroyed);
+
+        let repeated = attachment.detach_without_context().unwrap();
+        assert_eq!(repeated.final_entry(), FinalEntryOutcome::Unavailable);
+        assert_eq!(repeated.unresolved_persistent_roots(), 0);
     }
 }

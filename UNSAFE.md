@@ -46,6 +46,11 @@ the entry pointer and never releases the foreign context. Explicit final-entry
 detach balances engine protections; detach without entry reports unresolved
 protections. Its destructor never calls JSC.
 
+When a best-effort or unavailable foreign owner destroys its context before
+RustJSI detaches, `detach_without_context` retires Rust state without engine
+re-entry. Its unresolved counts describe cleanup RustJSI could not perform,
+not resources known to remain live after context destruction.
+
 `JscEntrySource` lets a foreign integration centralize those same entry proofs.
 Its unsafe implementation must atomically reject a stale attachment identity,
 lend the current attachment's live global context, hold all required
@@ -54,10 +59,11 @@ relies on that contract to expose safe source-linked entry.
 
 The AddressSanitizer workflow instruments Rust and a rebuilt standard library
 on ARM64 macOS. It checks the full JSC suite for address errors and runs leak
-detection over the 1,024-cycle foreign attachment test. That focused leak check
-suppresses only JavaScriptCore's process-lifetime run-loop singleton. The system
-JavaScriptCore binary is not instrumented, so this is boundary evidence rather
-than proof that the engine or integration is memory-safe.
+detection over focused foreign-owner lifecycle tests, including 1,024
+attachment epochs and owner loss before detach. That focused leak check
+suppresses only JavaScriptCore's process-lifetime run-loop singleton. The
+system JavaScriptCore binary is not instrumented, so this is boundary evidence
+rather than proof that the engine or integration is memory-safe.
 
 The legacy JSC `Context` path now gives managed `Local` results independent
 entry-owned protections too, including values resolved from persistent roots.
