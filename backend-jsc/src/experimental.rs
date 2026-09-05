@@ -19,6 +19,7 @@ mod exception_message;
 #[cfg(test)]
 mod exception_tests;
 mod external_buffer;
+mod host_adapter;
 mod local_budget;
 #[cfg(test)]
 mod local_budget_tests;
@@ -47,6 +48,7 @@ use std::thread::{self, ThreadId};
 pub use attachment::{Attachment, DetachReport};
 pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
+pub use host_adapter::{JscAttachedHost, JscEntrySource, JscHostError};
 pub use native_state::NativeObject;
 
 /// Creation-time root admission limits for an experimental JSC attachment.

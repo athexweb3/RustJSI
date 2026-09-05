@@ -36,6 +36,13 @@ require the host to lend the same live `JSGlobalContextRef` on its legal thread
 with the required VM synchronization. `RuntimeIdentity` issues a new attachment
 epoch when the host replaces an engine.
 
+`JscEntrySource` is the narrow unsafe contract for a foreign integration to
+establish that entry. `JscAttachedHost` combines it with `Attachment` and exposes
+the safe source-linked `Host` contract without storing or returning the raw
+context. The integration remains responsible for its actual thread and VM
+synchronization; implementing the trait is not evidence that a framework meets
+those requirements.
+
 Explicit detach follows the declared final-entry policy. `detach_with_context`
 balances protected roots without releasing the context. Best-effort and
 unavailable hosts may use `detach_without_context`, whose `DetachReport` counts
