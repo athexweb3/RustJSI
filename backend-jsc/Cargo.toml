@@ -32,6 +32,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "callback_profile"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "root_release"
 harness = false
 required-features = ["experimental-jsc"]

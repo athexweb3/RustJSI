@@ -23,6 +23,7 @@ impl CallbackWorkload {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn selected_order() -> [CallbackWorkload; 3] {
     let Ok(value) = std::env::var("RUSTJSI_CALLBACK_ORDER") else {
         return [
