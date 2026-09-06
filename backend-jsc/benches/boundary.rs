@@ -17,20 +17,21 @@ fn main() {
 
     const WARMUP: u32 = 10_000;
     const ITERATIONS: u32 = 1_000_000;
+    const CALLBACK_BATCHES: u32 = 1_000;
     const ENTRY_BATCHES: u32 = 1_000;
 
     let callback_order = callbacks::selected_order();
-    let calls = measure_callback_workloads(callback_order, WARMUP, ITERATIONS);
+    let calls = measure_callback_workloads(callback_order, WARMUP, ITERATIONS, CALLBACK_BATCHES);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
     let gate = EntryGate::new(NonZeroU32::new(64).unwrap(), FinalEntryPolicy::Unavailable);
-    let gate_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
+    let gate_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
         let entry = black_box(&gate).try_enter().expect("admit host entry");
         black_box(&entry);
         drop(entry);
     });
-    let common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
+    let common_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
         black_box(&mut runtime)
             .with_backend(|_| black_box(()))
             .expect("enter common backend");
@@ -39,7 +40,7 @@ fn main() {
     let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
     let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
         .expect("create foreign attachment");
-    let foreign_common_entry = measure_entry(WARMUP, ITERATIONS, ENTRY_BATCHES, || {
+    let foreign_common_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
         // SAFETY: The benchmark owner keeps this context live on the current
         // thread and lends the same global context to every entry.
         unsafe {
@@ -71,7 +72,7 @@ fn main() {
         })
         .expect("enter common JSC backend");
 
-    print_call_measurements(callback_order, calls, ITERATIONS);
+    print_call_measurements(callback_order, &calls, ITERATIONS);
     print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
     print_entry_measurement("jsc_common_empty_entry", &common_entry);
     print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
@@ -95,11 +96,10 @@ fn assert_answer(value: f64) {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
 struct CallbackMeasurements {
-    lower_bound: f64,
-    prepared: f64,
-    rustjsi: f64,
+    lower_bound: BatchMeasurement,
+    prepared: BatchMeasurement,
+    rustjsi: BatchMeasurement,
 }
 
 #[cfg(target_os = "macos")]
@@ -107,6 +107,7 @@ fn measure_callback_workloads(
     order: [callbacks::CallbackWorkload; 3],
     warmup: u32,
     iterations: u32,
+    batches: u32,
 ) -> CallbackMeasurements {
     let mut lower_bound = None;
     let mut prepared = None;
@@ -115,17 +116,17 @@ fn measure_callback_workloads(
         match workload {
             callbacks::CallbackWorkload::Reused => {
                 lower_bound = Some(callbacks::with_operation(workload, |operation| {
-                    measure_callback(warmup, iterations, operation)
+                    measure_batches(warmup, iterations, batches, operation)
                 }));
             }
             callbacks::CallbackWorkload::Prepared => {
                 prepared = Some(callbacks::with_operation(workload, |operation| {
-                    measure_callback(warmup, iterations, operation)
+                    measure_batches(warmup, iterations, batches, operation)
                 }));
             }
             callbacks::CallbackWorkload::RustJsi => {
                 rustjsi = Some(callbacks::with_operation(workload, |operation| {
-                    measure_callback(warmup, iterations, operation)
+                    measure_batches(warmup, iterations, batches, operation)
                 }));
             }
         }
@@ -138,51 +139,54 @@ fn measure_callback_workloads(
 }
 
 #[cfg(target_os = "macos")]
-fn measure_callback(warmup: u32, iterations: u32, operation: &mut dyn FnMut()) -> f64 {
-    for _ in 0..warmup {
-        operation();
-    }
-    let started = std::time::Instant::now();
-    for _ in 0..iterations {
-        operation();
-    }
-    started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
-}
-
-#[cfg(target_os = "macos")]
 fn print_call_measurements(
     order: [callbacks::CallbackWorkload; 3],
-    measurements: CallbackMeasurements,
+    measurements: &CallbackMeasurements,
     iterations: u32,
 ) {
     let [first, second, third] = order.map(callbacks::CallbackWorkload::name);
+    let lower_bound = measurements.lower_bound.mean();
+    let prepared = measurements.prepared.mean();
+    let rustjsi = measurements.rustjsi.mean();
     println!("callback_order: {first},{second},{third}");
-    println!(
-        "direct_jsc_lower_bound: {:.2} ns/call",
-        measurements.lower_bound
-    );
-    println!(
-        "direct_jsc_prepared_call: {:.2} ns/call",
-        measurements.prepared
-    );
-    println!("rustjsi_experimental: {:.2} ns/call", measurements.rustjsi);
+    println!("direct_jsc_lower_bound: {lower_bound:.2} ns/call");
+    println!("direct_jsc_prepared_call: {prepared:.2} ns/call");
+    println!("rustjsi_experimental: {rustjsi:.2} ns/call");
     println!(
         "rustjsi_over_direct: {:.3}x ({iterations} iterations)",
-        measurements.rustjsi / measurements.lower_bound
+        rustjsi / lower_bound
     );
     println!(
         "rustjsi_over_prepared: {:.3}x ({iterations} iterations)",
-        measurements.rustjsi / measurements.prepared
+        rustjsi / prepared
+    );
+    print_batch_samples(
+        "callback_batches",
+        "direct_jsc_lower_bound",
+        "ns/call",
+        &measurements.lower_bound,
+    );
+    print_batch_samples(
+        "callback_batches",
+        "direct_jsc_prepared_call",
+        "ns/call",
+        &measurements.prepared,
+    );
+    print_batch_samples(
+        "callback_batches",
+        "rustjsi_experimental",
+        "ns/call",
+        &measurements.rustjsi,
     );
 }
 
 #[cfg(target_os = "macos")]
-fn measure_entry(
+fn measure_batches(
     warmup: u32,
     iterations: u32,
     batches: u32,
-    mut operation: impl FnMut(),
-) -> EntryMeasurement {
+    operation: &mut dyn FnMut(),
+) -> BatchMeasurement {
     assert!(batches > 0 && iterations % batches == 0);
     for _ in 0..warmup {
         operation();
@@ -199,7 +203,7 @@ fn measure_entry(
             started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations_per_batch),
         );
     }
-    EntryMeasurement {
+    BatchMeasurement {
         batches,
         iterations_per_batch,
         batch_means,
@@ -207,24 +211,28 @@ fn measure_entry(
 }
 
 #[cfg(target_os = "macos")]
-struct EntryMeasurement {
+struct BatchMeasurement {
     batches: u32,
     iterations_per_batch: u32,
     batch_means: Vec<f64>,
 }
 
 #[cfg(target_os = "macos")]
-impl EntryMeasurement {
+impl BatchMeasurement {
     fn mean(&self) -> f64 {
         self.batch_means.iter().sum::<f64>() / f64::from(self.batches)
     }
 }
 
 #[cfg(target_os = "macos")]
-fn print_entry_measurement(name: &str, measurement: &EntryMeasurement) {
-    use std::fmt::Write;
-
+fn print_entry_measurement(name: &str, measurement: &BatchMeasurement) {
     println!("{name}: {:.2} ns/entry", measurement.mean());
+    print_batch_samples("entry_batches", name, "ns/entry", measurement);
+}
+
+#[cfg(target_os = "macos")]
+fn print_batch_samples(prefix: &str, name: &str, unit: &str, measurement: &BatchMeasurement) {
+    use std::fmt::Write;
 
     let mut samples = String::new();
     for (index, sample) in measurement.batch_means.iter().enumerate() {
@@ -234,7 +242,7 @@ fn print_entry_measurement(name: &str, measurement: &EntryMeasurement) {
         write!(&mut samples, "{sample:.4}").expect("write batch sample");
     }
     println!(
-        "entry_batches_{name}: {} ops/batch {samples} ns/entry",
+        "{prefix}_{name}: {} ops/batch {samples} {unit}",
         measurement.iterations_per_batch
     );
 }
