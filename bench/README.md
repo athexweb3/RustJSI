@@ -140,3 +140,27 @@ Test the runner without JSC:
 ```sh
 python3 -B -m unittest discover -s bench -p 'test_*.py'
 ```
+
+## Callback profiling
+
+On macOS, capture one long-running callback workload with debug symbols and
+Apple's sampling profiler:
+
+```sh
+python3 -B bench/callback_profile.py \
+  --output bench/results/callback-profile-rustjsi-001 \
+  --workload rustjsi
+```
+
+`--workload` also accepts `prepared` and `reused`. The runner pins the requested
+Rust compiler paths, disables compiler wrappers, builds the profiling target
+with bench-profile debug information, then attaches `/usr/bin/sample` by PID.
+The default 200 million calls keep the target live for the five-second sample;
+iterations, duration and sample interval are configurable.
+
+The new output directory follows the same outside-or-Git-ignored rule as the
+boundary collector. It retains source/compiler/binary metadata, raw build and
+workload output, the stack profile, and a completion record. Compare captures
+from the same source and host tuple. Sample counts are statistical attribution,
+not additive nanoseconds or a latency distribution, and collapsed output also
+contains non-workload threads.
