@@ -72,6 +72,11 @@ fn main() {
         })
         .expect("enter common JSC backend");
 
+    let timer_pairs = measure_timer_pairs(ENTRY_BATCHES);
+    let empty_batches = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
+        black_box(());
+    });
+
     print_call_measurements(callback_order, &calls, ITERATIONS);
     print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
     print_entry_measurement("jsc_common_empty_entry", &common_entry);
@@ -82,6 +87,14 @@ fn main() {
         "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
         common_scalar / direct_scalar
     );
+    print_samples(
+        "calibration_timer_pair",
+        "samples",
+        ENTRY_BATCHES,
+        "ns/pair",
+        &timer_pairs,
+    );
+    print_batch_samples("calibration", "empty_batch", "ns/operation", &empty_batches);
     // SAFETY: This is the same still-live context used for every measured entry.
     let _ = unsafe { attachment.detach_with_context(foreign_owner.as_void()) }
         .expect("detach foreign benchmark attachment");
@@ -211,6 +224,16 @@ fn measure_batches(
 }
 
 #[cfg(target_os = "macos")]
+fn measure_timer_pairs(samples: u32) -> Vec<f64> {
+    let mut elapsed = Vec::with_capacity(samples as usize);
+    for _ in 0..samples {
+        let started = std::time::Instant::now();
+        elapsed.push(started.elapsed().as_secs_f64() * 1_000_000_000.0);
+    }
+    elapsed
+}
+
+#[cfg(target_os = "macos")]
 struct BatchMeasurement {
     batches: u32,
     iterations_per_batch: u32,
@@ -232,19 +255,27 @@ fn print_entry_measurement(name: &str, measurement: &BatchMeasurement) {
 
 #[cfg(target_os = "macos")]
 fn print_batch_samples(prefix: &str, name: &str, unit: &str, measurement: &BatchMeasurement) {
+    print_samples(
+        &format!("{prefix}_{name}"),
+        "ops/batch",
+        measurement.iterations_per_batch,
+        unit,
+        &measurement.batch_means,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn print_samples(name: &str, count_unit: &str, count: u32, unit: &str, values: &[f64]) {
     use std::fmt::Write;
 
     let mut samples = String::new();
-    for (index, sample) in measurement.batch_means.iter().enumerate() {
+    for (index, sample) in values.iter().enumerate() {
         if index > 0 {
             samples.push(',');
         }
         write!(&mut samples, "{sample:.4}").expect("write batch sample");
     }
-    println!(
-        "{prefix}_{name}: {} ops/batch {samples} {unit}",
-        measurement.iterations_per_batch
-    );
+    println!("{name}: {count} {count_unit} {samples} {unit}");
 }
 
 #[cfg(not(target_os = "macos"))]
