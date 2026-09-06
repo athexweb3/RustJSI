@@ -10,7 +10,7 @@ python3 -B bench/boundary.py report bench/results/boundary-001
 The runner builds the timing and allocation-probe executables once with Rust
 1.98.0, then launches each executable in twelve separate process pairs.
 `--toolchain` selects another installed toolchain. `--runs` accepts multiples
-of six from 12 through 996.
+of twelve from 12 through 996.
 Each workload has 10,000 warmup iterations and 1,000,000 measured iterations
 per process. The three timed entry workloads divide those iterations into 1,000
 contiguous batches of 1,000 operations. Startup, runtime creation and
@@ -55,15 +55,17 @@ run will report a smaller number. The scalar comparison has closer operation
 parity, but still excludes host entry from its timer. None of the comparisons
 measures application throughput.
 
-The three callback workloads run once in each of their six possible orders per
-six-process block. The default twelve runs execute two complete blocks. Each
-timing process writes its selected order to raw stdout; the collector validates
-equal order counts before reporting. `callback_position_effects` reports each
-workload separately in first, second and third position, plus the spread between
-those position means. Runtime/context/function construction and warmup remain
-outside each workload timer. This balances position and immediate carryover
-across callback workloads, but it does not eliminate thermal or between-process
-drift.
+The three callback workloads run once in each of their six possible orders,
+followed by the same six permutations in reverse order. Additional runs repeat
+this twelve-process schedule. Each timing process writes its selected order to
+raw stdout; the collector validates the exact schedule before reporting.
+`callback_position_effects` reports each workload separately in first, second
+and third position, plus the spread between those position means. Runtime,
+context and function construction and warmup remain outside each workload
+timer. Complete permutations balance position and immediate carryover. Pairing
+each permutation at mirrored points in the block reduces first-order
+chronological drift; it does not eliminate nonlinear thermal, scheduler or
+between-process effects.
 Callback and scalar results are checked against `42` before and after each
 timed workload. These checks do not validate every timed iteration. The direct
 callback function has an explicit root outside the timer; RAII releases the
