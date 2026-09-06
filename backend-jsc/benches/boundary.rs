@@ -5,7 +5,7 @@
 #[cfg(target_os = "macos")]
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
-    use rustjsi_backend_jsc::{Attachment, Runtime, Value};
+    use rustjsi_backend_jsc::{Attachment, Runtime};
     use rustjsi_host::{EntryGate, FinalEntryPolicy, RuntimeIdentity};
     use std::hint::black_box;
     use std::num::NonZeroU32;
@@ -15,8 +15,8 @@ fn main() {
     const ITERATIONS: u32 = 1_000_000;
     const ENTRY_BATCHES: u32 = 1_000;
 
-    let direct = raw::measure(WARMUP, ITERATIONS);
-    let direct_prepared = raw::measure_prepared(WARMUP, ITERATIONS);
+    let callback_order = selected_callback_order();
+    let calls = measure_callback_workloads(callback_order, WARMUP, ITERATIONS);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
@@ -44,33 +44,6 @@ fn main() {
                 .expect("enter foreign common backend");
         }
     });
-    let mut rustjsi = 0.0;
-    runtime
-        .with_context(|context| {
-            let add = context
-                .install_host_function("rustAdd", |call| {
-                    Ok(Value::Number(call.number(0)? + call.number(1)?))
-                })
-                .expect("install host function");
-            let arguments = [Value::Number(20.0), Value::Number(22.0)];
-            let result = context.call(&add, &arguments).expect("preflight call");
-            assert_answer(context.number(&result).expect("read preflight result"));
-
-            for _ in 0..WARMUP {
-                black_box(context.call(&add, &arguments).expect("warmup call"));
-            }
-
-            let started = Instant::now();
-            for _ in 0..ITERATIONS {
-                black_box(context.call(&add, &arguments).expect("measured call"));
-            }
-            let elapsed = started.elapsed();
-            rustjsi = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(ITERATIONS);
-            let result = context.call(&add, &arguments).expect("postflight call");
-            assert_answer(context.number(&result).expect("read postflight result"));
-        })
-        .expect("enter JSC runtime");
-
     let mut common_scalar = 0.0;
     runtime
         .with_backend(|backend| {
@@ -94,7 +67,7 @@ fn main() {
         })
         .expect("enter common JSC backend");
 
-    print_call_measurements(direct, direct_prepared, rustjsi, ITERATIONS);
+    print_call_measurements(callback_order, calls, ITERATIONS);
     print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
     print_entry_measurement("jsc_common_empty_entry", &common_entry);
     print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
@@ -118,17 +91,141 @@ fn assert_answer(value: f64) {
 }
 
 #[cfg(target_os = "macos")]
-fn print_call_measurements(lower_bound: f64, prepared: f64, rustjsi: f64, iterations: u32) {
-    println!("direct_jsc_lower_bound: {lower_bound:.2} ns/call");
-    println!("direct_jsc_prepared_call: {prepared:.2} ns/call");
-    println!("rustjsi_experimental: {rustjsi:.2} ns/call");
+fn measure_rustjsi_call(warmup: u32, iterations: u32) -> f64 {
+    use rustjsi_backend_jsc::{Runtime, Value};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let mut measurement = 0.0;
+    let mut runtime = Runtime::new().expect("create callback benchmark runtime");
+    runtime
+        .with_context(|context| {
+            let add = context
+                .install_host_function("rustAdd", |call| {
+                    Ok(Value::Number(call.number(0)? + call.number(1)?))
+                })
+                .expect("install host function");
+            let arguments = [Value::Number(20.0), Value::Number(22.0)];
+            let result = context.call(&add, &arguments).expect("preflight call");
+            assert_answer(context.number(&result).expect("read preflight result"));
+
+            for _ in 0..warmup {
+                black_box(context.call(&add, &arguments).expect("warmup call"));
+            }
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(context.call(&add, &arguments).expect("measured call"));
+            }
+            measurement = started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations);
+
+            let result = context.call(&add, &arguments).expect("postflight call");
+            assert_answer(context.number(&result).expect("read postflight result"));
+        })
+        .expect("enter callback benchmark runtime");
+    measurement
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum CallbackWorkload {
+    Reused,
+    Prepared,
+    RustJsi,
+}
+
+#[cfg(target_os = "macos")]
+impl CallbackWorkload {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Prepared => "prepared",
+            Self::RustJsi => "rustjsi",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct CallbackMeasurements {
+    lower_bound: f64,
+    prepared: f64,
+    rustjsi: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn selected_callback_order() -> [CallbackWorkload; 3] {
+    let Ok(value) = std::env::var("RUSTJSI_CALLBACK_ORDER") else {
+        return [
+            CallbackWorkload::Reused,
+            CallbackWorkload::Prepared,
+            CallbackWorkload::RustJsi,
+        ];
+    };
+    let reused = CallbackWorkload::Reused;
+    let prepared = CallbackWorkload::Prepared;
+    let rustjsi = CallbackWorkload::RustJsi;
+    match value.as_str() {
+        "reused,prepared,rustjsi" => [reused, prepared, rustjsi],
+        "reused,rustjsi,prepared" => [reused, rustjsi, prepared],
+        "prepared,reused,rustjsi" => [prepared, reused, rustjsi],
+        "prepared,rustjsi,reused" => [prepared, rustjsi, reused],
+        "rustjsi,reused,prepared" => [rustjsi, reused, prepared],
+        "rustjsi,prepared,reused" => [rustjsi, prepared, reused],
+        _ => panic!("invalid RUSTJSI_CALLBACK_ORDER: {value}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn measure_callback_workloads(
+    order: [CallbackWorkload; 3],
+    warmup: u32,
+    iterations: u32,
+) -> CallbackMeasurements {
+    let mut lower_bound = None;
+    let mut prepared = None;
+    let mut rustjsi = None;
+    for workload in order {
+        match workload {
+            CallbackWorkload::Reused => lower_bound = Some(raw::measure_reused(warmup, iterations)),
+            CallbackWorkload::Prepared => {
+                prepared = Some(raw::measure_prepared(warmup, iterations));
+            }
+            CallbackWorkload::RustJsi => {
+                rustjsi = Some(measure_rustjsi_call(warmup, iterations));
+            }
+        }
+    }
+    CallbackMeasurements {
+        lower_bound: lower_bound.expect("measure reused-argument callback"),
+        prepared: prepared.expect("measure prepared-argument callback"),
+        rustjsi: rustjsi.expect("measure RustJSI callback"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_call_measurements(
+    order: [CallbackWorkload; 3],
+    measurements: CallbackMeasurements,
+    iterations: u32,
+) {
+    let [first, second, third] = order.map(CallbackWorkload::name);
+    println!("callback_order: {first},{second},{third}");
+    println!(
+        "direct_jsc_lower_bound: {:.2} ns/call",
+        measurements.lower_bound
+    );
+    println!(
+        "direct_jsc_prepared_call: {:.2} ns/call",
+        measurements.prepared
+    );
+    println!("rustjsi_experimental: {:.2} ns/call", measurements.rustjsi);
     println!(
         "rustjsi_over_direct: {:.3}x ({iterations} iterations)",
-        rustjsi / lower_bound
+        measurements.rustjsi / measurements.lower_bound
     );
     println!(
         "rustjsi_over_prepared: {:.3}x ({iterations} iterations)",
-        rustjsi / prepared
+        measurements.rustjsi / measurements.prepared
     );
 }
 
@@ -298,7 +395,7 @@ mod raw {
         }
     }
 
-    pub(super) fn measure(warmup: u32, iterations: u32) -> f64 {
+    pub(super) fn measure_reused(warmup: u32, iterations: u32) -> f64 {
         let owner = OwnedContext::new();
         let rooted = RootedFunction::new(&owner);
         let context = owner.0;
