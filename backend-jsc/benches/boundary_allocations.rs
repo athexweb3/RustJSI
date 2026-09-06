@@ -3,6 +3,10 @@
 //! Rust allocator probe for the empty host-entry boundary paths.
 
 #[cfg(target_os = "macos")]
+#[path = "support/callbacks.rs"]
+mod callbacks;
+
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
 
@@ -15,6 +19,13 @@ fn main() {
 
     const WARMUP: u32 = 10_000;
     const ITERATIONS: u32 = 1_000_000;
+
+    let callback_order = callbacks::selected_order();
+    for workload in callback_order {
+        let measurement =
+            callbacks::with_operation(workload, |operation| measure(WARMUP, ITERATIONS, operation));
+        print_measurement(workload.labels().1, measurement, ITERATIONS);
+    }
 
     let gate = EntryGate::new(
         NonZeroU32::new(64).expect("nonzero entry limit"),

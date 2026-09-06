@@ -28,7 +28,18 @@ ENTRY_VALUES = {
     "jsc_common_empty_entry": 9.0,
     "jsc_foreign_common_empty_entry": 11.0,
 }
-TIMING_METRICS = BASE_SAMPLE + "".join(
+CALLBACK_VALUES = {
+    "direct_jsc_lower_bound": 100.0,
+    "direct_jsc_prepared_call": 110.0,
+    "rustjsi_experimental": 125.0,
+}
+CALLBACK_TIMINGS = "".join(
+    f"callback_batches_{name}: 1000 ops/batch "
+    + ",".join([f"{value:.4f}"] * 1000)
+    + " ns/call\n"
+    for name, value in CALLBACK_VALUES.items()
+)
+TIMING_METRICS = BASE_SAMPLE + CALLBACK_TIMINGS + "".join(
     f"entry_batches_{name}: 1000 ops/batch "
     + ",".join([f"{value:.4f}"] * 1000)
     + " ns/entry\n"
@@ -37,7 +48,7 @@ TIMING_METRICS = BASE_SAMPLE + "".join(
 ALLOCATION_SAMPLE = "".join(
     f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
     + "0 deallocated-bytes (1000000 iterations)\n"
-    for name in ENTRY_VALUES
+    for name in boundary.ALLOCATION_METRICS
 )
 
 
@@ -62,9 +73,15 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(sample["metrics"]["rustjsi_experimental"], 125)
         self.assertEqual(sample["metrics"].keys(), boundary.METRICS.keys())
         self.assertEqual(sample["entry_batches"].keys(), boundary.ENTRY_METRICS)
+        self.assertEqual(
+            sample["callback_batches"].keys(), boundary.CALLBACK_BATCH_METRICS
+        )
         self.assertEqual(len(sample["entry_batches"]["jsc_common_empty_entry"]), 1000)
         self.assertEqual(
             sample["rust_allocations"]["jsc_common_empty_entry"]["allocations"], 0
+        )
+        self.assertEqual(
+            sample["rust_allocations"]["rustjsi_experimental"]["allocations"], 0
         )
         self.assertEqual(sample["callback_order"], boundary.CALLBACK_ORDERS[0])
 
@@ -83,6 +100,7 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("4.0000", "NaN", 1),
             SAMPLE.replace("4.0000,", "", 1),
             SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
+            SAMPLE.replace("100.0000", "120.0000", 1),
             SAMPLE.replace("0 calls 0 bytes", "-1 calls 0 bytes", 1),
             "\n".join(SAMPLE.splitlines()[:-1]),
         ]
@@ -105,7 +123,7 @@ class SampleTests(unittest.TestCase):
         result = boundary.describe_nonnegative([0, 0, 0])
         self.assertEqual(result["mean"], 0)
         self.assertEqual(result["sample_cv"], 0)
-        self.assertEqual(result["mean_per_entry"], 0)
+        self.assertEqual(result["mean_per_operation"], 0)
 
     def test_nearest_rank_percentiles(self):
         values = list(range(1, 101))
@@ -144,6 +162,24 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             allocations["metrics"]["jsc_common_empty_entry"]["allocations"]["mean"],
             0,
+        )
+        self.assertEqual(
+            allocations["metrics"]["rustjsi_experimental"]["allocations"]["mean"],
+            0,
+        )
+
+    def test_callback_tail_is_a_block_mean_not_an_individual_call_tail(self):
+        samples = balanced_samples()
+        samples[0]["callback_batches"]["rustjsi_experimental"][-1] = 500
+        report = boundary.summarize(samples)
+        latency = report["callback_batch_latency"]
+        self.assertEqual(latency["sample_kind"], "contiguous_batch_mean")
+        self.assertEqual(latency["operations_per_batch"], 1000)
+        self.assertEqual(
+            latency["metrics"]["rustjsi_experimental"]["samples"], 12_000
+        )
+        self.assertLessEqual(
+            latency["metrics"]["rustjsi_experimental"]["p99"], 500
         )
 
     def test_mirrored_permutation_blocks_are_required(self):
@@ -309,6 +345,13 @@ class ArtifactTests(unittest.TestCase):
                     if name == "build":
                         output = artifacts
                     elif name.startswith("allocation-run-"):
+                        self.assertEqual(
+                            environment["RUSTJSI_CALLBACK_ORDER"],
+                            boundary.CALLBACK_SCHEDULE[
+                                int(name.rsplit("-", 1)[1])
+                                % len(boundary.CALLBACK_SCHEDULE)
+                            ],
+                        )
                         output = ALLOCATION_SAMPLE
                     else:
                         output = timing_sample(environment["RUSTJSI_CALLBACK_ORDER"])
@@ -361,11 +404,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_position_analysis_requires_schema_seven(self):
+    def test_callback_allocation_analysis_requires_schema_nine(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 6,
+                "schema": 8,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},

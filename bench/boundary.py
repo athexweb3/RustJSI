@@ -36,6 +36,12 @@ ENTRY_METRICS = {
     "jsc_common_empty_entry",
     "jsc_foreign_common_empty_entry",
 }
+CALLBACK_BATCH_METRICS = {
+    "direct_jsc_lower_bound",
+    "direct_jsc_prepared_call",
+    "rustjsi_experimental",
+}
+ALLOCATION_METRICS = ENTRY_METRICS | CALLBACK_BATCH_METRICS
 ITERATIONS = 1_000_000
 ENTRY_BATCHES = 1_000
 ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
@@ -61,7 +67,7 @@ CALLBACK_METRICS = {
     "prepared": "direct_jsc_prepared_call",
     "rustjsi": "rustjsi_experimental",
 }
-SCHEMA = 7
+SCHEMA = 9
 
 
 def valid_run_count(value):
@@ -77,6 +83,7 @@ def parse_sample(output):
     values = {}
     ratios = set()
     entry_batches = {}
+    callback_batches = {}
     rust_allocations = {}
     callback_order = None
     for line in output.splitlines():
@@ -121,6 +128,23 @@ def parse_sample(output):
             ):
                 raise ValueError(f"invalid entry batch samples: {metric}")
             entry_batches[metric] = samples
+        elif name.startswith("callback_batches_"):
+            metric = name.removeprefix("callback_batches_")
+            match = re.fullmatch(r"([0-9]+) ops/batch (.+) ns/call", payload)
+            if (
+                not match
+                or metric not in CALLBACK_BATCH_METRICS
+                or metric in callback_batches
+            ):
+                raise ValueError(f"invalid or duplicate callback batch metric: {metric}")
+            samples = [float(value) for value in match[2].split(",")]
+            if (
+                int(match[1]) != ENTRY_BATCH_ITERATIONS
+                or len(samples) != ENTRY_BATCHES
+                or any(not math.isfinite(value) or value <= 0 for value in samples)
+            ):
+                raise ValueError(f"invalid callback batch samples: {metric}")
+            callback_batches[metric] = samples
         elif name.startswith("rust_alloc_"):
             metric = name.removeprefix("rust_alloc_")
             match = re.fullmatch(
@@ -128,7 +152,7 @@ def parse_sample(output):
                 r"([0-9]+) deallocated-bytes \(([0-9]+) iterations\)",
                 payload,
             )
-            if not match or metric not in ENTRY_METRICS or metric in rust_allocations:
+            if not match or metric not in ALLOCATION_METRICS or metric in rust_allocations:
                 raise ValueError(f"invalid or duplicate allocation metric: {metric}")
             if int(match[5]) != ITERATIONS:
                 raise ValueError(f"invalid allocation iteration count: {metric}")
@@ -141,16 +165,21 @@ def parse_sample(output):
         values.keys() != METRICS.keys()
         or ratios != RATIOS
         or entry_batches.keys() != ENTRY_METRICS
-        or rust_allocations.keys() != ENTRY_METRICS
+        or callback_batches.keys() != CALLBACK_BATCH_METRICS
+        or rust_allocations.keys() != ALLOCATION_METRICS
         or callback_order is None
     ):
         raise ValueError("incomplete benchmark output")
     for name, samples in entry_batches.items():
         if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
             raise ValueError(f"entry batch mean does not match metric: {name}")
+    for name, samples in callback_batches.items():
+        if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
+            raise ValueError(f"callback batch mean does not match metric: {name}")
     return {
         "metrics": values,
         "entry_batches": entry_batches,
+        "callback_batches": callback_batches,
         "rust_allocations": rust_allocations,
         "callback_order": callback_order,
     }
@@ -183,7 +212,7 @@ def describe_nonnegative(values):
         "min": min(values),
         "max": max(values),
         "sample_cv": statistics.stdev(values) / mean if mean else 0.0,
-        "mean_per_entry": mean / ITERATIONS,
+        "mean_per_operation": mean / ITERATIONS,
     }
 
 
@@ -239,20 +268,32 @@ def summarize(samples):
             "counts": order_counts,
         },
         "callback_position_effects": summarize_callback_positions(samples),
+        "callback_batch_latency": {
+            "sample_kind": "contiguous_batch_mean",
+            "operations_per_batch": ENTRY_BATCH_ITERATIONS,
+            "metrics": {
+                name: describe_batches([
+                    value
+                    for sample in samples
+                    for value in sample["callback_batches"][name]
+                ], len(samples), "ns/call")
+                for name in CALLBACK_BATCH_METRICS
+            },
+        },
         "entry_batch_latency": {
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
             "metrics": {
-                name: describe_entry_batches([
+                name: describe_batches([
                     value
                     for sample in samples
                     for value in sample["entry_batches"][name]
-                ], len(samples))
+                ], len(samples), "ns/entry")
                 for name in ENTRY_METRICS
             },
         },
         "rust_allocator_activity": {
-            "scope": "Rust global allocator calls in the timed entry region",
+            "scope": "Rust global allocator calls in each timed boundary region",
             "excludes": "JavaScriptCore, system-framework, and foreign allocator activity",
             "iterations_per_process": ITERATIONS,
             "metrics": {
@@ -262,7 +303,7 @@ def summarize(samples):
                     ])
                     for field in ALLOCATION_FIELDS
                 }
-                for name in ENTRY_METRICS
+                for name in ALLOCATION_METRICS
             },
         },
         "all_run_mean_cv_at_most_5_percent": all(
@@ -293,11 +334,11 @@ def summarize_callback_positions(samples):
     return result
 
 
-def describe_entry_batches(values, processes):
+def describe_batches(values, processes, unit):
     """Describe pooled, equal-sized block means without calling them call tails."""
     result = describe(values)
     result.update({
-        "unit": "ns/entry",
+        "unit": unit,
         "processes": processes,
         "batches_per_process": ENTRY_BATCHES,
         "p50": nearest_rank(values, 0.50),
@@ -488,6 +529,8 @@ def collect(directory, runs, toolchain):
             "measured_iterations": ITERATIONS,
             "entry_batches": ENTRY_BATCHES,
             "entry_batch_iterations": ENTRY_BATCH_ITERATIONS,
+            "callback_batches": ENTRY_BATCHES,
+            "callback_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_ordering": CALLBACK_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
@@ -527,6 +570,7 @@ def collect(directory, runs, toolchain):
                 [str(executables["boundary_allocations"])],
                 directory,
                 f"allocation-run-{index:03}",
+                environment=timing_environment,
             )
             samples.append(parse_sample(timing + allocations))
             print(f"boundary run {index + 1}/{runs}", file=sys.stderr)
