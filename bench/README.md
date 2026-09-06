@@ -58,10 +58,12 @@ measures application throughput.
 The three callback workloads run once in each of their six possible orders per
 six-process block. The default twelve runs execute two complete blocks. Each
 timing process writes its selected order to raw stdout; the collector validates
-equal order counts before reporting. Runtime/context/function construction and
-warmup remain outside each workload timer. This balances position and immediate
-carryover across callback workloads, but it does not eliminate thermal or
-between-process drift.
+equal order counts before reporting. `callback_position_effects` reports each
+workload separately in first, second and third position, plus the spread between
+those position means. Runtime/context/function construction and warmup remain
+outside each workload timer. This balances position and immediate carryover
+across callback workloads, but it does not eliminate thermal or between-process
+drift.
 Callback and scalar results are checked against `42` before and after each
 timed workload. These checks do not validate every timed iteration. The direct
 callback function has an explicit root outside the timer; RAII releases the
