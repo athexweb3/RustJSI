@@ -51,20 +51,25 @@ CALLBACK_ORDERS = (
     "rustjsi,reused,prepared",
     "rustjsi,prepared,reused",
 )
+CALLBACK_SCHEDULE = CALLBACK_ORDERS + tuple(reversed(CALLBACK_ORDERS))
 CALLBACK_ORDERING = {
-    "design": "complete_six_permutation_blocks",
-    "sequence": list(CALLBACK_ORDERS),
+    "design": "mirrored_complete_six_permutation_pairs",
+    "sequence": list(CALLBACK_SCHEDULE),
 }
 CALLBACK_METRICS = {
     "reused": "direct_jsc_lower_bound",
     "prepared": "direct_jsc_prepared_call",
     "rustjsi": "rustjsi_experimental",
 }
-SCHEMA = 6
+SCHEMA = 7
 
 
 def valid_run_count(value):
-    return type(value) is int and 12 <= value <= 996 and value % len(CALLBACK_ORDERS) == 0
+    return (
+        type(value) is int
+        and 12 <= value <= 996
+        and value % len(CALLBACK_SCHEDULE) == 0
+    )
 
 
 def parse_sample(output):
@@ -192,7 +197,14 @@ def nearest_rank(values, percentile):
 
 def summarize(samples):
     if not valid_run_count(len(samples)):
-        raise ValueError("need 12–996 process runs in complete six-permutation blocks")
+        raise ValueError("need 12–996 process runs in complete mirrored blocks")
+    actual_orders = [sample["callback_order"] for sample in samples]
+    expected_orders = [
+        CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
+        for index in range(len(samples))
+    ]
+    if actual_orders != expected_orders:
+        raise ValueError("callback workload schedule does not match metadata")
     order_counts = {
         order: sum(sample["callback_order"] == order for sample in samples)
         for order in CALLBACK_ORDERS
@@ -223,7 +235,7 @@ def summarize(samples):
             for name, (top, bottom) in pairs.items()
         },
         "callback_ordering": {
-            "design": "complete_six_permutation_blocks",
+            "design": "mirrored_complete_six_permutation_pairs",
             "counts": order_counts,
         },
         "callback_position_effects": summarize_callback_positions(samples),
@@ -443,7 +455,7 @@ def collect(directory, runs, toolchain):
     if platform.system() != "Darwin":
         raise ValueError("the boundary benchmark requires macOS system JavaScriptCore")
     if not valid_run_count(runs):
-        raise ValueError("runs must be a multiple of six between 12 and 996")
+        raise ValueError("runs must be a multiple of twelve between 12 and 996")
     if directory.is_relative_to(ROOT):
         ignored = subprocess.run(
             ["git", "check-ignore", "--quiet", str(directory)], cwd=ROOT,
@@ -502,7 +514,7 @@ def collect(directory, runs, toolchain):
         write_json(directory / "metadata.json", metadata)
         samples = []
         for index in range(runs):
-            callback_order = CALLBACK_ORDERS[index % len(CALLBACK_ORDERS)]
+            callback_order = CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
             timing_environment = os.environ.copy()
             timing_environment["RUSTJSI_CALLBACK_ORDER"] = callback_order
             timing = record_process(

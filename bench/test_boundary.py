@@ -48,8 +48,7 @@ def timing_sample(order=boundary.CALLBACK_ORDERS[0]):
 def balanced_samples():
     return [
         boundary.parse_sample(timing_sample(order) + ALLOCATION_SAMPLE)
-        for _ in range(2)
-        for order in boundary.CALLBACK_ORDERS
+        for order in boundary.CALLBACK_SCHEDULE
     ]
 
 
@@ -147,13 +146,25 @@ class SampleTests(unittest.TestCase):
             0,
         )
 
-    def test_complete_permutation_blocks_are_required(self):
+    def test_mirrored_permutation_blocks_are_required(self):
         with self.assertRaises(ValueError):
             boundary.summarize(balanced_samples()[:-1])
-        unbalanced = balanced_samples()
-        unbalanced[-1]["callback_order"] = boundary.CALLBACK_ORDERS[0]
-        with self.assertRaisesRegex(ValueError, "not balanced"):
-            boundary.summarize(unbalanced)
+        reordered = balanced_samples()
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        with self.assertRaisesRegex(ValueError, "schedule does not match"):
+            boundary.summarize(reordered)
+
+    def test_run_count_requires_complete_mirrored_blocks(self):
+        self.assertEqual(
+            boundary.CALLBACK_SCHEDULE,
+            boundary.CALLBACK_ORDERS + tuple(reversed(boundary.CALLBACK_ORDERS)),
+        )
+        for runs in (12, 24, 996):
+            with self.subTest(runs=runs):
+                self.assertTrue(boundary.valid_run_count(runs))
+        for runs in (6, 18, 1000, True):
+            with self.subTest(runs=runs):
+                self.assertFalse(boundary.valid_run_count(runs))
 
     def test_identical_runs_have_zero_noise_not_gate_qualification(self):
         report = boundary.summarize(balanced_samples())
@@ -212,7 +223,7 @@ class ArtifactTests(unittest.TestCase):
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(12):
-                order = boundary.CALLBACK_ORDERS[index % len(boundary.CALLBACK_ORDERS)]
+                order = boundary.CALLBACK_SCHEDULE[index]
                 (directory / f"run-{index:03}.stdout").write_text(
                     timing_sample(order)
                 )
@@ -350,11 +361,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_position_analysis_requires_schema_six(self):
+    def test_position_analysis_requires_schema_seven(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 5,
+                "schema": 6,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
