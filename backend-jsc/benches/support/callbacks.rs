@@ -14,11 +14,11 @@ pub(crate) enum CallbackWorkload {
 }
 
 impl CallbackWorkload {
-    pub(crate) const fn name(self) -> &'static str {
+    pub(crate) const fn labels(self) -> (&'static str, &'static str) {
         match self {
-            Self::Reused => "reused",
-            Self::Prepared => "prepared",
-            Self::RustJsi => "rustjsi",
+            Self::Reused => ("reused", "direct_jsc_lower_bound"),
+            Self::Prepared => ("prepared", "direct_jsc_prepared_call"),
+            Self::RustJsi => ("rustjsi", "rustjsi_experimental"),
         }
     }
 }

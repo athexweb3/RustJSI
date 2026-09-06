@@ -144,7 +144,7 @@ fn print_call_measurements(
     measurements: &CallbackMeasurements,
     iterations: u32,
 ) {
-    let [first, second, third] = order.map(callbacks::CallbackWorkload::name);
+    let [first, second, third] = order.map(|workload| workload.labels().0);
     let lower_bound = measurements.lower_bound.mean();
     let prepared = measurements.prepared.mean();
     let rustjsi = measurements.rustjsi.mean();

@@ -41,6 +41,7 @@ CALLBACK_BATCH_METRICS = {
     "direct_jsc_prepared_call",
     "rustjsi_experimental",
 }
+ALLOCATION_METRICS = ENTRY_METRICS | CALLBACK_BATCH_METRICS
 ITERATIONS = 1_000_000
 ENTRY_BATCHES = 1_000
 ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
@@ -66,7 +67,7 @@ CALLBACK_METRICS = {
     "prepared": "direct_jsc_prepared_call",
     "rustjsi": "rustjsi_experimental",
 }
-SCHEMA = 8
+SCHEMA = 9
 
 
 def valid_run_count(value):
@@ -151,7 +152,7 @@ def parse_sample(output):
                 r"([0-9]+) deallocated-bytes \(([0-9]+) iterations\)",
                 payload,
             )
-            if not match or metric not in ENTRY_METRICS or metric in rust_allocations:
+            if not match or metric not in ALLOCATION_METRICS or metric in rust_allocations:
                 raise ValueError(f"invalid or duplicate allocation metric: {metric}")
             if int(match[5]) != ITERATIONS:
                 raise ValueError(f"invalid allocation iteration count: {metric}")
@@ -165,7 +166,7 @@ def parse_sample(output):
         or ratios != RATIOS
         or entry_batches.keys() != ENTRY_METRICS
         or callback_batches.keys() != CALLBACK_BATCH_METRICS
-        or rust_allocations.keys() != ENTRY_METRICS
+        or rust_allocations.keys() != ALLOCATION_METRICS
         or callback_order is None
     ):
         raise ValueError("incomplete benchmark output")
@@ -292,7 +293,7 @@ def summarize(samples):
             },
         },
         "rust_allocator_activity": {
-            "scope": "Rust global allocator calls in the timed entry region",
+            "scope": "Rust global allocator calls in each timed boundary region",
             "excludes": "JavaScriptCore, system-framework, and foreign allocator activity",
             "iterations_per_process": ITERATIONS,
             "metrics": {
@@ -302,7 +303,7 @@ def summarize(samples):
                     ])
                     for field in ALLOCATION_FIELDS
                 }
-                for name in ENTRY_METRICS
+                for name in ALLOCATION_METRICS
             },
         },
         "all_run_mean_cv_at_most_5_percent": all(
@@ -569,6 +570,7 @@ def collect(directory, runs, toolchain):
                 [str(executables["boundary_allocations"])],
                 directory,
                 f"allocation-run-{index:03}",
+                environment=timing_environment,
             )
             samples.append(parse_sample(timing + allocations))
             print(f"boundary run {index + 1}/{runs}", file=sys.stderr)

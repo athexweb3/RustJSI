@@ -48,7 +48,7 @@ TIMING_METRICS = BASE_SAMPLE + CALLBACK_TIMINGS + "".join(
 ALLOCATION_SAMPLE = "".join(
     f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
     + "0 deallocated-bytes (1000000 iterations)\n"
-    for name in ENTRY_VALUES
+    for name in boundary.ALLOCATION_METRICS
 )
 
 
@@ -79,6 +79,9 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(len(sample["entry_batches"]["jsc_common_empty_entry"]), 1000)
         self.assertEqual(
             sample["rust_allocations"]["jsc_common_empty_entry"]["allocations"], 0
+        )
+        self.assertEqual(
+            sample["rust_allocations"]["rustjsi_experimental"]["allocations"], 0
         )
         self.assertEqual(sample["callback_order"], boundary.CALLBACK_ORDERS[0])
 
@@ -158,6 +161,10 @@ class SampleTests(unittest.TestCase):
         self.assertIn("excludes", allocations)
         self.assertEqual(
             allocations["metrics"]["jsc_common_empty_entry"]["allocations"]["mean"],
+            0,
+        )
+        self.assertEqual(
+            allocations["metrics"]["rustjsi_experimental"]["allocations"]["mean"],
             0,
         )
 
@@ -338,6 +345,13 @@ class ArtifactTests(unittest.TestCase):
                     if name == "build":
                         output = artifacts
                     elif name.startswith("allocation-run-"):
+                        self.assertEqual(
+                            environment["RUSTJSI_CALLBACK_ORDER"],
+                            boundary.CALLBACK_SCHEDULE[
+                                int(name.rsplit("-", 1)[1])
+                                % len(boundary.CALLBACK_SCHEDULE)
+                            ],
+                        )
                         output = ALLOCATION_SAMPLE
                     else:
                         output = timing_sample(environment["RUSTJSI_CALLBACK_ORDER"])
@@ -390,11 +404,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_callback_batch_analysis_requires_schema_eight(self):
+    def test_callback_allocation_analysis_requires_schema_nine(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 7,
+                "schema": 8,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
