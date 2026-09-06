@@ -16,6 +16,7 @@ fn main() {
     const ENTRY_BATCHES: u32 = 1_000;
 
     let direct = raw::measure(WARMUP, ITERATIONS);
+    let direct_prepared = raw::measure_prepared(WARMUP, ITERATIONS);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
@@ -93,15 +94,10 @@ fn main() {
         })
         .expect("enter common JSC backend");
 
-    println!("direct_jsc_lower_bound: {direct:.2} ns/call");
+    print_call_measurements(direct, direct_prepared, rustjsi, ITERATIONS);
     print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
     print_entry_measurement("jsc_common_empty_entry", &common_entry);
     print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
-    println!("rustjsi_experimental: {rustjsi:.2} ns/call");
-    println!(
-        "rustjsi_over_direct: {:.3}x ({ITERATIONS} iterations)",
-        rustjsi / direct
-    );
     println!("direct_jsc_scalar: {direct_scalar:.2} ns/round-trip");
     println!("rustjsi_common_scalar: {common_scalar:.2} ns/round-trip");
     println!(
@@ -118,6 +114,21 @@ fn assert_answer(value: f64) {
     assert!(
         (value - 42.0).abs() < f64::EPSILON,
         "wrong benchmark result: {value}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn print_call_measurements(lower_bound: f64, prepared: f64, rustjsi: f64, iterations: u32) {
+    println!("direct_jsc_lower_bound: {lower_bound:.2} ns/call");
+    println!("direct_jsc_prepared_call: {prepared:.2} ns/call");
+    println!("rustjsi_experimental: {rustjsi:.2} ns/call");
+    println!(
+        "rustjsi_over_direct: {:.3}x ({iterations} iterations)",
+        rustjsi / lower_bound
+    );
+    println!(
+        "rustjsi_over_prepared: {:.3}x ({iterations} iterations)",
+        rustjsi / prepared
     );
 }
 
@@ -309,6 +320,26 @@ mod raw {
         elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
     }
 
+    pub(super) fn measure_prepared(warmup: u32, iterations: u32) -> f64 {
+        let owner = OwnedContext::new();
+        let rooted = RootedFunction::new(&owner);
+        let context = owner.0;
+        let function = rooted.function;
+        check_result(context, call_with_prepared_arguments(context, function));
+
+        for _ in 0..warmup {
+            black_box(call_with_prepared_arguments(context, function));
+        }
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(call_with_prepared_arguments(context, function));
+        }
+        let elapsed = started.elapsed();
+
+        check_result(context, call_with_prepared_arguments(context, function));
+        elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
     pub(super) fn measure_scalar(warmup: u32, iterations: u32) -> f64 {
         let owner = OwnedContext::new();
         let context = owner.0;
@@ -351,6 +382,18 @@ mod raw {
         let result = unsafe { to_number(context, value, &raw mut exception) };
         assert!(exception.is_null(), "direct scalar conversion threw");
         result
+    }
+
+    fn call_with_prepared_arguments(context: Context, function: Object) -> Value {
+        // SAFETY: Both primitive arguments are created in the live context and
+        // remain valid for the immediately following synchronous call.
+        let arguments = unsafe {
+            [
+                make_number(context, black_box(20.0)),
+                make_number(context, black_box(22.0)),
+            ]
+        };
+        call(context, function, &arguments)
     }
 
     fn call(context: Context, function: Object, arguments: &[Value; 2]) -> Value {

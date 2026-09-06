@@ -12,11 +12,13 @@ import boundary
 
 
 BASE_SAMPLE = """direct_jsc_lower_bound: 100.00 ns/call
+direct_jsc_prepared_call: 110.00 ns/call
 host_gate_admit_and_exit: 4.00 ns/entry
 jsc_common_empty_entry: 9.00 ns/entry
 jsc_foreign_common_empty_entry: 11.00 ns/entry
 rustjsi_experimental: 125.00 ns/call
 rustjsi_over_direct: 1.250x (1000000 iterations)
+rustjsi_over_prepared: 1.136x (1000000 iterations)
 direct_jsc_scalar: 25.00 ns/round-trip
 rustjsi_common_scalar: 27.00 ns/round-trip
 common_scalar_over_direct: 1.080x (1000000 iterations)
@@ -101,6 +103,9 @@ class SampleTests(unittest.TestCase):
         report = boundary.summarize(samples)
         ratios = report["paired_ratios"]["call_over_lower_bound"]
         self.assertEqual(ratios["mean"], (2.5 + 9 * 1.25) / 10)
+        self.assertEqual(
+            report["paired_ratios"]["call_over_prepared"]["mean"], 125 / 110
+        )
         self.assertFalse(report["all_run_mean_cv_at_most_5_percent"])
         self.assertIsNone(report["individual_call_p99"])
         self.assertFalse(report["performance_gate_qualified"])
@@ -308,6 +313,24 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "after"}, "binary_sha256": "test-digest",
             })
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
+                boundary.read_report(directory)
+
+    def test_prepared_baseline_requires_schema_four(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": 3,
+                "benchmark": "boundary",
+                "runs": 10,
+                "source": {"head": "before"},
+                "binary_sha256": self.HASHES,
+            }
+            boundary.write_json(directory / "metadata.json", metadata)
+            boundary.write_json(directory / "complete.json", {
+                "source": metadata["source"],
+                "binary_sha256": metadata["binary_sha256"],
+            })
+            with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
                 boundary.read_report(directory)
 
     def test_report_rejects_invalid_binary_hash_metadata(self):

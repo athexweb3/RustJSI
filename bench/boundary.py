@@ -18,6 +18,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 METRICS = {
     "direct_jsc_lower_bound": "ns/call",
+    "direct_jsc_prepared_call": "ns/call",
     "host_gate_admit_and_exit": "ns/entry",
     "jsc_common_empty_entry": "ns/entry",
     "jsc_foreign_common_empty_entry": "ns/entry",
@@ -25,7 +26,11 @@ METRICS = {
     "direct_jsc_scalar": "ns/round-trip",
     "rustjsi_common_scalar": "ns/round-trip",
 }
-RATIOS = {"rustjsi_over_direct", "common_scalar_over_direct"}
+RATIOS = {
+    "rustjsi_over_direct",
+    "rustjsi_over_prepared",
+    "common_scalar_over_direct",
+}
 ENTRY_METRICS = {
     "host_gate_admit_and_exit",
     "jsc_common_empty_entry",
@@ -38,7 +43,7 @@ ALLOCATION_FIELDS = (
     "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
 )
 BENCHMARKS = ("boundary", "boundary_allocations")
-SCHEMA = 3
+SCHEMA = 4
 
 
 def parse_sample(output):
@@ -169,6 +174,7 @@ def summarize(samples):
     }
     pairs = {
         "call_over_lower_bound": ("rustjsi_experimental", "direct_jsc_lower_bound"),
+        "call_over_prepared": ("rustjsi_experimental", "direct_jsc_prepared_call"),
         "common_scalar_over_direct": ("rustjsi_common_scalar", "direct_jsc_scalar"),
     }
     return {
