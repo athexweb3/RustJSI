@@ -55,7 +55,12 @@ CALLBACK_ORDERING = {
     "design": "complete_six_permutation_blocks",
     "sequence": list(CALLBACK_ORDERS),
 }
-SCHEMA = 5
+CALLBACK_METRICS = {
+    "reused": "direct_jsc_lower_bound",
+    "prepared": "direct_jsc_prepared_call",
+    "rustjsi": "rustjsi_experimental",
+}
+SCHEMA = 6
 
 
 def valid_run_count(value):
@@ -221,6 +226,7 @@ def summarize(samples):
             "design": "complete_six_permutation_blocks",
             "counts": order_counts,
         },
+        "callback_position_effects": summarize_callback_positions(samples),
         "entry_batch_latency": {
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
@@ -253,6 +259,26 @@ def summarize(samples):
         "individual_call_p99": None,
         "performance_gate_qualified": False,
     }
+
+
+def summarize_callback_positions(samples):
+    position_names = ("first", "second", "third")
+    result = {}
+    for workload, metric in CALLBACK_METRICS.items():
+        positions = {}
+        for index, position in enumerate(position_names):
+            positions[position] = describe([
+                sample["metrics"][metric]
+                for sample in samples
+                if sample["callback_order"].split(",")[index] == workload
+            ])
+        means = [position["mean"] for position in positions.values()]
+        result[metric] = {
+            "unit": METRICS[metric],
+            "positions": positions,
+            "max_mean_spread": max(means) / min(means) - 1,
+        }
+    return result
 
 
 def describe_entry_batches(values, processes):

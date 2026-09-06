@@ -162,6 +162,12 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             set(report["callback_ordering"]["counts"].values()), {2}
         )
+        for metric in boundary.CALLBACK_METRICS.values():
+            effects = report["callback_position_effects"][metric]
+            self.assertEqual(effects["max_mean_spread"], 0)
+            self.assertEqual(
+                {item["samples"] for item in effects["positions"].values()}, {4}
+            )
 
 
 class ArtifactTests(unittest.TestCase):
@@ -344,11 +350,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_counterbalanced_baseline_requires_schema_five(self):
+    def test_position_analysis_requires_schema_six(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 4,
+                "schema": 5,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
