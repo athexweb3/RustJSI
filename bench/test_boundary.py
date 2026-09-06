@@ -123,7 +123,7 @@ class SampleTests(unittest.TestCase):
         result = boundary.describe_nonnegative([0, 0, 0])
         self.assertEqual(result["mean"], 0)
         self.assertEqual(result["sample_cv"], 0)
-        self.assertEqual(result["mean_per_entry"], 0)
+        self.assertEqual(result["mean_per_operation"], 0)
 
     def test_nearest_rank_percentiles(self):
         values = list(range(1, 101))

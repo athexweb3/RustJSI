@@ -212,7 +212,7 @@ def describe_nonnegative(values):
         "min": min(values),
         "max": max(values),
         "sample_cv": statistics.stdev(values) / mean if mean else 0.0,
-        "mean_per_entry": mean / ITERATIONS,
+        "mean_per_operation": mean / ITERATIONS,
     }
 
 
