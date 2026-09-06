@@ -82,6 +82,14 @@ workloads. The counter covers Rust allocations made by the probe and linked
 Rust code in that region. It does not observe JavaScriptCore, Objective-C,
 system-framework or other foreign allocator activity.
 
+After all timed workloads finish, the timing executable records two diagnostic
+controls. `calibration_timer_pair` measures back-to-back `Instant` reads in the
+same process. `calibration_empty_batch` runs the same 1,000-by-1,000 batching
+harness with only a Rust `black_box` operation. Running the controls last keeps
+them from changing the preceding workload measurements. It also means they
+sample a later interval rather than the exact scheduler state of each workload
+block.
+
 ## Reading the report
 
 The primary metrics remain one mean per process. The report gives their mean,
@@ -95,6 +103,11 @@ method. These are quantiles of contiguous 1,000-operation block means, not
 individual call or entry latencies. Batching amortizes timestamp reads enough
 to expose scheduler and frequency disturbances without placing a timer around
 every operation. It can hide single-operation spikes inside a block.
+
+`measurement_calibration` reports the timer-pair and empty-batch distributions,
+plus the timer-pair cost amortized over one 1,000-operation measured block.
+These controls expose the harness floor; they are not assumed to be additive
+with engine work and are never subtracted from a workload metric.
 
 `rust_allocator_activity` summarizes per-process counter totals and their mean
 per operation for the callback and entry workloads. Zero is a valid
