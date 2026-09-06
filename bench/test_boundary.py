@@ -45,6 +45,14 @@ TIMING_METRICS = BASE_SAMPLE + CALLBACK_TIMINGS + "".join(
     + " ns/entry\n"
     for name, value in ENTRY_VALUES.items()
 )
+CALIBRATION_SAMPLE = (
+    "calibration_timer_pair: 1000 samples "
+    + ",".join(["20.0000"] * 1000)
+    + " ns/pair\n"
+    + "calibration_empty_batch: 1000 ops/batch "
+    + ",".join(["1.0000"] * 1000)
+    + " ns/operation\n"
+)
 ALLOCATION_SAMPLE = "".join(
     f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
     + "0 deallocated-bytes (1000000 iterations)\n"
@@ -53,7 +61,7 @@ ALLOCATION_SAMPLE = "".join(
 
 
 def timing_sample(order=boundary.CALLBACK_ORDERS[0]):
-    return f"callback_order: {order}\n" + TIMING_METRICS
+    return f"callback_order: {order}\n" + TIMING_METRICS + CALIBRATION_SAMPLE
 
 
 def balanced_samples():
@@ -76,6 +84,11 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             sample["callback_batches"].keys(), boundary.CALLBACK_BATCH_METRICS
         )
+        self.assertEqual(
+            sample["calibration"].keys(),
+            {"calibration_timer_pair", "calibration_empty_batch"},
+        )
+        self.assertEqual(len(sample["calibration"]["calibration_timer_pair"]), 1000)
         self.assertEqual(len(sample["entry_batches"]["jsc_common_empty_entry"]), 1000)
         self.assertEqual(
             sample["rust_allocations"]["jsc_common_empty_entry"]["allocations"], 0
@@ -101,6 +114,9 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("4.0000,", "", 1),
             SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
             SAMPLE.replace("100.0000", "120.0000", 1),
+            SAMPLE.replace("20.0000", "NaN", 1),
+            SAMPLE.replace("calibration_timer_pair: 1000", "calibration_timer_pair: 10"),
+            SAMPLE.replace("1.0000,", "", 1),
             SAMPLE.replace("0 calls 0 bytes", "-1 calls 0 bytes", 1),
             "\n".join(SAMPLE.splitlines()[:-1]),
         ]
@@ -124,6 +140,12 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result["mean"], 0)
         self.assertEqual(result["sample_cv"], 0)
         self.assertEqual(result["mean_per_operation"], 0)
+
+    def test_calibration_accepts_clock_resolution_zeroes(self):
+        sample = boundary.parse_sample(SAMPLE.replace("20.0000", "0.0000"))
+        self.assertEqual(
+            set(sample["calibration"]["calibration_timer_pair"]), {0.0}
+        )
 
     def test_nearest_rank_percentiles(self):
         values = list(range(1, 101))
@@ -181,6 +203,24 @@ class SampleTests(unittest.TestCase):
         self.assertLessEqual(
             latency["metrics"]["rustjsi_experimental"]["p99"], 500
         )
+
+    def test_calibration_is_diagnostic_and_never_subtracted(self):
+        samples = balanced_samples()
+        samples[0]["calibration"]["calibration_timer_pair"][-1] = 200
+        samples[0]["calibration"]["calibration_empty_batch"][-1] = 10
+        calibration = boundary.summarize(samples)["measurement_calibration"]
+        self.assertEqual(
+            calibration["sample_kind"], "post_workload_diagnostic_control"
+        )
+        self.assertFalse(calibration["subtracted_from_workloads"])
+        self.assertEqual(calibration["timer_pair"]["samples"], 12_000)
+        self.assertEqual(
+            calibration["timer_pair_amortized_over_measured_batch"][
+                "operations_per_batch"
+            ],
+            1000,
+        )
+        self.assertEqual(calibration["empty_batch"]["samples"], 12_000)
 
     def test_mirrored_permutation_blocks_are_required(self):
         with self.assertRaises(ValueError):
@@ -404,11 +444,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_callback_allocation_analysis_requires_schema_nine(self):
+    def test_calibration_analysis_requires_schema_ten(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 8,
+                "schema": 9,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
