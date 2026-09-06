@@ -45,6 +45,7 @@ ALLOCATION_METRICS = ENTRY_METRICS | CALLBACK_BATCH_METRICS
 ITERATIONS = 1_000_000
 ENTRY_BATCHES = 1_000
 ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
+CALIBRATION_SAMPLES = ENTRY_BATCHES
 ALLOCATION_FIELDS = (
     "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
 )
@@ -67,7 +68,7 @@ CALLBACK_METRICS = {
     "prepared": "direct_jsc_prepared_call",
     "rustjsi": "rustjsi_experimental",
 }
-SCHEMA = 9
+SCHEMA = 10
 
 
 def valid_run_count(value):
@@ -84,6 +85,7 @@ def parse_sample(output):
     ratios = set()
     entry_batches = {}
     callback_batches = {}
+    calibration = {}
     rust_allocations = {}
     callback_order = None
     for line in output.splitlines():
@@ -145,6 +147,30 @@ def parse_sample(output):
             ):
                 raise ValueError(f"invalid callback batch samples: {metric}")
             callback_batches[metric] = samples
+        elif name == "calibration_timer_pair":
+            match = re.fullmatch(r"([0-9]+) samples (.+) ns/pair", payload)
+            if not match or name in calibration:
+                raise ValueError("invalid or duplicate timer-pair calibration")
+            samples = [float(value) for value in match[2].split(",")]
+            if (
+                int(match[1]) != CALIBRATION_SAMPLES
+                or len(samples) != CALIBRATION_SAMPLES
+                or any(not math.isfinite(value) or value < 0 for value in samples)
+            ):
+                raise ValueError("invalid timer-pair calibration samples")
+            calibration[name] = samples
+        elif name == "calibration_empty_batch":
+            match = re.fullmatch(r"([0-9]+) ops/batch (.+) ns/operation", payload)
+            if not match or name in calibration:
+                raise ValueError("invalid or duplicate empty-batch calibration")
+            samples = [float(value) for value in match[2].split(",")]
+            if (
+                int(match[1]) != ENTRY_BATCH_ITERATIONS
+                or len(samples) != ENTRY_BATCHES
+                or any(not math.isfinite(value) or value < 0 for value in samples)
+            ):
+                raise ValueError("invalid empty-batch calibration samples")
+            calibration[name] = samples
         elif name.startswith("rust_alloc_"):
             metric = name.removeprefix("rust_alloc_")
             match = re.fullmatch(
@@ -166,6 +192,9 @@ def parse_sample(output):
         or ratios != RATIOS
         or entry_batches.keys() != ENTRY_METRICS
         or callback_batches.keys() != CALLBACK_BATCH_METRICS
+        or calibration.keys() != {
+            "calibration_timer_pair", "calibration_empty_batch"
+        }
         or rust_allocations.keys() != ALLOCATION_METRICS
         or callback_order is None
     ):
@@ -180,6 +209,7 @@ def parse_sample(output):
         "metrics": values,
         "entry_batches": entry_batches,
         "callback_batches": callback_batches,
+        "calibration": calibration,
         "rust_allocations": rust_allocations,
         "callback_order": callback_order,
     }
@@ -187,23 +217,23 @@ def parse_sample(output):
 
 def describe(values):
     """Statistics across process-level batch means, not individual call latencies."""
-    if len(values) < 2 or any(not math.isfinite(x) or x <= 0 for x in values):
-        raise ValueError("need at least two finite positive samples")
-    mean = statistics.mean(values)
-    return {
-        "samples": len(values),
-        "mean": mean,
-        "median": statistics.median(values),
-        "min": min(values),
-        "max": max(values),
-        "sample_cv": statistics.stdev(values) / mean,
-    }
+    return describe_values(values, allow_zero=False)
 
 
 def describe_nonnegative(values):
     """Describe counters where an exact zero is a valid and useful result."""
-    if len(values) < 2 or any(not math.isfinite(x) or x < 0 for x in values):
-        raise ValueError("need at least two finite nonnegative samples")
+    result = describe_values(values, allow_zero=True)
+    result["mean_per_operation"] = result["mean"] / ITERATIONS
+    return result
+
+
+def describe_values(values, *, allow_zero):
+    invalid = (
+        (lambda value: value < 0) if allow_zero else (lambda value: value <= 0)
+    )
+    if len(values) < 2 or any(not math.isfinite(x) or invalid(x) for x in values):
+        kind = "nonnegative" if allow_zero else "positive"
+        raise ValueError(f"need at least two finite {kind} samples")
     mean = statistics.mean(values)
     return {
         "samples": len(values),
@@ -212,12 +242,11 @@ def describe_nonnegative(values):
         "min": min(values),
         "max": max(values),
         "sample_cv": statistics.stdev(values) / mean if mean else 0.0,
-        "mean_per_operation": mean / ITERATIONS,
     }
 
 
 def nearest_rank(values, percentile):
-    """Return a nearest-rank percentile from finite positive observations."""
+    """Return a nearest-rank percentile from ordered observations."""
     if not values or not 0 < percentile <= 1:
         raise ValueError("need observations and a percentile in (0, 1]")
     ordered = sorted(values)
@@ -292,6 +321,7 @@ def summarize(samples):
                 for name in ENTRY_METRICS
             },
         },
+        "measurement_calibration": summarize_calibration(samples),
         "rust_allocator_activity": {
             "scope": "Rust global allocator calls in each timed boundary region",
             "excludes": "JavaScriptCore, system-framework, and foreign allocator activity",
@@ -334,6 +364,39 @@ def summarize_callback_positions(samples):
     return result
 
 
+def summarize_calibration(samples):
+    timer_pairs = [
+        value
+        for sample in samples
+        for value in sample["calibration"]["calibration_timer_pair"]
+    ]
+    amortized_timer_pairs = [value / ENTRY_BATCH_ITERATIONS for value in timer_pairs]
+    empty_batches = [
+        value
+        for sample in samples
+        for value in sample["calibration"]["calibration_empty_batch"]
+    ]
+    return {
+        "sample_kind": "post_workload_diagnostic_control",
+        "subtracted_from_workloads": False,
+        "timer_pair": describe_distribution(
+            timer_pairs, len(samples), CALIBRATION_SAMPLES, "ns/pair"
+        ),
+        "timer_pair_amortized_over_measured_batch": {
+            "operations_per_batch": ENTRY_BATCH_ITERATIONS,
+            **describe_distribution(
+                amortized_timer_pairs,
+                len(samples),
+                CALIBRATION_SAMPLES,
+                "ns/operation",
+            ),
+        },
+        "empty_batch": describe_batches(
+            empty_batches, len(samples), "ns/operation"
+        ),
+    }
+
+
 def describe_batches(values, processes, unit):
     """Describe pooled, equal-sized block means without calling them call tails."""
     result = describe(values)
@@ -341,6 +404,19 @@ def describe_batches(values, processes, unit):
         "unit": unit,
         "processes": processes,
         "batches_per_process": ENTRY_BATCHES,
+        "p50": nearest_rank(values, 0.50),
+        "p95": nearest_rank(values, 0.95),
+        "p99": nearest_rank(values, 0.99),
+    })
+    return result
+
+
+def describe_distribution(values, processes, samples_per_process, unit):
+    result = describe_values(values, allow_zero=True)
+    result.update({
+        "unit": unit,
+        "processes": processes,
+        "samples_per_process": samples_per_process,
         "p50": nearest_rank(values, 0.50),
         "p95": nearest_rank(values, 0.95),
         "p99": nearest_rank(values, 0.99),
@@ -531,6 +607,8 @@ def collect(directory, runs, toolchain):
             "entry_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_batches": ENTRY_BATCHES,
             "callback_batch_iterations": ENTRY_BATCH_ITERATIONS,
+            "calibration_samples": CALIBRATION_SAMPLES,
+            "calibration_empty_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_ordering": CALLBACK_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
