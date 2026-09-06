@@ -12,8 +12,8 @@ The runner builds the timing and allocation-probe executables once with Rust
 `--toolchain` selects another installed toolchain. `--runs` accepts multiples
 of twelve from 12 through 996.
 Each workload has 10,000 warmup iterations and 1,000,000 measured iterations
-per process. The three timed entry workloads divide those iterations into 1,000
-contiguous batches of 1,000 operations. Startup, runtime creation and
+per process. The callback and entry workloads divide those iterations into
+1,000 contiguous batches of 1,000 operations. Startup, runtime creation and
 compilation are outside the workload timers.
 
 The collector passes absolute `RUSTC` and `RUSTDOC` paths from `rustup which`
@@ -72,12 +72,13 @@ callback function has an explicit root outside the timer; RAII releases the
 root before its context, including if a validation assertion unwinds.
 macOS CI checks successful benchmark execution, not timing thresholds.
 
-For each entry workload, the timing executable also records the four-decimal
-mean of every 1,000-operation batch. A separate executable with a counting
-global allocator snapshots successful Rust allocation, reallocation and
-deallocation activity around the equivalent 1,000,000 operations. Keeping the
-probe out of the timing executable prevents its atomics from changing workloads
-that allocate. The counter covers Rust allocations made by the probe and linked
+For each callback and entry workload, the timing executable also records the
+four-decimal mean of every 1,000-operation batch. A separate executable with a
+counting global allocator snapshots successful Rust allocation, reallocation
+and deallocation activity around the equivalent 1,000,000 operations. It runs
+the callback workloads in the same selected order as the timing executable.
+Keeping the probe separate prevents its atomics from changing the timed
+workloads. The counter covers Rust allocations made by the probe and linked
 Rust code in that region. It does not observe JavaScriptCore, Objective-C,
 system-framework or other foreign allocator activity.
 
@@ -88,17 +89,18 @@ median, range and sample coefficient of variation (`sample standard deviation /
 mean`) across processes. Ratios are calculated within each process before being
 summarized. Primary times have two decimal places of nanosecond precision.
 
-`entry_batch_latency` pools the equal-sized, four-decimal batch means and
-reports p50, p95 and p99 using the nearest-rank method. These are quantiles of
-contiguous 1,000-operation block means, not individual entry latencies. Batching
-amortizes timestamp reads enough to expose scheduler and frequency disturbances
-without placing a timer around every nanosecond-scale entry. It can hide
-single-operation spikes inside a block.
+`callback_batch_latency` and `entry_batch_latency` pool the equal-sized,
+four-decimal batch means and report p50, p95 and p99 using the nearest-rank
+method. These are quantiles of contiguous 1,000-operation block means, not
+individual call or entry latencies. Batching amortizes timestamp reads enough
+to expose scheduler and frequency disturbances without placing a timer around
+every operation. It can hide single-operation spikes inside a block.
 
 `rust_allocator_activity` summarizes per-process counter totals and their mean
-per entry. Zero is a valid observation. It supports a narrowly scoped
-zero-Rust-allocation claim only for the named timed region and build; it is not
-evidence of zero engine allocation or zero payload copies.
+per operation for the callback and entry workloads. Zero is a valid
+observation. It supports a narrowly scoped zero-Rust-allocation claim only for
+the named measured region and build; it is not evidence of zero engine
+allocation or zero payload copies.
 
 `all_run_mean_cv_at_most_5_percent` is a noise diagnostic, not a performance
 pass. It is not the variability of independently estimated medians. No
