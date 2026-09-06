@@ -28,7 +28,7 @@ ENTRY_VALUES = {
     "jsc_common_empty_entry": 9.0,
     "jsc_foreign_common_empty_entry": 11.0,
 }
-TIMING_SAMPLE = BASE_SAMPLE + "".join(
+TIMING_METRICS = BASE_SAMPLE + "".join(
     f"entry_batches_{name}: 1000 ops/batch "
     + ",".join([f"{value:.4f}"] * 1000)
     + " ns/entry\n"
@@ -39,6 +39,21 @@ ALLOCATION_SAMPLE = "".join(
     + "0 deallocated-bytes (1000000 iterations)\n"
     for name in ENTRY_VALUES
 )
+
+
+def timing_sample(order=boundary.CALLBACK_ORDERS[0]):
+    return f"callback_order: {order}\n" + TIMING_METRICS
+
+
+def balanced_samples():
+    return [
+        boundary.parse_sample(timing_sample(order) + ALLOCATION_SAMPLE)
+        for _ in range(2)
+        for order in boundary.CALLBACK_ORDERS
+    ]
+
+
+TIMING_SAMPLE = timing_sample()
 SAMPLE = TIMING_SAMPLE + ALLOCATION_SAMPLE
 
 
@@ -52,6 +67,7 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             sample["rust_allocations"]["jsc_common_empty_entry"]["allocations"], 0
         )
+        self.assertEqual(sample["callback_order"], boundary.CALLBACK_ORDERS[0])
 
     def test_bad_samples(self):
         cases = [
@@ -64,6 +80,7 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("1000000 iterations", "10 iterations"),
             SAMPLE.replace("1.250x", "0.000x"),
             SAMPLE.replace("direct_jsc_lower_bound: ", "direct_jsc_lower_bound="),
+            SAMPLE.replace("reused,prepared,rustjsi", "reused,reused,rustjsi"),
             SAMPLE.replace("4.0000", "NaN", 1),
             SAMPLE.replace("4.0000,", "", 1),
             SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
@@ -98,11 +115,11 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(boundary.nearest_rank(values, 0.99), 99)
 
     def test_ratios_are_paired_and_no_call_percentile_is_invented(self):
-        samples = [boundary.parse_sample(SAMPLE) for _ in range(10)]
+        samples = balanced_samples()
         samples[0]["metrics"]["direct_jsc_lower_bound"] = 50
         report = boundary.summarize(samples)
         ratios = report["paired_ratios"]["call_over_lower_bound"]
-        self.assertEqual(ratios["mean"], (2.5 + 9 * 1.25) / 10)
+        self.assertEqual(ratios["mean"], (2.5 + 11 * 1.25) / 12)
         self.assertEqual(
             report["paired_ratios"]["call_over_prepared"]["mean"], 125 / 110
         )
@@ -111,14 +128,14 @@ class SampleTests(unittest.TestCase):
         self.assertFalse(report["performance_gate_qualified"])
 
     def test_entry_tail_and_allocator_scope_are_explicit(self):
-        samples = [boundary.parse_sample(SAMPLE) for _ in range(10)]
+        samples = balanced_samples()
         samples[0]["entry_batches"]["host_gate_admit_and_exit"][-1] = 40
         report = boundary.summarize(samples)
         latency = report["entry_batch_latency"]
         self.assertEqual(latency["sample_kind"], "contiguous_batch_mean")
         self.assertEqual(latency["operations_per_batch"], 1000)
         self.assertEqual(
-            latency["metrics"]["host_gate_admit_and_exit"]["samples"], 10_000
+            latency["metrics"]["host_gate_admit_and_exit"]["samples"], 12_000
         )
         self.assertLessEqual(
             latency["metrics"]["host_gate_admit_and_exit"]["p99"], 40
@@ -130,14 +147,21 @@ class SampleTests(unittest.TestCase):
             0,
         )
 
-    def test_at_least_ten_runs(self):
+    def test_complete_permutation_blocks_are_required(self):
         with self.assertRaises(ValueError):
-            boundary.summarize([boundary.parse_sample(SAMPLE)] * 9)
+            boundary.summarize(balanced_samples()[:-1])
+        unbalanced = balanced_samples()
+        unbalanced[-1]["callback_order"] = boundary.CALLBACK_ORDERS[0]
+        with self.assertRaisesRegex(ValueError, "not balanced"):
+            boundary.summarize(unbalanced)
 
     def test_identical_runs_have_zero_noise_not_gate_qualification(self):
-        report = boundary.summarize([boundary.parse_sample(SAMPLE)] * 10)
+        report = boundary.summarize(balanced_samples())
         self.assertTrue(report["all_run_mean_cv_at_most_5_percent"])
         self.assertFalse(report["performance_gate_qualified"])
+        self.assertEqual(
+            set(report["callback_ordering"]["counts"].values()), {2}
+        )
 
 
 class ArtifactTests(unittest.TestCase):
@@ -175,13 +199,17 @@ class ArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
+                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
                 "source": {"head": "test"},
                 "binary_sha256": self.HASHES,
+                "callback_ordering": boundary.CALLBACK_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
-            for index in range(10):
-                (directory / f"run-{index:03}.stdout").write_text(TIMING_SAMPLE)
+            for index in range(12):
+                order = boundary.CALLBACK_ORDERS[index % len(boundary.CALLBACK_ORDERS)]
+                (directory / f"run-{index:03}.stdout").write_text(
+                    timing_sample(order)
+                )
                 (directory / f"allocation-run-{index:03}.stdout").write_text(
                     ALLOCATION_SAMPLE
                 )
@@ -220,7 +248,7 @@ class ArtifactTests(unittest.TestCase):
             patch.object(boundary.subprocess, "run", return_value=result),
         ):
             with self.assertRaisesRegex(ValueError, "must be Git-ignored"):
-                boundary.collect(boundary.ROOT / "not-created", 10, "1.98.0")
+                boundary.collect(boundary.ROOT / "not-created", 12, "1.98.0")
 
     def test_source_fingerprint_includes_untracked_contents(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -266,10 +294,10 @@ class ArtifactTests(unittest.TestCase):
                     elif name.startswith("allocation-run-"):
                         output = ALLOCATION_SAMPLE
                     else:
-                        output = TIMING_SAMPLE
+                        output = timing_sample(environment["RUSTJSI_CALLBACK_ORDER"])
                     (destination / f"{name}.stdout").write_text(output)
                     (destination / f"{name}.stderr").write_text("")
-                    if changed == "binary" and name == "allocation-run-009":
+                    if changed == "binary" and name == "allocation-run-011":
                         executables["boundary_allocations"].write_bytes(b"changed binary")
                     return output
 
@@ -287,26 +315,27 @@ class ArtifactTests(unittest.TestCase):
                 ):
                     if changed:
                         with self.assertRaisesRegex(RuntimeError, "changed during collection"):
-                            boundary.collect(directory, 10, "test-toolchain")
+                            boundary.collect(directory, 12, "test-toolchain")
                         self.assertFalse((directory / "complete.json").exists())
                         self.assertFalse((directory / "summary.json").exists())
                         with self.assertRaisesRegex(ValueError, "collection failed"):
                             boundary.read_report(directory)
                     else:
-                        report = boundary.collect(directory, 10, "test-toolchain")
+                        report = boundary.collect(directory, 12, "test-toolchain")
                         self.assertEqual(boundary.read_report(directory), report)
-                    self.assertEqual(run.call_count, 21)
+                    self.assertEqual(run.call_count, 25)
                     # An existing collection is never reused, including failed ones.
                     with self.assertRaises(FileExistsError):
-                        boundary.collect(directory, 10, "test-toolchain")
+                        boundary.collect(directory, 12, "test-toolchain")
 
     def test_report_rejects_invalid_completion_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 10,
+                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
                 "source": {"head": "before"},
                 "binary_sha256": self.HASHES,
+                "callback_ordering": boundary.CALLBACK_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             boundary.write_json(directory / "complete.json", {
@@ -315,13 +344,13 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_prepared_baseline_requires_schema_four(self):
+    def test_counterbalanced_baseline_requires_schema_five(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 3,
+                "schema": 4,
                 "benchmark": "boundary",
-                "runs": 10,
+                "runs": 12,
                 "source": {"head": "before"},
                 "binary_sha256": self.HASHES,
             }
@@ -342,7 +371,7 @@ class ArtifactTests(unittest.TestCase):
                 boundary.write_json(directory / "metadata.json", {
                     "schema": boundary.SCHEMA,
                     "benchmark": "boundary",
-                    "runs": 10,
+                    "runs": 12,
                     "source": {"head": "before"},
                     "binary_sha256": hashes,
                 })
