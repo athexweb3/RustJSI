@@ -8,8 +8,9 @@ python3 -B bench/boundary.py report bench/results/boundary-001
 ```
 
 The runner builds the timing and allocation-probe executables once with Rust
-1.98.0, then launches each executable in ten separate process pairs.
-`--toolchain` selects another installed toolchain; `--runs` accepts 10–1000.
+1.98.0, then launches each executable in twelve separate process pairs.
+`--toolchain` selects another installed toolchain. `--runs` accepts multiples
+of six from 12 through 996.
 Each workload has 10,000 warmup iterations and 1,000,000 measured iterations
 per process. The three timed entry workloads divide those iterations into 1,000
 contiguous batches of 1,000 operations. Startup, runtime creation and
@@ -53,6 +54,14 @@ those are part of the RustJSI boundary cost being compared. The metric name
 run will report a smaller number. The scalar comparison has closer operation
 parity, but still excludes host entry from its timer. None of the comparisons
 measures application throughput.
+
+The three callback workloads run once in each of their six possible orders per
+six-process block. The default twelve runs execute two complete blocks. Each
+timing process writes its selected order to raw stdout; the collector validates
+equal order counts before reporting. Runtime/context/function construction and
+warmup remain outside each workload timer. This balances position and immediate
+carryover across callback workloads, but it does not eliminate thermal or
+between-process drift.
 Callback and scalar results are checked against `42` before and after each
 timed workload. These checks do not validate every timed iteration. The direct
 callback function has an explicit root outside the timer; RAII releases the
@@ -94,9 +103,11 @@ absent. JavaScriptCore allocation, payload-copy, confidence-interval and
 regression-gate work also remains open.
 
 Separate processes do not isolate CPU frequency, thermal state, OS scheduling,
-shared caches or background work. Workloads currently run in a fixed order;
-order bias is unmeasured. Use an otherwise idle machine and record power/thermal
-conditions separately. Do not run collection alongside builds or test suites.
+shared caches or background work. Callback workload order is counterbalanced;
+entry and scalar workloads still run in a fixed order after the callback group.
+Their order bias is unmeasured. Use an otherwise idle machine and record
+power/thermal conditions separately. Do not run collection alongside builds or
+test suites.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
 entire environment. The source fingerprint covers tracked and non-ignored
