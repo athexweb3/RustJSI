@@ -43,7 +43,33 @@ ALLOCATION_FIELDS = (
     "allocations", "allocated_bytes", "deallocations", "deallocated_bytes"
 )
 BENCHMARKS = ("boundary", "boundary_allocations")
-SCHEMA = 4
+CALLBACK_ORDERS = (
+    "reused,prepared,rustjsi",
+    "reused,rustjsi,prepared",
+    "prepared,reused,rustjsi",
+    "prepared,rustjsi,reused",
+    "rustjsi,reused,prepared",
+    "rustjsi,prepared,reused",
+)
+CALLBACK_SCHEDULE = CALLBACK_ORDERS + tuple(reversed(CALLBACK_ORDERS))
+CALLBACK_ORDERING = {
+    "design": "mirrored_complete_six_permutation_pairs",
+    "sequence": list(CALLBACK_SCHEDULE),
+}
+CALLBACK_METRICS = {
+    "reused": "direct_jsc_lower_bound",
+    "prepared": "direct_jsc_prepared_call",
+    "rustjsi": "rustjsi_experimental",
+}
+SCHEMA = 7
+
+
+def valid_run_count(value):
+    return (
+        type(value) is int
+        and 12 <= value <= 996
+        and value % len(CALLBACK_SCHEDULE) == 0
+    )
 
 
 def parse_sample(output):
@@ -52,13 +78,18 @@ def parse_sample(output):
     ratios = set()
     entry_batches = {}
     rust_allocations = {}
+    callback_order = None
     for line in output.splitlines():
         if not line.strip():
             continue
         name, separator, payload = line.partition(": ")
         if not separator:
             raise ValueError(f"malformed benchmark line: {line!r}")
-        if name in METRICS:
+        if name == "callback_order":
+            if callback_order is not None or payload not in CALLBACK_ORDERS:
+                raise ValueError("invalid or duplicate callback order")
+            callback_order = payload
+        elif name in METRICS:
             number, separator, unit = payload.partition(" ")
             if not separator or unit != METRICS[name] or name in values:
                 raise ValueError(f"invalid or duplicate metric: {name}")
@@ -111,6 +142,7 @@ def parse_sample(output):
         or ratios != RATIOS
         or entry_batches.keys() != ENTRY_METRICS
         or rust_allocations.keys() != ENTRY_METRICS
+        or callback_order is None
     ):
         raise ValueError("incomplete benchmark output")
     for name, samples in entry_batches.items():
@@ -120,6 +152,7 @@ def parse_sample(output):
         "metrics": values,
         "entry_batches": entry_batches,
         "rust_allocations": rust_allocations,
+        "callback_order": callback_order,
     }
 
 
@@ -163,8 +196,21 @@ def nearest_rank(values, percentile):
 
 
 def summarize(samples):
-    if len(samples) < 10:
-        raise ValueError("need at least ten independent process runs")
+    if not valid_run_count(len(samples)):
+        raise ValueError("need 12–996 process runs in complete mirrored blocks")
+    actual_orders = [sample["callback_order"] for sample in samples]
+    expected_orders = [
+        CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
+        for index in range(len(samples))
+    ]
+    if actual_orders != expected_orders:
+        raise ValueError("callback workload schedule does not match metadata")
+    order_counts = {
+        order: sum(sample["callback_order"] == order for sample in samples)
+        for order in CALLBACK_ORDERS
+    }
+    if len(set(order_counts.values())) != 1:
+        raise ValueError("callback workload orders are not balanced")
     metrics = {
         name: {
             "unit": unit,
@@ -188,6 +234,11 @@ def summarize(samples):
             ])
             for name, (top, bottom) in pairs.items()
         },
+        "callback_ordering": {
+            "design": "mirrored_complete_six_permutation_pairs",
+            "counts": order_counts,
+        },
+        "callback_position_effects": summarize_callback_positions(samples),
         "entry_batch_latency": {
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
@@ -220,6 +271,26 @@ def summarize(samples):
         "individual_call_p99": None,
         "performance_gate_qualified": False,
     }
+
+
+def summarize_callback_positions(samples):
+    position_names = ("first", "second", "third")
+    result = {}
+    for workload, metric in CALLBACK_METRICS.items():
+        positions = {}
+        for index, position in enumerate(position_names):
+            positions[position] = describe([
+                sample["metrics"][metric]
+                for sample in samples
+                if sample["callback_order"].split(",")[index] == workload
+            ])
+        means = [position["mean"] for position in positions.values()]
+        result[metric] = {
+            "unit": METRICS[metric],
+            "positions": positions,
+            "max_mean_spread": max(means) / min(means) - 1,
+        }
+    return result
 
 
 def describe_entry_batches(values, processes):
@@ -353,10 +424,11 @@ def read_report(directory):
         metadata.get("schema") != SCHEMA
         or metadata.get("benchmark") != "boundary"
         or not valid_binary_hashes(metadata.get("binary_sha256"))
+        or metadata.get("callback_ordering") != CALLBACK_ORDERING
     ):
         raise ValueError("unsupported benchmark metadata")
     count = metadata.get("runs")
-    if type(count) is not int or not 10 <= count <= 1_000:
+    if not valid_run_count(count):
         raise ValueError("invalid run count")
     if (
         completion.get("source") != metadata.get("source")
@@ -382,8 +454,8 @@ def read_report(directory):
 def collect(directory, runs, toolchain):
     if platform.system() != "Darwin":
         raise ValueError("the boundary benchmark requires macOS system JavaScriptCore")
-    if not 10 <= runs <= 1_000:
-        raise ValueError("runs must be between 10 and 1000")
+    if not valid_run_count(runs):
+        raise ValueError("runs must be a multiple of twelve between 12 and 996")
     if directory.is_relative_to(ROOT):
         ignored = subprocess.run(
             ["git", "check-ignore", "--quiet", str(directory)], cwd=ROOT,
@@ -416,6 +488,7 @@ def collect(directory, runs, toolchain):
             "measured_iterations": ITERATIONS,
             "entry_batches": ENTRY_BATCHES,
             "entry_batch_iterations": ENTRY_BATCH_ITERATIONS,
+            "callback_ordering": CALLBACK_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
             "build_command": build,
@@ -441,8 +514,14 @@ def collect(directory, runs, toolchain):
         write_json(directory / "metadata.json", metadata)
         samples = []
         for index in range(runs):
+            callback_order = CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
+            timing_environment = os.environ.copy()
+            timing_environment["RUSTJSI_CALLBACK_ORDER"] = callback_order
             timing = record_process(
-                [str(executables["boundary"])], directory, f"run-{index:03}"
+                [str(executables["boundary"])],
+                directory,
+                f"run-{index:03}",
+                environment=timing_environment,
             )
             allocations = record_process(
                 [str(executables["boundary_allocations"])],
@@ -479,7 +558,7 @@ def main():
     commands = parser.add_subparsers(dest="action", required=True)
     run = commands.add_parser("run", help="build once, then launch independent benchmark processes")
     run.add_argument("--output", type=Path, required=True, help="new output directory")
-    run.add_argument("--runs", type=int, default=10)
+    run.add_argument("--runs", type=int, default=12)
     run.add_argument("--toolchain", default="1.98.0")
     report = commands.add_parser("report", help="recompute statistics from saved raw stdout")
     report.add_argument("directory", type=Path)
