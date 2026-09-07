@@ -9,6 +9,10 @@ manifest, strong-root operations, and an owned external-buffer contract. Scoped
 value and byte-view types use generic associated lifetimes; engine-native types
 do not enter the portable contract.
 
+Contract version 2 adds synchronous `BackendScope::call` with scoped arguments
+and an explicit `CallReceiver::Global` or object receiver. Primitive receivers
+are rejected. Results remain scoped and JavaScript exceptions return as errors.
+
 `BackendFamily` names entry and scope types independently of a host lifetime.
 Generic consumers can combine capability bounds on its scope type; `with_scope`
 uses an already-borrowed backend. It supplies no runtime ownership or admission.
