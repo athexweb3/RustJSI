@@ -3,7 +3,8 @@
 use crate::{ModelBackend, ModelBufferView, ModelRoot, ModelScope, ModelValue};
 use rustjsi_backend::{
     BackendBase, BackendError, BackendFamily, BackendManifest, BackendScope, BorrowedBufferScope,
-    OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope, ValueKind,
+    CallReceiver, OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope,
+    ValueKind,
 };
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -139,6 +140,15 @@ impl<'entry> BackendScope for ModelEntryScope<'_, 'entry> {
 
     fn evaluate(&self, source: &str, source_url: &str) -> Result<Self::Value<'_>, BackendError> {
         self.inner.evaluate(source, source_url)
+    }
+
+    fn call<'value>(
+        &'value self,
+        function: Self::Value<'value>,
+        receiver: CallReceiver<Self::Value<'value>>,
+        arguments: &[Self::Value<'value>],
+    ) -> Result<Self::Value<'value>, BackendError> {
+        self.inner.call(function, receiver, arguments)
     }
 
     fn kind<'value>(&'value self, value: Self::Value<'value>) -> Result<ValueKind, BackendError> {
