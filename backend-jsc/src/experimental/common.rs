@@ -12,8 +12,8 @@ use super::{
 use crate::sys;
 use rustjsi_backend::{
     BACKEND_CONTRACT_VERSION, BackendBase, BackendError, BackendException, BackendFamily,
-    BackendManifest, BackendScope, Capability, CapabilitySet, OwnedExternalBufferScope,
-    OwnershipTransferError, RootBackend, RootScope, ValueKind,
+    BackendManifest, BackendScope, CallReceiver, Capability, CapabilitySet,
+    OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use rustjsi_host::{AttachmentId, Host, HostState};
 use std::cell::RefCell;
@@ -287,6 +287,89 @@ impl<'entry> BackendScope for JscScope<'_, 'entry> {
         self.rooted(raw, reservation)
     }
 
+    fn call<'value>(
+        &'value self,
+        function: Self::Value<'value>,
+        receiver: CallReceiver<Self::Value<'value>>,
+        arguments: &[Self::Value<'value>],
+    ) -> Result<Self::Value<'value>, BackendError> {
+        self.ensure_value(function)?;
+        let actual = self.raw_kind(function.raw)?;
+        if actual != ValueKind::Function {
+            return Err(BackendError::Type {
+                expected: ValueKind::Function,
+                actual,
+            });
+        }
+        let receiver = match receiver {
+            CallReceiver::Global => ptr::null_mut(),
+            CallReceiver::Object(receiver) => {
+                self.ensure_value(receiver)?;
+                let actual = self.raw_kind(receiver.raw)?;
+                if !matches!(
+                    actual,
+                    ValueKind::Object | ValueKind::Function | ValueKind::Buffer
+                ) {
+                    return Err(BackendError::Type {
+                        expected: ValueKind::Object,
+                        actual,
+                    });
+                }
+                receiver.raw.as_ptr()
+            }
+        };
+        for argument in arguments {
+            self.ensure_value(*argument)?;
+        }
+
+        let reservation = self
+            .backend
+            .shared
+            .local_budget
+            .reserve()
+            .map_err(map_runtime_error)?;
+        let mut inline_arguments = [ptr::null(); super::INLINE_ARGUMENTS];
+        let mut heap_arguments = Vec::new();
+        let raw_arguments = if arguments.len() <= super::INLINE_ARGUMENTS {
+            for (raw, argument) in inline_arguments.iter_mut().zip(arguments) {
+                *raw = argument.raw.as_ptr();
+            }
+            &inline_arguments[..arguments.len()]
+        } else {
+            heap_arguments.reserve(arguments.len());
+            heap_arguments.extend(
+                arguments
+                    .iter()
+                    .map(|argument| argument.raw.as_ptr().cast_const()),
+            );
+            &heap_arguments
+        };
+        let argument_pointer = if raw_arguments.is_empty() {
+            ptr::null()
+        } else {
+            raw_arguments.as_ptr()
+        };
+        let mut exception = ptr::null();
+        // SAFETY: All handles were validated against this live scope. The result
+        // or exception is captured before any argument can leave the call.
+        let raw = unsafe {
+            sys::object_call_as_function(
+                self.backend.raw.as_ptr(),
+                function.raw.as_ptr(),
+                receiver,
+                raw_arguments.len(),
+                argument_pointer,
+                &raw mut exception,
+            )
+        };
+        if !exception.is_null() {
+            return Err(BackendError::Exception(
+                exception_to_owned(self.backend.raw, exception).into(),
+            ));
+        }
+        self.local_result(raw, reservation)
+    }
+
     fn kind<'value>(&'value self, value: Self::Value<'value>) -> Result<ValueKind, BackendError> {
         self.ensure_value(value)?;
         self.raw_kind(value.raw)
@@ -464,6 +547,27 @@ impl JscScope<'_, '_> {
             "JavaScriptCore returned a null value",
         ))?;
         Ok(self.root_nonnull(raw, reservation))
+    }
+
+    fn local_result(
+        &self,
+        raw: sys::ValueRef,
+        reservation: Reservation<'_>,
+    ) -> Result<JscValue<'_>, BackendError> {
+        let raw = NonNull::new(raw.cast_mut()).ok_or(BackendError::Failure(
+            "JavaScriptCore returned a null value without an exception",
+        ))?;
+        // SAFETY: The call result belongs to this live context. Scalar primitives
+        // do not require protection; managed values are rooted before returning.
+        let kind = unsafe { sys::value_get_type(self.backend.raw.as_ptr(), raw.as_ptr()) };
+        if matches!(
+            kind,
+            sys::TYPE_STRING | sys::TYPE_OBJECT | sys::TYPE_SYMBOL | sys::TYPE_BIG_INT
+        ) {
+            Ok(self.root_nonnull(raw, reservation))
+        } else {
+            Ok(self.value(raw))
+        }
     }
 
     fn root_nonnull(
@@ -644,6 +748,75 @@ mod tests {
     }
 
     #[test]
+    fn calls_javascript_with_explicit_receivers_and_heap_arguments() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let function = scope
+                    .evaluate(
+                        "(function(...xs) { return this.answer + xs.reduce((a, b) => a + b, 0); })",
+                        "call.js",
+                    )
+                    .unwrap();
+                let receiver = scope.evaluate("({ answer: 30 })", "call.js").unwrap();
+                let one = scope.number(1.0).unwrap();
+                let result = scope
+                    .call(function, CallReceiver::Object(receiver), &[one; 12])
+                    .unwrap();
+                assert_eq!(scope.as_number(result), Ok(42.0));
+                let global = scope
+                    .evaluate(
+                        "(function() { 'use strict'; return this === globalThis; })",
+                        "call.js",
+                    )
+                    .unwrap();
+                let result = scope.call(global, CallReceiver::Global, &[]).unwrap();
+                assert_eq!(scope.as_boolean(result), Ok(true));
+                assert!(matches!(
+                    scope.call(one, CallReceiver::Global, &[]),
+                    Err(BackendError::Type {
+                        expected: ValueKind::Function,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    scope.call(function, CallReceiver::Object(one), &[]),
+                    Err(BackendError::Type {
+                        expected: ValueKind::Object,
+                        ..
+                    })
+                ));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn call_results_survive_gc_and_exceptions_allow_recovery() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let function = scope
+                    .evaluate("(() => ({ answer: 42 }))", "call.js")
+                    .unwrap();
+                let result = scope.call(function, CallReceiver::Global, &[]).unwrap();
+                // SAFETY: The scope is inside a live host-authorized engine entry.
+                unsafe { sys::garbage_collect(scope.backend.raw.as_ptr()) };
+                assert_eq!(scope.kind(result), Ok(ValueKind::Object));
+                let throwing = scope
+                    .evaluate("(() => { throw new Error('call failed'); })", "call.js")
+                    .unwrap();
+                assert!(matches!(
+                    scope.call(throwing, CallReceiver::Global, &[]),
+                    Err(BackendError::Exception(_))
+                ));
+                assert!(scope.call(function, CallReceiver::Global, &[]).is_ok());
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn common_roots_share_the_configured_registry_limit() {
         let mut runtime = Runtime::new_with_persistent_root_limit(1).unwrap();
         runtime
@@ -658,6 +831,85 @@ mod tests {
                 );
                 scope.release(root).unwrap();
                 scope.persist(second).unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn call_rejects_foreign_values_before_execution() {
+        let mut first = Runtime::new().unwrap();
+        let mut second = Runtime::new().unwrap();
+        first
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let function = scope
+                    .evaluate("(() => { throw 'must not execute'; })", "foreign.js")
+                    .unwrap();
+                second
+                    .with_backend(|other| {
+                        let foreign = other.open_scope().unwrap();
+                        let number = foreign.number(1.0).unwrap();
+                        assert_eq!(
+                            scope.call(function, CallReceiver::Global, &[number]),
+                            Err(BackendError::WrongBackend)
+                        );
+                        assert_eq!(
+                            scope.call(number, CallReceiver::Global, &[]),
+                            Err(BackendError::WrongBackend)
+                        );
+                        assert_eq!(
+                            scope.call(function, CallReceiver::Object(number), &[]),
+                            Err(BackendError::WrongBackend)
+                        );
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn call_reserves_result_capacity_before_javascript_side_effects() {
+        let mut runtime = Runtime::new().unwrap();
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let function = scope
+                    .evaluate("(() => { throw 'must not execute'; })", "quota.js")
+                    .unwrap();
+                let remaining = scope
+                    .backend
+                    .shared
+                    .local_budget
+                    .reserve_many(4095)
+                    .unwrap();
+                assert_eq!(
+                    scope.call(function, CallReceiver::Global, &[]),
+                    Err(BackendError::Failure("local result root limit reached"))
+                );
+                drop(remaining);
+                assert!(matches!(
+                    scope.call(function, CallReceiver::Global, &[]),
+                    Err(BackendError::Exception(_))
+                ));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn scalar_calls_refund_result_capacity() {
+        let mut runtime = Runtime::new_with_root_limits(super::super::RootLimits {
+            persistent_slots: 0,
+            local_roots: 2,
+        })
+        .unwrap();
+        runtime
+            .with_backend(|backend| {
+                let scope = backend.open_scope().unwrap();
+                let function = scope.evaluate("(() => 42)", "scalar.js").unwrap();
+                for _ in 0..8192 {
+                    let value = scope.call(function, CallReceiver::Global, &[]).unwrap();
+                    assert_eq!(scope.as_number(value), Ok(42.0));
+                }
             })
             .unwrap();
     }

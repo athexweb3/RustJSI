@@ -24,8 +24,8 @@ pub use lifecycle::{
     RuntimeState,
 };
 pub use model::{
-    Evaluation, ExternalBufferStats, ModelBackend, ModelBufferView, ModelRoot, ModelScope,
-    ModelValue, Primitive,
+    Evaluation, ExternalBufferStats, Invocation, ModelBackend, ModelBufferView, ModelRoot,
+    ModelScope, ModelValue, Primitive,
 };
 pub use model_entry::{ModelBackendFamily, ModelEntry, ModelEntryScope};
 pub use model_host::ModelHost;

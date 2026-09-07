@@ -2,8 +2,8 @@
 
 use rustjsi_backend::{
     BACKEND_CONTRACT_VERSION, BackendBase, BackendError, BackendException, BackendManifest,
-    BackendScope, BorrowedBufferScope, Capability, CapabilitySet, OwnedExternalBufferScope,
-    OwnershipTransferError, RootBackend, RootScope, ValueKind,
+    BackendScope, BorrowedBufferScope, CallReceiver, Capability, CapabilitySet,
+    OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -31,6 +31,19 @@ pub enum Primitive {
 /// A pre-programmed result for one deterministic evaluation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Evaluation {
+    /// Return a newly allocated primitive.
+    Return(Primitive),
+    /// Return a newly allocated deterministic callable value.
+    ReturnFunction,
+    /// Return a contained JavaScript exception.
+    Throw(String),
+    /// Return a contained backend failure.
+    Fail(&'static str),
+}
+
+/// A pre-programmed result for one deterministic function call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Invocation {
     /// Return a newly allocated primitive.
     Return(Primitive),
     /// Return a contained JavaScript exception.
@@ -65,7 +78,9 @@ impl AsRef<[u8]> for ModelBufferView<'_> {
     fn as_ref(&self) -> &[u8] {
         match &*self.entry {
             ModelValueEntry::External(bytes) => bytes,
-            ModelValueEntry::Primitive(_) => unreachable!("validated buffer changed kind"),
+            ModelValueEntry::Primitive(_) | ModelValueEntry::Function => {
+                unreachable!("validated buffer changed kind")
+            }
         }
     }
 }
@@ -136,12 +151,14 @@ struct ModelState {
     values: SlotMap<ModelValueEntry>,
     roots: SlotMap<ValueId>,
     evaluations: VecDeque<Evaluation>,
+    invocations: VecDeque<Invocation>,
     stats: ExternalBufferStats,
 }
 
 #[derive(Debug)]
 enum ModelValueEntry {
     Primitive(Primitive),
+    Function,
     External(Box<[u8]>),
 }
 
@@ -202,6 +219,11 @@ impl ModelBackend {
     /// Enqueues one exact evaluation outcome.
     pub fn push_evaluation(&mut self, evaluation: Evaluation) {
         self.state.get_mut().evaluations.push_back(evaluation);
+    }
+
+    /// Enqueues one exact function-call outcome.
+    pub fn push_invocation(&mut self, invocation: Invocation) {
+        self.state.get_mut().invocations.push_back(invocation);
     }
 
     /// Makes the next external-buffer transfer fail before ownership changes.
@@ -341,12 +363,49 @@ impl BackendScope for ModelScope<'_> {
         let evaluation = self.backend.state.borrow_mut().evaluations.pop_front();
         match evaluation {
             Some(Evaluation::Return(value)) => Ok(self.primitive(value)),
+            Some(Evaluation::ReturnFunction) => Ok(self.insert(ModelValueEntry::Function)),
             Some(Evaluation::Throw(message)) => {
                 Err(BackendError::Exception(BackendException::new(message)))
             }
             Some(Evaluation::Fail(message)) => Err(BackendError::Failure(message)),
             None => Err(BackendError::Failure(
                 "deterministic evaluation was not programmed",
+            )),
+        }
+    }
+
+    fn call<'value>(
+        &'value self,
+        function: Self::Value<'value>,
+        receiver: CallReceiver<Self::Value<'value>>,
+        arguments: &[Self::Value<'value>],
+    ) -> Result<Self::Value<'value>, BackendError> {
+        self.require_kind(function, ValueKind::Function)?;
+        if let CallReceiver::Object(receiver) = receiver {
+            let actual = self.validate(receiver)?;
+            if !matches!(
+                actual,
+                ValueKind::Object | ValueKind::Function | ValueKind::Buffer
+            ) {
+                return Err(BackendError::Type {
+                    expected: ValueKind::Object,
+                    actual,
+                });
+            }
+        }
+        for argument in arguments {
+            self.validate(*argument)?;
+        }
+
+        let invocation = self.backend.state.borrow_mut().invocations.pop_front();
+        match invocation {
+            Some(Invocation::Return(value)) => Ok(self.primitive(value)),
+            Some(Invocation::Throw(message)) => {
+                Err(BackendError::Exception(BackendException::new(message)))
+            }
+            Some(Invocation::Fail(message)) => Err(BackendError::Failure(message)),
+            None => Err(BackendError::Failure(
+                "deterministic invocation was not programmed",
             )),
         }
     }
@@ -365,7 +424,12 @@ impl BackendScope for ModelScope<'_> {
             .get(id.slot, id.generation)
         {
             Some(ModelValueEntry::Primitive(Primitive::Boolean(value))) => Ok(*value),
-            Some(ModelValueEntry::Primitive(_) | ModelValueEntry::External(_)) | None => {
+            Some(
+                ModelValueEntry::Primitive(_)
+                | ModelValueEntry::Function
+                | ModelValueEntry::External(_),
+            )
+            | None => {
                 unreachable!("validated model entry changed kind")
             }
         }
@@ -381,7 +445,12 @@ impl BackendScope for ModelScope<'_> {
             .get(id.slot, id.generation)
         {
             Some(ModelValueEntry::Primitive(Primitive::Number(value))) => Ok(*value),
-            Some(ModelValueEntry::Primitive(_) | ModelValueEntry::External(_)) | None => {
+            Some(
+                ModelValueEntry::Primitive(_)
+                | ModelValueEntry::Function
+                | ModelValueEntry::External(_),
+            )
+            | None => {
                 unreachable!("validated model entry changed kind")
             }
         }
@@ -397,7 +466,12 @@ impl BackendScope for ModelScope<'_> {
             .get(id.slot, id.generation)
         {
             Some(ModelValueEntry::Primitive(Primitive::String(value))) => Ok(value.clone()),
-            Some(ModelValueEntry::Primitive(_) | ModelValueEntry::External(_)) | None => {
+            Some(
+                ModelValueEntry::Primitive(_)
+                | ModelValueEntry::Function
+                | ModelValueEntry::External(_),
+            )
+            | None => {
                 unreachable!("validated model entry changed kind")
             }
         }
@@ -537,6 +611,7 @@ impl ModelValueEntry {
             Self::Primitive(Primitive::Boolean(_)) => ValueKind::Boolean,
             Self::Primitive(Primitive::Number(_)) => ValueKind::Number,
             Self::Primitive(Primitive::String(_)) => ValueKind::String,
+            Self::Function => ValueKind::Function,
             Self::External(_) => ValueKind::Buffer,
         }
     }

@@ -18,6 +18,12 @@ owned external buffers. They deliberately do not advertise borrowed buffer
 bytes because JSC documents its backing-store pointer as temporary across API
 calls.
 
+Common scopes can call JavaScript functions through `BackendScope::call`.
+Arguments are existing scoped values; up to eight handles use inline storage.
+The call reserves result capacity before execution, roots managed results, and
+refunds that capacity for scalar results or exceptions. Receivers are explicitly
+the global object or an existing object-like value.
+
 The standalone `Runtime` is also the sole owner of its JSC global context.
 Shared attachment registries never cache that raw context or gain independent
 engine-entry authority. An admitted entry temporarily installs the runtime and

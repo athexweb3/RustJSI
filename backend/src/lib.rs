@@ -17,7 +17,7 @@ mod family;
 pub use family::BackendFamily;
 
 /// The current source-level backend contract version.
-pub const BACKEND_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0);
+pub const BACKEND_CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0);
 
 /// A version of the source-level backend contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -272,6 +272,18 @@ pub enum ValueKind {
     Buffer,
 }
 
+/// Receiver selection for a synchronous JavaScript function call.
+///
+/// The global mode is explicit because some engine APIs cannot represent an
+/// unbound or primitive receiver without changing JavaScript semantics.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CallReceiver<V> {
+    /// Use the backend runtime's global object as `this`.
+    Global,
+    /// Use an object-like scoped value as `this`.
+    Object(V),
+}
+
 /// An exception copied out of an engine call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendException {
@@ -470,6 +482,25 @@ pub trait BackendScope {
     ///
     /// Returns a captured JavaScript exception or contained engine failure.
     fn evaluate(&self, source: &str, source_url: &str) -> Result<Self::Value<'_>, BackendError>;
+
+    /// Calls a JavaScript function synchronously in this engine scope.
+    ///
+    /// The function, optional receiver, and arguments must belong to this
+    /// backend instance. `CallReceiver::Object` accepts object, function, and
+    /// buffer values; scalar receivers are rejected rather than coerced.
+    /// JavaScript execution may throw, allocate, trigger GC, or re-enter Rust.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for a non-callable function or scalar object
+    /// receiver, rejects foreign or stale values, and contains JavaScript or
+    /// backend failures.
+    fn call<'value>(
+        &'value self,
+        function: Self::Value<'value>,
+        receiver: CallReceiver<Self::Value<'value>>,
+        arguments: &[Self::Value<'value>],
+    ) -> Result<Self::Value<'value>, BackendError>;
 
     /// Returns a value's semantic kind without coercion.
     ///
