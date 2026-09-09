@@ -143,6 +143,22 @@ python3 -B -m unittest discover -s bench -p 'test_*.py'
 
 ## Callback profiling
 
+The `js_calls` benchmark compares prepared scalar calls to a JavaScript
+function through direct JSC and common backend scopes:
+
+```sh
+cargo bench -p rustjsi-backend-jsc --features experimental-jsc --bench js_calls
+RUSTJSI_JS_CALL_ORDER=common,direct cargo bench -p rustjsi-backend-jsc --features experimental-jsc --bench js_calls
+```
+
+Both paths create two numbers, check callability, use the global receiver,
+classify the result, and perform a strict numeric read per call. Setup and
+teardown are excluded. The common path additionally validates identities and
+reserves result capacity. Each workload validates 42 before and after timing.
+Results are single process means, without tail or allocation measurements.
+They cannot be subtracted from the host-callback benchmark to isolate dispatch
+cost because its API and result-reading workload differ.
+
 On macOS, capture one long-running callback workload with debug symbols and
 Apple's sampling profiler:
 
