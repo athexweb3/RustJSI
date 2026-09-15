@@ -38,6 +38,25 @@ class CallbackProfileTests(unittest.TestCase):
                 output + "\n" + json.dumps(artifact)
             )
 
+    def test_js_call_profile_target_and_workloads_are_explicit(self):
+        spec = callback_profile.profile_spec("js-call")
+        self.assertEqual(spec["target"], "js_call_profile")
+        self.assertEqual(spec["environment"], "RUSTJSI_JS_CALL_PROFILE")
+        self.assertEqual(spec["workloads"], {"direct", "common"})
+        with self.assertRaisesRegex(ValueError, "unsupported profile target"):
+            callback_profile.profile_spec("unknown")
+        artifact = {
+            "reason": "compiler-artifact",
+            "target": {"name": "js_call_profile", "kind": ["bench"]},
+            "executable": "/tmp/js-call-profile",
+        }
+        self.assertEqual(
+            callback_profile.executable_from_cargo(
+                json.dumps(artifact), "js_call_profile"
+            ),
+            Path("/tmp/js-call-profile"),
+        )
+
     def test_saved_process_output_is_exclusive(self):
         result = subprocess.CompletedProcess([], 0, "stdout", "stderr")
         with tempfile.TemporaryDirectory() as temporary:
@@ -68,6 +87,16 @@ class CallbackProfileTests(unittest.TestCase):
             with patch.object(callback_profile.platform, "system", return_value="Darwin"):
                 with self.assertRaisesRegex(ValueError, "unsupported"):
                     callback_profile.capture(output, "unknown", 1, 1, 1, "1.98.0")
+            self.assertFalse(output.exists())
+
+    def test_js_call_capture_rejects_wrong_workload_before_writing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "capture"
+            with patch.object(callback_profile.platform, "system", return_value="Darwin"):
+                with self.assertRaisesRegex(ValueError, "unsupported"):
+                    callback_profile.capture(
+                        output, "rustjsi", 1, 1, 1, "1.98.0", "js-call"
+                    )
             self.assertFalse(output.exists())
 
 

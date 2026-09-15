@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Capture a compiler-pinned macOS sample of one JSC callback workload."""
+"""Capture a compiler-pinned macOS sample of one JSC call workload."""
 
 import argparse
 import datetime
@@ -15,6 +15,18 @@ import boundary
 
 PROFILE_TARGET = "callback_profile"
 WORKLOADS = {"reused", "prepared", "rustjsi"}
+PROFILE_SPECS = {
+    "callback": {
+        "target": PROFILE_TARGET,
+        "environment": "RUSTJSI_CALLBACK_PROFILE",
+        "workloads": WORKLOADS,
+    },
+    "js-call": {
+        "target": "js_call_profile",
+        "environment": "RUSTJSI_JS_CALL_PROFILE",
+        "workloads": {"direct", "common"},
+    },
+}
 DEFAULT_ITERATIONS = 200_000_000
 MAX_ITERATIONS = 2**32 - 1
 
@@ -26,22 +38,29 @@ def positive_int(value, maximum):
     return parsed
 
 
-def executable_from_cargo(output):
+def profile_spec(profile):
+    try:
+        return PROFILE_SPECS[profile]
+    except KeyError as error:
+        raise ValueError("unsupported profile target") from error
+
+
+def executable_from_cargo(output, target=PROFILE_TARGET):
     executable = None
     for line in output.splitlines():
         message = json.loads(line)
         if (
             message.get("reason") == "compiler-artifact"
-            and message.get("target", {}).get("name") == PROFILE_TARGET
+            and message.get("target", {}).get("name") == target
             and "bench" in message.get("target", {}).get("kind", [])
             and message.get("executable")
         ):
             candidate = Path(message["executable"])
             if executable is not None and executable != candidate:
-                raise ValueError("Cargo reported multiple callback profile executables")
+                raise ValueError("Cargo reported multiple profile executables")
             executable = candidate
     if executable is None:
-        raise ValueError("Cargo did not report the callback profile executable")
+        raise ValueError("Cargo did not report the profile executable")
     return executable
 
 
@@ -64,11 +83,14 @@ def require_ignored_output(directory):
         raise ValueError("output inside the repository must be Git-ignored")
 
 
-def capture(directory, workload, iterations, duration, interval, toolchain):
+def capture(
+    directory, workload, iterations, duration, interval, toolchain, profile="callback"
+):
     if platform.system() != "Darwin":
-        raise ValueError("callback sampling requires macOS system JavaScriptCore")
-    if workload not in WORKLOADS:
-        raise ValueError("unsupported callback workload")
+        raise ValueError("call sampling requires macOS system JavaScriptCore")
+    spec = profile_spec(profile)
+    if workload not in spec["workloads"]:
+        raise ValueError("unsupported profile workload")
     require_ignored_output(directory)
     directory.mkdir(parents=True, exist_ok=False)
     process = None
@@ -79,7 +101,7 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
         build = [
             "rustup", "run", toolchain, "cargo", "bench", "--locked",
             "-p", "rustjsi-backend-jsc", "--features", "experimental-jsc",
-            "--bench", PROFILE_TARGET, "--no-run", "--message-format=json",
+            "--bench", spec["target"], "--no-run", "--message-format=json",
         ]
         built = subprocess.run(
             build,
@@ -93,7 +115,7 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
         save_process(built, directory, "build")
         if built.returncode:
             raise RuntimeError(f"build exited with {built.returncode}; see saved stderr")
-        executable = executable_from_cargo(built.stdout)
+        executable = executable_from_cargo(built.stdout, spec["target"])
         binary_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
         profile = directory / "profile.txt"
         sample_command_template = [
@@ -101,8 +123,9 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
             "-mayDie", "-fullPaths", "-file", str(profile),
         ]
         metadata = {
-            "schema": 1,
-            "benchmark": PROFILE_TARGET,
+            "schema": 2,
+            "profile": profile,
+            "benchmark": spec["target"],
             "workload": workload,
             "iterations": iterations,
             "sample_duration_seconds": duration,
@@ -135,7 +158,7 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
         boundary.write_json(directory / "metadata.json", metadata)
 
         environment = os.environ.copy()
-        environment["RUSTJSI_CALLBACK_PROFILE"] = workload
+        environment[spec["environment"]] = workload
         environment["RUSTJSI_PROFILE_ITERATIONS"] = str(iterations)
         process = subprocess.Popen(
             [str(executable)],
@@ -175,7 +198,7 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
         if final_stamp != stamp:
             raise RuntimeError("source state changed during capture")
         if hashlib.sha256(executable.read_bytes()).hexdigest() != binary_hash:
-            raise RuntimeError("callback profile executable changed during capture")
+            raise RuntimeError("profile executable changed during capture")
         boundary.write_json(directory / "complete.json", {
             "source": final_stamp,
             "binary_sha256": binary_hash,
@@ -197,7 +220,8 @@ def capture(directory, workload, iterations, duration, interval, toolchain):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--workload", choices=sorted(WORKLOADS), required=True)
+    parser.add_argument("--target", choices=sorted(PROFILE_SPECS), default="callback")
+    parser.add_argument("--workload", required=True)
     parser.add_argument(
         "--iterations",
         type=lambda value: positive_int(value, MAX_ITERATIONS),
@@ -219,6 +243,7 @@ def main():
             args.duration,
             args.interval_ms,
             args.toolchain,
+            args.target,
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"callback-profile: {error}\n")
