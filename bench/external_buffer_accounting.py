@@ -97,6 +97,7 @@ def collect(directory, toolchain):
         raise ValueError("external-buffer accounting requires macOS system JavaScriptCore")
     require_ignored_output(directory)
     directory.mkdir(parents=True, exist_ok=False)
+    started_utc = datetime.datetime.now(datetime.UTC).isoformat()
     stamp = boundary.source_stamp()
     environment = boundary.compiler_environment(toolchain)
     build = [
@@ -132,7 +133,7 @@ def collect(directory, toolchain):
     metadata = {
         "schema": 1,
         "benchmark": BENCHMARK,
-        "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+        "started_utc": started_utc,
         "source": stamp,
         "build_command": build,
         "compiler_selection": "explicit",
