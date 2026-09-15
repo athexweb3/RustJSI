@@ -84,11 +84,11 @@ def require_ignored_output(directory):
 
 
 def capture(
-    directory, workload, iterations, duration, interval, toolchain, profile="callback"
+    directory, workload, iterations, duration, interval, toolchain, profile_name="callback"
 ):
     if platform.system() != "Darwin":
         raise ValueError("call sampling requires macOS system JavaScriptCore")
-    spec = profile_spec(profile)
+    spec = profile_spec(profile_name)
     if workload not in spec["workloads"]:
         raise ValueError("unsupported profile workload")
     require_ignored_output(directory)
@@ -117,14 +117,14 @@ def capture(
             raise RuntimeError(f"build exited with {built.returncode}; see saved stderr")
         executable = executable_from_cargo(built.stdout, spec["target"])
         binary_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
-        profile = directory / "profile.txt"
+        profile_path = directory / "profile.txt"
         sample_command_template = [
             "/usr/bin/sample", "<pid>", str(duration), str(interval),
-            "-mayDie", "-fullPaths", "-file", str(profile),
+            "-mayDie", "-fullPaths", "-file", str(profile_path),
         ]
         metadata = {
             "schema": 2,
-            "profile": profile,
+            "profile": profile_name,
             "benchmark": spec["target"],
             "workload": workload,
             "iterations": iterations,
@@ -192,7 +192,7 @@ def capture(
             raise RuntimeError(
                 f"workload exited with {process.returncode}; see saved stderr"
             )
-        if not profile.is_file() or profile.stat().st_size == 0:
+        if not profile_path.is_file() or profile_path.stat().st_size == 0:
             raise RuntimeError("sample did not produce a profile")
         final_stamp = boundary.source_stamp()
         if final_stamp != stamp:
@@ -205,7 +205,7 @@ def capture(
             "completed_utc": datetime.datetime.now(datetime.UTC).isoformat(),
         })
         return metadata
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+    except (OSError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         if process is not None and process.poll() is None:
             process.terminate()
             try:

@@ -57,6 +57,52 @@ class CallbackProfileTests(unittest.TestCase):
             Path("/tmp/js-call-profile"),
         )
 
+    def test_js_call_capture_records_selector_without_path_serialization(self):
+        class Process:
+            pid = 123
+            returncode = 0
+
+            def communicate(self, timeout):
+                assert timeout == 300
+                return "profile output", ""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "js-call-profile"
+            executable.write_bytes(b"profile executable")
+            output = root / "capture"
+            artifact = json.dumps({
+                "reason": "compiler-artifact",
+                "target": {"name": "js_call_profile", "kind": ["bench"]},
+                "executable": str(executable),
+            })
+
+            def run(arguments, **_kwargs):
+                if arguments[0] == "rustup":
+                    return subprocess.CompletedProcess(arguments, 0, artifact, "")
+                profile = Path(arguments[-1])
+                profile.write_text("sample")
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            stamp = {"head": "test"}
+            with (
+                patch.object(callback_profile.platform, "system", return_value="Darwin"),
+                patch.object(callback_profile.boundary, "source_stamp", side_effect=[stamp, stamp]),
+                patch.object(callback_profile.boundary, "compiler_environment", return_value={
+                    "RUSTC": "/test/rustc", "RUSTDOC": "/test/rustdoc",
+                }),
+                patch.object(callback_profile.boundary, "command", return_value="test metadata"),
+                patch.object(callback_profile.subprocess, "run", side_effect=run),
+                patch.object(callback_profile.subprocess, "Popen", return_value=Process()),
+            ):
+                callback_profile.capture(
+                    output, "direct", 1, 1, 1, "1.98.0", "js-call"
+                )
+            metadata = json.loads((output / "metadata.json").read_text())
+            self.assertEqual(metadata["profile"], "js-call")
+            self.assertEqual(metadata["benchmark"], "js_call_profile")
+            self.assertTrue((output / "complete.json").is_file())
+
     def test_saved_process_output_is_exclusive(self):
         result = subprocess.CompletedProcess([], 0, "stdout", "stderr")
         with tempfile.TemporaryDirectory() as temporary:
