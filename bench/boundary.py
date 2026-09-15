@@ -85,7 +85,21 @@ JS_CALL_METRICS = {
     "direct": "direct_jsc_js_call",
     "common": "rustjsi_common_js_call",
 }
-SCHEMA = 11
+SCHEMA = 12
+HOST_SYSCTL_KEYS = {
+    "model": "hw.model",
+    "logical_cpus": "hw.logicalcpu",
+    "physical_cpus": "hw.physicalcpu",
+    "memory_bytes": "hw.memsize",
+    "performance_level_0_physical_cpus": "hw.perflevel0.physicalcpu",
+    "performance_level_1_physical_cpus": "hw.perflevel1.physicalcpu",
+}
+HOST_ENVIRONMENT_LIMITS = (
+    "does_not_pin_cpu_or_frequency",
+    "does_not_measure_thermal_state",
+    "does_not_exclude_background_work",
+    "does_not_make_a_performance_gate_qualified",
+)
 
 
 def valid_run_count(value):
@@ -529,6 +543,48 @@ def command(arguments, *, cwd=ROOT):
     return result.stdout.strip()
 
 
+def optional_command(arguments):
+    """Capture a host fact without making an optional platform detail fatal."""
+    try:
+        return {"status": "available", "output": command(arguments)}
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unavailable"}
+
+
+def host_environment():
+    """Record collection context; this is evidence, not machine isolation."""
+    return {
+        "kind": "collection_context_not_isolation",
+        "sysctl": {
+            name: optional_command(["sysctl", "-n", key])
+            for name, key in HOST_SYSCTL_KEYS.items()
+        },
+        "power_policy": optional_command(["pmset", "-g", "custom"]),
+        "limits": list(HOST_ENVIRONMENT_LIMITS),
+    }
+
+
+def valid_host_environment(value):
+    if not isinstance(value, dict):
+        return False
+    if value.get("kind") != "collection_context_not_isolation":
+        return False
+    sysctls = value.get("sysctl")
+    if not isinstance(sysctls, dict) or sysctls.keys() != HOST_SYSCTL_KEYS.keys():
+        return False
+    fields = (*sysctls.values(), value.get("power_policy"))
+    for field in fields:
+        if not isinstance(field, dict) or field.get("status") not in {
+            "available", "unavailable"
+        }:
+            return False
+        if field["status"] == "available" and not isinstance(field.get("output"), str):
+            return False
+        if field["status"] == "unavailable" and set(field) != {"status"}:
+            return False
+    return value.get("limits") == list(HOST_ENVIRONMENT_LIMITS)
+
+
 def source_stamp():
     # Ignored files are excluded; only hashes of public worktree contents are saved.
     diff = subprocess.run(
@@ -639,6 +695,7 @@ def read_report(directory):
         metadata.get("schema") != SCHEMA
         or metadata.get("benchmark") != "boundary"
         or not valid_binary_hashes(metadata.get("binary_sha256"))
+        or not valid_host_environment(metadata.get("host_environment"))
         or metadata.get("callback_ordering") != CALLBACK_ORDERING
         or metadata.get("js_call_ordering") != JS_CALL_ORDERING
     ):
@@ -725,6 +782,7 @@ def collect(directory, runs, toolchain):
             "os": command(["sw_vers"]),
             "architecture": platform.machine(),
             "cpu": command(["sysctl", "-n", "machdep.cpu.brand_string"]),
+            "host_environment": host_environment(),
             "sdk": command(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
             "binary_sha256": binary_hashes,
             "environment_overrides": {

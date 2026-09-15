@@ -326,6 +326,51 @@ class SampleTests(unittest.TestCase):
 class ArtifactTests(unittest.TestCase):
     HASHES = {name: "a" * 64 for name in boundary.BENCHMARKS}
 
+    @staticmethod
+    def host_environment():
+        return {
+            "kind": "collection_context_not_isolation",
+            "sysctl": {
+                name: {"status": "available", "output": "test"}
+                for name in boundary.HOST_SYSCTL_KEYS
+            },
+            "power_policy": {"status": "unavailable"},
+            "limits": list(boundary.HOST_ENVIRONMENT_LIMITS),
+        }
+
+    def test_host_environment_records_optional_facts_without_claiming_control(self):
+        values = {
+            ("sysctl", "-n", "hw.model"): "TestMac",
+            ("sysctl", "-n", "hw.logicalcpu"): "10",
+            ("sysctl", "-n", "hw.physicalcpu"): "10",
+            ("sysctl", "-n", "hw.memsize"): "17179869184",
+            ("sysctl", "-n", "hw.perflevel0.physicalcpu"): "4",
+            ("sysctl", "-n", "hw.perflevel1.physicalcpu"): "6",
+            ("pmset", "-g", "custom"): "AC Power:\n lowpowermode 0",
+        }
+        with patch.object(boundary, "command", side_effect=lambda args: values[tuple(args)]):
+            snapshot = boundary.host_environment()
+        self.assertTrue(boundary.valid_host_environment(snapshot))
+        self.assertEqual(snapshot["kind"], "collection_context_not_isolation")
+        self.assertIn("does_not_measure_thermal_state", snapshot["limits"])
+        self.assertEqual(snapshot["sysctl"]["model"]["output"], "TestMac")
+
+    def test_host_environment_tolerates_unavailable_optional_fields(self):
+        with patch.object(boundary, "command", side_effect=OSError("missing")):
+            snapshot = boundary.host_environment()
+        self.assertTrue(boundary.valid_host_environment(snapshot))
+        self.assertEqual(snapshot["power_policy"], {"status": "unavailable"})
+
+    def test_host_environment_validation_rejects_ambiguous_or_overclaimed_records(self):
+        valid = self.host_environment()
+        self.assertTrue(boundary.valid_host_environment(valid))
+        invalid = dict(valid)
+        invalid["kind"] = "isolated_machine"
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["sysctl"] = {"model": {"status": "available"}}
+        self.assertFalse(boundary.valid_host_environment(invalid))
+
     def test_cargo_executable_selection(self):
         output = json.dumps({"reason": "build-finished", "success": True}) + "\n"
         with self.assertRaises(ValueError):
@@ -361,6 +406,7 @@ class ArtifactTests(unittest.TestCase):
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
                 "source": {"head": "test"},
                 "binary_sha256": self.HASHES,
+                "host_environment": self.host_environment(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
             }
@@ -513,6 +559,7 @@ class ArtifactTests(unittest.TestCase):
                 "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
                 "source": {"head": "before"},
                 "binary_sha256": self.HASHES,
+                "host_environment": self.host_environment(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
             }
@@ -548,11 +595,12 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(hashes=hashes), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 boundary.write_json(directory / "metadata.json", {
-                    "schema": boundary.SCHEMA,
-                    "benchmark": "boundary",
-                    "runs": 12,
+                "schema": boundary.SCHEMA,
+                "benchmark": "boundary",
+                "runs": 12,
                     "source": {"head": "before"},
                     "binary_sha256": hashes,
+                    "host_environment": self.host_environment(),
                 })
                 boundary.write_json(directory / "complete.json", {
                     "source": {"head": "before"}, "binary_sha256": hashes,
