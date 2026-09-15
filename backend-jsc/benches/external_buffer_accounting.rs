@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Exact-owner external-buffer probe for the direct JavaScriptCore route.
+//! Exact-owner external-buffer probe for the direct `JavaScriptCore` route.
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -16,14 +20,17 @@ fn main() {
     });
     let expected_first_byte = first_byte(byte_len);
     let mut runtime = Runtime::new().expect("create external-buffer probe runtime");
-    let buffer = runtime
+    let (buffer, rust_transfer_delta) = runtime
         .with_context(|context| {
+            let owner = payload(byte_len);
+            let before_transfer = allocation::snapshot();
             let buffer = context
                 .install_external_buffer(
                     "__rustjsi_external_buffer_probe",
-                    payload(byte_len),
+                    owner,
                 )
                 .expect("transfer exact external buffer");
+            let rust_transfer_delta = allocation::snapshot().difference(before_transfer);
             let result = context
                 .eval(
                     "(() => {\
@@ -49,7 +56,7 @@ fn main() {
                     "external-buffer-accounting-delete.js",
                 )
                 .expect("remove JavaScript buffer reachability");
-            buffer
+            (buffer, rust_transfer_delta)
         })
         .expect("enter external-buffer probe runtime");
 
@@ -64,7 +71,13 @@ fn main() {
         "external_buffer_accounting: payload_bytes={byte_len} \
          backing_origin={origin:?} js_mutation=verified \
          deallocator_origin={deallocator_origin:?} \
-         deallocator_runtime_thread={deallocator_runtime_thread:?}",
+         deallocator_runtime_thread={deallocator_runtime_thread:?} \
+         rust_transfer_allocations={} rust_transfer_allocated_bytes={} \
+         rust_transfer_deallocations={} rust_transfer_deallocated_bytes={}",
+        rust_transfer_delta.allocations,
+        rust_transfer_delta.allocated_bytes,
+        rust_transfer_delta.deallocations,
+        rust_transfer_delta.deallocated_bytes,
     );
 }
 
@@ -105,6 +118,97 @@ fn collect_until_deallocated(
             .expect("enter external-buffer collection runtime");
     }
     panic!("external buffer owner was not deallocated");
+}
+
+#[cfg(target_os = "macos")]
+mod allocation {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) struct CountingAllocator;
+
+    // SAFETY: Every operation delegates to `System` with the original pointer and
+    // layout. Counters observe Rust allocator traffic without changing ownership.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The caller's allocation contract is forwarded to `System`.
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: The caller's allocation contract is forwarded to `System`.
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            record_deallocation(layout.size());
+            // SAFETY: The caller's matching pointer and layout are forwarded.
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            // SAFETY: The live allocation, layout and requested size are forwarded.
+            let replacement = unsafe { System.realloc(pointer, layout, size) };
+            if !replacement.is_null() {
+                record_deallocation(layout.size());
+                record_allocation(size);
+            }
+            replacement
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Snapshot {
+        pub(super) allocations: u64,
+        pub(super) allocated_bytes: u64,
+        pub(super) deallocations: u64,
+        pub(super) deallocated_bytes: u64,
+    }
+
+    impl Snapshot {
+        pub(super) fn difference(self, earlier: Self) -> Self {
+            Self {
+                allocations: self.allocations.wrapping_sub(earlier.allocations),
+                allocated_bytes: self.allocated_bytes.wrapping_sub(earlier.allocated_bytes),
+                deallocations: self.deallocations.wrapping_sub(earlier.deallocations),
+                deallocated_bytes: self
+                    .deallocated_bytes
+                    .wrapping_sub(earlier.deallocated_bytes),
+            }
+        }
+    }
+
+    pub(super) fn snapshot() -> Snapshot {
+        Snapshot {
+            allocations: ALLOCATIONS.load(Ordering::Relaxed),
+            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+            deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
+            deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_allocation(size: usize) {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
+
+    fn record_deallocation(size: usize) {
+        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
