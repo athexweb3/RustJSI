@@ -140,7 +140,12 @@ power/thermal conditions separately. Do not run collection alongside builds or
 test suites.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
-entire environment. The source fingerprint covers tracked and non-ignored
+entire environment. It also records available macOS hardware topology and
+current `pmset` policy in a structured `host_environment` record. Missing
+optional system fields are labelled unavailable rather than guessed. This is
+collection context for comparing artifacts; it does not pin CPU/frequency,
+measure thermal state, exclude background work, or qualify a performance gate.
+The source fingerprint covers tracked and non-ignored
 untracked files; ignored/generated inputs, symlink targets, external Cargo
 configuration and system engine internals are not fully captured. OS build and
 SDK version identify the system-JSC tuple, not a WebKit source revision. The
