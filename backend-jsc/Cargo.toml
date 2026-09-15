@@ -37,6 +37,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "js_call_profile"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "js_calls"
 harness = false
 required-features = ["experimental-jsc"]
