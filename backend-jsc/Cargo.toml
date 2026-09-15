@@ -37,6 +37,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "js_calls"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "root_release"
 harness = false
 required-features = ["experimental-jsc"]
