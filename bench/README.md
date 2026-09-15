@@ -152,6 +152,35 @@ Test the runner without JSC:
 python3 -B -m unittest discover -s bench -p 'test_*.py'
 ```
 
+## External-buffer accounting
+
+On macOS, collect ownership and payload-copy evidence for the direct JSC
+external-buffer route:
+
+```sh
+python3 -B bench/external_buffer_accounting.py \
+  --output bench/results/external-buffer-accounting-001
+```
+
+The collector builds one probe with an explicitly selected compiler, then runs
+0-byte, 1-byte, 4 KiB, and 1 MiB exact `Box<[u8]>` transfers. Each run checks
+the JavaScript mutation path, removes JS reachability, forces bounded GC work,
+and verifies that the registered deleter receives the original allocation.
+
+For a non-empty payload, `payload_copy_bytes: 0` is reported only if JSC's
+immediate backing pointer equals the transferred allocation. That is evidence
+for this named constructor and system-JSC tuple. It does not include wrapper,
+GC, cache, scheduling, or platform costs. Empty payloads have no meaningful
+pointer identity and report no payload-copy number. Rust allocator fields cover
+only Rust-visible allocation in the transfer window; JavaScriptCore and system
+allocation remain `unmeasured`.
+
+The output directory must be outside the repository or Git-ignored. It stores
+compiler/source/SDK/binary metadata, raw output per payload size, parsed
+records, and a completion record after source and binary postflight checks.
+This is an ownership and data-movement diagnostic, not a latency benchmark or
+a general zero-copy claim for other engines or buffer modes.
+
 ## Native sampling profiles
 
 The `js_calls` benchmark compares prepared scalar calls to a JavaScript

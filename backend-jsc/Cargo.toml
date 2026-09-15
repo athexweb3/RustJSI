@@ -42,6 +42,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "external_buffer_accounting"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "js_calls"
 harness = false
 required-features = ["experimental-jsc"]
