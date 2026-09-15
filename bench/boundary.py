@@ -23,12 +23,15 @@ METRICS = {
     "jsc_common_empty_entry": "ns/entry",
     "jsc_foreign_common_empty_entry": "ns/entry",
     "rustjsi_experimental": "ns/call",
+    "direct_jsc_js_call": "ns/call",
+    "rustjsi_common_js_call": "ns/call",
     "direct_jsc_scalar": "ns/round-trip",
     "rustjsi_common_scalar": "ns/round-trip",
 }
 RATIOS = {
     "rustjsi_over_direct",
     "rustjsi_over_prepared",
+    "common_js_call_over_direct",
     "common_scalar_over_direct",
 }
 ENTRY_METRICS = {
@@ -41,7 +44,8 @@ CALLBACK_BATCH_METRICS = {
     "direct_jsc_prepared_call",
     "rustjsi_experimental",
 }
-ALLOCATION_METRICS = ENTRY_METRICS | CALLBACK_BATCH_METRICS
+JS_CALL_BATCH_METRICS = {"direct_jsc_js_call", "rustjsi_common_js_call"}
+ALLOCATION_METRICS = ENTRY_METRICS | CALLBACK_BATCH_METRICS | JS_CALL_BATCH_METRICS
 ITERATIONS = 1_000_000
 ENTRY_BATCHES = 1_000
 ENTRY_BATCH_ITERATIONS = ITERATIONS // ENTRY_BATCHES
@@ -68,7 +72,20 @@ CALLBACK_METRICS = {
     "prepared": "direct_jsc_prepared_call",
     "rustjsi": "rustjsi_experimental",
 }
-SCHEMA = 10
+JS_CALL_ORDERS = ("direct,common", "common,direct")
+JS_CALL_SCHEDULE = tuple(
+    JS_CALL_ORDERS[index % len(JS_CALL_ORDERS)]
+    for index in range(len(CALLBACK_SCHEDULE))
+)
+JS_CALL_ORDERING = {
+    "design": "alternating_pair_across_mirrored_callback_block",
+    "sequence": list(JS_CALL_SCHEDULE),
+}
+JS_CALL_METRICS = {
+    "direct": "direct_jsc_js_call",
+    "common": "rustjsi_common_js_call",
+}
+SCHEMA = 11
 
 
 def valid_run_count(value):
@@ -85,9 +102,11 @@ def parse_sample(output):
     ratios = set()
     entry_batches = {}
     callback_batches = {}
+    js_call_batches = {}
     calibration = {}
     rust_allocations = {}
     callback_order = None
+    js_call_order = None
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -98,6 +117,10 @@ def parse_sample(output):
             if callback_order is not None or payload not in CALLBACK_ORDERS:
                 raise ValueError("invalid or duplicate callback order")
             callback_order = payload
+        elif name == "js_call_order":
+            if js_call_order is not None or payload not in JS_CALL_ORDERS:
+                raise ValueError("invalid or duplicate JavaScript call order")
+            js_call_order = payload
         elif name in METRICS:
             number, separator, unit = payload.partition(" ")
             if not separator or unit != METRICS[name] or name in values:
@@ -147,6 +170,23 @@ def parse_sample(output):
             ):
                 raise ValueError(f"invalid callback batch samples: {metric}")
             callback_batches[metric] = samples
+        elif name.startswith("js_call_batches_"):
+            metric = name.removeprefix("js_call_batches_")
+            match = re.fullmatch(r"([0-9]+) ops/batch (.+) ns/call", payload)
+            if (
+                not match
+                or metric not in JS_CALL_BATCH_METRICS
+                or metric in js_call_batches
+            ):
+                raise ValueError(f"invalid or duplicate JavaScript call batch metric: {metric}")
+            samples = [float(value) for value in match[2].split(",")]
+            if (
+                int(match[1]) != ENTRY_BATCH_ITERATIONS
+                or len(samples) != ENTRY_BATCHES
+                or any(not math.isfinite(value) or value <= 0 for value in samples)
+            ):
+                raise ValueError(f"invalid JavaScript call batch samples: {metric}")
+            js_call_batches[metric] = samples
         elif name == "calibration_timer_pair":
             match = re.fullmatch(r"([0-9]+) samples (.+) ns/pair", payload)
             if not match or name in calibration:
@@ -192,11 +232,13 @@ def parse_sample(output):
         or ratios != RATIOS
         or entry_batches.keys() != ENTRY_METRICS
         or callback_batches.keys() != CALLBACK_BATCH_METRICS
+        or js_call_batches.keys() != JS_CALL_BATCH_METRICS
         or calibration.keys() != {
             "calibration_timer_pair", "calibration_empty_batch"
         }
         or rust_allocations.keys() != ALLOCATION_METRICS
         or callback_order is None
+        or js_call_order is None
     ):
         raise ValueError("incomplete benchmark output")
     for name, samples in entry_batches.items():
@@ -205,13 +247,18 @@ def parse_sample(output):
     for name, samples in callback_batches.items():
         if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
             raise ValueError(f"callback batch mean does not match metric: {name}")
+    for name, samples in js_call_batches.items():
+        if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
+            raise ValueError(f"JavaScript call batch mean does not match metric: {name}")
     return {
         "metrics": values,
         "entry_batches": entry_batches,
         "callback_batches": callback_batches,
+        "js_call_batches": js_call_batches,
         "calibration": calibration,
         "rust_allocations": rust_allocations,
         "callback_order": callback_order,
+        "js_call_order": js_call_order,
     }
 
 
@@ -269,6 +316,19 @@ def summarize(samples):
     }
     if len(set(order_counts.values())) != 1:
         raise ValueError("callback workload orders are not balanced")
+    actual_js_call_orders = [sample["js_call_order"] for sample in samples]
+    expected_js_call_orders = [
+        JS_CALL_SCHEDULE[index % len(JS_CALL_SCHEDULE)]
+        for index in range(len(samples))
+    ]
+    if actual_js_call_orders != expected_js_call_orders:
+        raise ValueError("JavaScript call workload schedule does not match metadata")
+    js_call_order_counts = {
+        order: sum(sample["js_call_order"] == order for sample in samples)
+        for order in JS_CALL_ORDERS
+    }
+    if len(set(js_call_order_counts.values())) != 1:
+        raise ValueError("JavaScript call workload orders are not balanced")
     metrics = {
         name: {
             "unit": unit,
@@ -279,6 +339,7 @@ def summarize(samples):
     pairs = {
         "call_over_lower_bound": ("rustjsi_experimental", "direct_jsc_lower_bound"),
         "call_over_prepared": ("rustjsi_experimental", "direct_jsc_prepared_call"),
+        "common_js_call_over_direct": ("rustjsi_common_js_call", "direct_jsc_js_call"),
         "common_scalar_over_direct": ("rustjsi_common_scalar", "direct_jsc_scalar"),
     }
     return {
@@ -297,6 +358,11 @@ def summarize(samples):
             "counts": order_counts,
         },
         "callback_position_effects": summarize_callback_positions(samples),
+        "js_call_ordering": {
+            "design": "alternating_pair_across_mirrored_callback_block",
+            "counts": js_call_order_counts,
+        },
+        "js_call_position_effects": summarize_js_call_positions(samples),
         "callback_batch_latency": {
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
@@ -307,6 +373,18 @@ def summarize(samples):
                     for value in sample["callback_batches"][name]
                 ], len(samples), "ns/call")
                 for name in CALLBACK_BATCH_METRICS
+            },
+        },
+        "js_call_batch_latency": {
+            "sample_kind": "contiguous_batch_mean",
+            "operations_per_batch": ENTRY_BATCH_ITERATIONS,
+            "metrics": {
+                name: describe_batches([
+                    value
+                    for sample in samples
+                    for value in sample["js_call_batches"][name]
+                ], len(samples), "ns/call")
+                for name in JS_CALL_BATCH_METRICS
             },
         },
         "entry_batch_latency": {
@@ -354,6 +432,26 @@ def summarize_callback_positions(samples):
                 sample["metrics"][metric]
                 for sample in samples
                 if sample["callback_order"].split(",")[index] == workload
+            ])
+        means = [position["mean"] for position in positions.values()]
+        result[metric] = {
+            "unit": METRICS[metric],
+            "positions": positions,
+            "max_mean_spread": max(means) / min(means) - 1,
+        }
+    return result
+
+
+def summarize_js_call_positions(samples):
+    position_names = ("first", "second")
+    result = {}
+    for workload, metric in JS_CALL_METRICS.items():
+        positions = {}
+        for index, position in enumerate(position_names):
+            positions[position] = describe([
+                sample["metrics"][metric]
+                for sample in samples
+                if sample["js_call_order"].split(",")[index] == workload
             ])
         means = [position["mean"] for position in positions.values()]
         result[metric] = {
@@ -542,6 +640,7 @@ def read_report(directory):
         or metadata.get("benchmark") != "boundary"
         or not valid_binary_hashes(metadata.get("binary_sha256"))
         or metadata.get("callback_ordering") != CALLBACK_ORDERING
+        or metadata.get("js_call_ordering") != JS_CALL_ORDERING
     ):
         raise ValueError("unsupported benchmark metadata")
     count = metadata.get("runs")
@@ -607,9 +706,12 @@ def collect(directory, runs, toolchain):
             "entry_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_batches": ENTRY_BATCHES,
             "callback_batch_iterations": ENTRY_BATCH_ITERATIONS,
+            "js_call_batches": ENTRY_BATCHES,
+            "js_call_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "calibration_samples": CALIBRATION_SAMPLES,
             "calibration_empty_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_ordering": CALLBACK_ORDERING,
+            "js_call_ordering": JS_CALL_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
             "build_command": build,
@@ -636,8 +738,10 @@ def collect(directory, runs, toolchain):
         samples = []
         for index in range(runs):
             callback_order = CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
+            js_call_order = JS_CALL_SCHEDULE[index % len(JS_CALL_SCHEDULE)]
             timing_environment = os.environ.copy()
             timing_environment["RUSTJSI_CALLBACK_ORDER"] = callback_order
+            timing_environment["RUSTJSI_JS_CALL_ORDER"] = js_call_order
             timing = record_process(
                 [str(executables["boundary"])],
                 directory,

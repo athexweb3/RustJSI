@@ -19,6 +19,9 @@ jsc_foreign_common_empty_entry: 11.00 ns/entry
 rustjsi_experimental: 125.00 ns/call
 rustjsi_over_direct: 1.250x (1000000 iterations)
 rustjsi_over_prepared: 1.136x (1000000 iterations)
+direct_jsc_js_call: 90.00 ns/call
+rustjsi_common_js_call: 99.00 ns/call
+common_js_call_over_direct: 1.100x (1000000 iterations)
 direct_jsc_scalar: 25.00 ns/round-trip
 rustjsi_common_scalar: 27.00 ns/round-trip
 common_scalar_over_direct: 1.080x (1000000 iterations)
@@ -39,7 +42,17 @@ CALLBACK_TIMINGS = "".join(
     + " ns/call\n"
     for name, value in CALLBACK_VALUES.items()
 )
-TIMING_METRICS = BASE_SAMPLE + CALLBACK_TIMINGS + "".join(
+JS_CALL_VALUES = {
+    "direct_jsc_js_call": 90.0,
+    "rustjsi_common_js_call": 99.0,
+}
+JS_CALL_TIMINGS = "".join(
+    f"js_call_batches_{name}: 1000 ops/batch "
+    + ",".join([f"{value:.4f}"] * 1000)
+    + " ns/call\n"
+    for name, value in JS_CALL_VALUES.items()
+)
+TIMING_METRICS = BASE_SAMPLE + CALLBACK_TIMINGS + JS_CALL_TIMINGS + "".join(
     f"entry_batches_{name}: 1000 ops/batch "
     + ",".join([f"{value:.4f}"] * 1000)
     + " ns/entry\n"
@@ -60,14 +73,24 @@ ALLOCATION_SAMPLE = "".join(
 )
 
 
-def timing_sample(order=boundary.CALLBACK_ORDERS[0]):
-    return f"callback_order: {order}\n" + TIMING_METRICS + CALIBRATION_SAMPLE
+def timing_sample(
+    callback_order=boundary.CALLBACK_ORDERS[0],
+    js_call_order=boundary.JS_CALL_ORDERS[0],
+):
+    return (
+        f"callback_order: {callback_order}\n"
+        f"js_call_order: {js_call_order}\n"
+        + TIMING_METRICS
+        + CALIBRATION_SAMPLE
+    )
 
 
 def balanced_samples():
     return [
-        boundary.parse_sample(timing_sample(order) + ALLOCATION_SAMPLE)
-        for order in boundary.CALLBACK_SCHEDULE
+        boundary.parse_sample(timing_sample(callback_order, js_call_order) + ALLOCATION_SAMPLE)
+        for callback_order, js_call_order in zip(
+            boundary.CALLBACK_SCHEDULE, boundary.JS_CALL_SCHEDULE, strict=True
+        )
     ]
 
 
@@ -85,6 +108,9 @@ class SampleTests(unittest.TestCase):
             sample["callback_batches"].keys(), boundary.CALLBACK_BATCH_METRICS
         )
         self.assertEqual(
+            sample["js_call_batches"].keys(), boundary.JS_CALL_BATCH_METRICS
+        )
+        self.assertEqual(
             sample["calibration"].keys(),
             {"calibration_timer_pair", "calibration_empty_batch"},
         )
@@ -96,7 +122,11 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             sample["rust_allocations"]["rustjsi_experimental"]["allocations"], 0
         )
+        self.assertEqual(
+            sample["rust_allocations"]["rustjsi_common_js_call"]["allocations"], 0
+        )
         self.assertEqual(sample["callback_order"], boundary.CALLBACK_ORDERS[0])
+        self.assertEqual(sample["js_call_order"], boundary.JS_CALL_ORDERS[0])
 
     def test_bad_samples(self):
         cases = [
@@ -110,10 +140,12 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("1.250x", "0.000x"),
             SAMPLE.replace("direct_jsc_lower_bound: ", "direct_jsc_lower_bound="),
             SAMPLE.replace("reused,prepared,rustjsi", "reused,reused,rustjsi"),
+            SAMPLE.replace("direct,common", "direct,direct"),
             SAMPLE.replace("4.0000", "NaN", 1),
             SAMPLE.replace("4.0000,", "", 1),
             SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
             SAMPLE.replace("100.0000", "120.0000", 1),
+            SAMPLE.replace("90.0000", "120.0000", 1),
             SAMPLE.replace("20.0000", "NaN", 1),
             SAMPLE.replace("calibration_timer_pair: 1000", "calibration_timer_pair: 10"),
             SAMPLE.replace("1.0000,", "", 1),
@@ -162,6 +194,9 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             report["paired_ratios"]["call_over_prepared"]["mean"], 125 / 110
         )
+        self.assertEqual(
+            report["paired_ratios"]["common_js_call_over_direct"]["mean"], 1.1
+        )
         self.assertFalse(report["all_run_mean_cv_at_most_5_percent"])
         self.assertIsNone(report["individual_call_p99"])
         self.assertFalse(report["performance_gate_qualified"])
@@ -204,6 +239,26 @@ class SampleTests(unittest.TestCase):
             latency["metrics"]["rustjsi_experimental"]["p99"], 500
         )
 
+    def test_js_call_tail_and_allocator_scope_are_explicit(self):
+        samples = balanced_samples()
+        samples[0]["js_call_batches"]["rustjsi_common_js_call"][-1] = 500
+        report = boundary.summarize(samples)
+        latency = report["js_call_batch_latency"]
+        self.assertEqual(latency["sample_kind"], "contiguous_batch_mean")
+        self.assertEqual(latency["operations_per_batch"], 1000)
+        self.assertEqual(
+            latency["metrics"]["rustjsi_common_js_call"]["samples"], 12_000
+        )
+        self.assertLessEqual(
+            latency["metrics"]["rustjsi_common_js_call"]["p99"], 500
+        )
+        self.assertEqual(
+            report["rust_allocator_activity"]["metrics"][
+                "rustjsi_common_js_call"
+            ]["allocations"]["mean"],
+            0,
+        )
+
     def test_calibration_is_diagnostic_and_never_subtracted(self):
         samples = balanced_samples()
         samples[0]["calibration"]["calibration_timer_pair"][-1] = 200
@@ -229,6 +284,10 @@ class SampleTests(unittest.TestCase):
         reordered[0], reordered[1] = reordered[1], reordered[0]
         with self.assertRaisesRegex(ValueError, "schedule does not match"):
             boundary.summarize(reordered)
+        wrong_js_order = balanced_samples()
+        wrong_js_order[0]["js_call_order"] = boundary.JS_CALL_ORDERS[1]
+        with self.assertRaisesRegex(ValueError, "JavaScript call workload schedule"):
+            boundary.summarize(wrong_js_order)
 
     def test_run_count_requires_complete_mirrored_blocks(self):
         self.assertEqual(
@@ -249,11 +308,18 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             set(report["callback_ordering"]["counts"].values()), {2}
         )
+        self.assertEqual(set(report["js_call_ordering"]["counts"].values()), {6})
         for metric in boundary.CALLBACK_METRICS.values():
             effects = report["callback_position_effects"][metric]
             self.assertEqual(effects["max_mean_spread"], 0)
             self.assertEqual(
                 {item["samples"] for item in effects["positions"].values()}, {4}
+            )
+        for metric in boundary.JS_CALL_METRICS.values():
+            effects = report["js_call_position_effects"][metric]
+            self.assertEqual(effects["max_mean_spread"], 0)
+            self.assertEqual(
+                {item["samples"] for item in effects["positions"].values()}, {6}
             )
 
 
@@ -296,12 +362,14 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "test"},
                 "binary_sha256": self.HASHES,
                 "callback_ordering": boundary.CALLBACK_ORDERING,
+                "js_call_ordering": boundary.JS_CALL_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(12):
-                order = boundary.CALLBACK_SCHEDULE[index]
+                callback_order = boundary.CALLBACK_SCHEDULE[index]
+                js_call_order = boundary.JS_CALL_SCHEDULE[index]
                 (directory / f"run-{index:03}.stdout").write_text(
-                    timing_sample(order)
+                    timing_sample(callback_order, js_call_order)
                 )
                 (directory / f"allocation-run-{index:03}.stdout").write_text(
                     ALLOCATION_SAMPLE
@@ -392,9 +460,19 @@ class ArtifactTests(unittest.TestCase):
                                 % len(boundary.CALLBACK_SCHEDULE)
                             ],
                         )
+                        self.assertEqual(
+                            environment["RUSTJSI_JS_CALL_ORDER"],
+                            boundary.JS_CALL_SCHEDULE[
+                                int(name.rsplit("-", 1)[1])
+                                % len(boundary.JS_CALL_SCHEDULE)
+                            ],
+                        )
                         output = ALLOCATION_SAMPLE
                     else:
-                        output = timing_sample(environment["RUSTJSI_CALLBACK_ORDER"])
+                        output = timing_sample(
+                            environment["RUSTJSI_CALLBACK_ORDER"],
+                            environment["RUSTJSI_JS_CALL_ORDER"],
+                        )
                     (destination / f"{name}.stdout").write_text(output)
                     (destination / f"{name}.stderr").write_text("")
                     if changed == "binary" and name == "allocation-run-011":
@@ -436,6 +514,7 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "before"},
                 "binary_sha256": self.HASHES,
                 "callback_ordering": boundary.CALLBACK_ORDERING,
+                "js_call_ordering": boundary.JS_CALL_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             boundary.write_json(directory / "complete.json", {
@@ -444,11 +523,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_calibration_analysis_requires_schema_ten(self):
+    def test_scoped_call_analysis_requires_schema_eleven(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 9,
+                "schema": 10,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
