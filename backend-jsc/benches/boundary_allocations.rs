@@ -7,6 +7,10 @@
 mod callbacks;
 
 #[cfg(target_os = "macos")]
+#[path = "support/js_calls.rs"]
+mod js_calls;
+
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
 
@@ -24,6 +28,13 @@ fn main() {
     for workload in callback_order {
         let measurement =
             callbacks::with_operation(workload, |operation| measure(WARMUP, ITERATIONS, operation));
+        print_measurement(workload.labels().1, measurement, ITERATIONS);
+    }
+
+    let js_call_order = js_calls::selected_order();
+    for workload in js_call_order {
+        let measurement =
+            js_calls::with_operation(workload, |operation| measure(WARMUP, ITERATIONS, operation));
         print_measurement(workload.labels().1, measurement, ITERATIONS);
     }
 

@@ -39,6 +39,8 @@ the saved summary. Results under `bench/results/` are ignored by Git.
 | `direct_jsc_lower_bound` | Direct JSC callback call with pre-created number arguments; callback checks types and adds them |
 | `direct_jsc_prepared_call` | Direct JSC number-argument creation plus the same checked callback and exception capture on every call |
 | `rustjsi_experimental` | RustJSI call preparation, JSC callback dispatch, checked addition and result capture |
+| `direct_jsc_js_call` | Direct JSC call to a prepared JavaScript function, including scalar argument creation and strict result validation |
+| `rustjsi_common_js_call` | Common-backend call to the same prepared JavaScript function with equivalent engine work and RustJSI safety checks |
 | `host_gate_admit_and_exit` | Entry accounting guard creation and drop, without engine entry |
 | `jsc_common_empty_entry` | Empty authorized common-backend entry, including maintenance checks |
 | `jsc_foreign_common_empty_entry` | Empty non-owning attachment entry, including host-context validation and maintenance checks |
@@ -66,17 +68,22 @@ timer. Complete permutations balance position and immediate carryover. Pairing
 each permutation at mirrored points in the block reduces first-order
 chronological drift; it does not eliminate nonlinear thermal, scheduler or
 between-process effects.
-Callback and scalar results are checked against `42` before and after each
-timed workload. These checks do not validate every timed iteration. The direct
-callback function has an explicit root outside the timer; RAII releases the
+The two scoped JavaScript call workloads alternate order across that mirrored
+twelve-process block. Each callback permutation is paired once with each call
+order. This balances first and second position for the call pair, but does not
+remove thermal, scheduler, cache or frequency effects.
+Callback, scoped-call and scalar results are checked against `42` before and
+after each timed workload. These checks do not validate every timed iteration.
+The direct functions have explicit roots outside the timer; RAII releases each
 root before its context, including if a validation assertion unwinds.
 macOS CI checks successful benchmark execution, not timing thresholds.
 
-For each callback and entry workload, the timing executable also records the
-four-decimal mean of every 1,000-operation batch. A separate executable with a
-counting global allocator snapshots successful Rust allocation, reallocation
-and deallocation activity around the equivalent 1,000,000 operations. It runs
-the callback workloads in the same selected order as the timing executable.
+For each callback, scoped-call and entry workload, the timing executable also
+records the four-decimal mean of every 1,000-operation batch. A separate
+executable with a counting global allocator snapshots successful Rust
+allocation, reallocation and deallocation activity around the equivalent
+1,000,000 operations. It runs the callback and scoped-call workloads in the
+same selected order as the timing executable.
 Keeping the probe separate prevents its atomics from changing the timed
 workloads. The counter covers Rust allocations made by the probe and linked
 Rust code in that region. It does not observe JavaScriptCore, Objective-C,
@@ -104,13 +111,17 @@ individual call or entry latencies. Batching amortizes timestamp reads enough
 to expose scheduler and frequency disturbances without placing a timer around
 every operation. It can hide single-operation spikes inside a block.
 
+`js_call_batch_latency` applies the same block-mean model to the direct and
+common scoped-call pair. `js_call_position_effects` reports each workload in
+first and second position. Neither section is an individual-call tail model.
+
 `measurement_calibration` reports the timer-pair and empty-batch distributions,
 plus the timer-pair cost amortized over one 1,000-operation measured block.
 These controls expose the harness floor; they are not assumed to be additive
 with engine work and are never subtracted from a workload metric.
 
 `rust_allocator_activity` summarizes per-process counter totals and their mean
-per operation for the callback and entry workloads. Zero is a valid
+per operation for the callback, scoped-call and entry workloads. Zero is a valid
 observation. It supports a narrowly scoped zero-Rust-allocation claim only for
 the named measured region and build; it is not evidence of zero engine
 allocation or zero payload copies.
@@ -158,6 +169,11 @@ reserves result capacity. Each workload validates 42 before and after timing.
 Results are single process means, without tail or allocation measurements.
 They cannot be subtracted from the host-callback benchmark to isolate dispatch
 cost because its API and result-reading workload differ.
+
+The independent boundary collector includes the same shared workloads with
+alternating order, 1,000-operation block means, paired process ratios and a
+separate Rust allocation probe. The standalone commands remain quick smoke
+comparisons rather than saved evidence collections.
 
 On macOS, capture one long-running callback workload with debug symbols and
 Apple's sampling profiler:
