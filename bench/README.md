@@ -152,7 +152,7 @@ Test the runner without JSC:
 python3 -B -m unittest discover -s bench -p 'test_*.py'
 ```
 
-## Callback profiling
+## Native sampling profiles
 
 The `js_calls` benchmark compares prepared scalar calls to a JavaScript
 function through direct JSC and common backend scopes:
@@ -184,15 +184,32 @@ python3 -B bench/callback_profile.py \
   --workload rustjsi
 ```
 
-`--workload` also accepts `prepared` and `reused`. The runner pins the requested
-Rust compiler paths, disables compiler wrappers, builds the profiling target
-with bench-profile debug information, then attaches `/usr/bin/sample` by PID.
-The default 200 million calls keep the target live for the five-second sample;
+`--workload` also accepts `prepared` and `reused`.
+
+To sample the matched scoped-call pair instead, select the `js-call` target:
+
+```sh
+python3 -B bench/callback_profile.py \
+  --target js-call \
+  --output bench/results/js-call-profile-common-001 \
+  --workload common
+```
+
+The scoped-call target accepts `common` and `direct`. It runs the same prepared
+pure-JavaScript scalar function used by the scoped-call comparator. `common`
+goes through the RustJSI backend contract; `direct` calls JavaScriptCore
+directly. The target prints an aggregate duration only to show that the sample
+attached to a live workload. It is not timing evidence.
+
+The runner pins the requested Rust compiler paths, disables compiler wrappers,
+builds the selected profiling target with bench-profile debug information, then
+attaches `/usr/bin/sample` by PID. The default 200 million callback calls and
+50 million scoped calls keep their targets live for the five-second sample;
 iterations, duration and sample interval are configurable.
 
-The new output directory follows the same outside-or-Git-ignored rule as the
-boundary collector. It retains source/compiler/binary metadata, raw build and
-workload output, the stack profile, and a completion record. Compare captures
-from the same source and host tuple. Sample counts are statistical attribution,
-not additive nanoseconds or a latency distribution, and collapsed output also
-contains non-workload threads.
+The output directory follows the same outside-or-Git-ignored rule as the
+boundary collector. It retains the selected target, workload, source/compiler/
+binary metadata, raw build and workload output, the stack profile, and a
+completion record. Compare captures from the same source and host tuple.
+Sample counts are statistical attribution, not additive nanoseconds or a
+latency distribution, and collapsed output also contains non-workload threads.
