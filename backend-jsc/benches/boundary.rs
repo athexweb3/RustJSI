@@ -7,6 +7,10 @@
 mod callbacks;
 
 #[cfg(target_os = "macos")]
+#[path = "support/js_calls.rs"]
+mod js_calls;
+
+#[cfg(target_os = "macos")]
 fn main() {
     use rustjsi_backend::{BackendBase, BackendScope};
     use rustjsi_backend_jsc::{Attachment, Runtime};
@@ -22,6 +26,8 @@ fn main() {
 
     let callback_order = callbacks::selected_order();
     let calls = measure_callback_workloads(callback_order, WARMUP, ITERATIONS, CALLBACK_BATCHES);
+    let js_call_order = js_calls::selected_order();
+    let js_calls = measure_js_call_workloads(js_call_order, WARMUP, ITERATIONS, CALLBACK_BATCHES);
     let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
 
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
@@ -78,6 +84,7 @@ fn main() {
     });
 
     print_call_measurements(callback_order, &calls, ITERATIONS);
+    print_js_call_measurements(js_call_order, &js_calls, ITERATIONS);
     print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
     print_entry_measurement("jsc_common_empty_entry", &common_entry);
     print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
@@ -98,6 +105,66 @@ fn main() {
     // SAFETY: This is the same still-live context used for every measured entry.
     let _ = unsafe { attachment.detach_with_context(foreign_owner.as_void()) }
         .expect("detach foreign benchmark attachment");
+}
+
+#[cfg(target_os = "macos")]
+struct JsCallMeasurements {
+    direct: BatchMeasurement,
+    common: BatchMeasurement,
+}
+
+#[cfg(target_os = "macos")]
+fn measure_js_call_workloads(
+    order: [js_calls::JsCallWorkload; 2],
+    warmup: u32,
+    iterations: u32,
+    batches: u32,
+) -> JsCallMeasurements {
+    let mut direct = None;
+    let mut common = None;
+    for workload in order {
+        let measurement = js_calls::with_operation(workload, |operation| {
+            measure_batches(warmup, iterations, batches, operation)
+        });
+        match workload {
+            js_calls::JsCallWorkload::Direct => direct = Some(measurement),
+            js_calls::JsCallWorkload::Common => common = Some(measurement),
+        }
+    }
+    JsCallMeasurements {
+        direct: direct.expect("measure direct JavaScript calls"),
+        common: common.expect("measure common JavaScript calls"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_js_call_measurements(
+    order: [js_calls::JsCallWorkload; 2],
+    measurements: &JsCallMeasurements,
+    iterations: u32,
+) {
+    let [first, second] = order.map(|workload| workload.labels().0);
+    let direct = measurements.direct.mean();
+    let common = measurements.common.mean();
+    println!("js_call_order: {first},{second}");
+    println!("direct_jsc_js_call: {direct:.2} ns/call");
+    println!("rustjsi_common_js_call: {common:.2} ns/call");
+    println!(
+        "common_js_call_over_direct: {:.3}x ({iterations} iterations)",
+        common / direct
+    );
+    print_batch_samples(
+        "js_call_batches",
+        "direct_jsc_js_call",
+        "ns/call",
+        &measurements.direct,
+    );
+    print_batch_samples(
+        "js_call_batches",
+        "rustjsi_common_js_call",
+        "ns/call",
+        &measurements.common,
+    );
 }
 
 #[cfg(target_os = "macos")]
