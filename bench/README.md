@@ -140,24 +140,24 @@ power/thermal conditions separately. Do not run collection alongside builds or
 test suites.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
-entire environment. It also records available macOS hardware topology, the
-active power source (`pmset -g ps`) and the power settings currently applied
-(`pmset -g`) in a structured `host_environment` record. The record is taken
-once, after the release build and before the first benchmark process, so a
-power change during collection is not captured. Missing, failing, slow or
-undecodable optional system commands are labelled unavailable rather than
-guessed or treated as fatal. Available output is stored as reported, apart from
-surrounding whitespace and the masking below, and is not validated. Names of
-processes holding sleep assertions (everything after "prevented by" on a line),
-battery identifiers and the hibernation image path are masked. The reader
-rejects a record with missing, extra or reworded fields, and every report
-repeats the record with its limits. This is collection context for comparing
-artifacts; it does not pin CPU/frequency, measure thermal state, exclude
-background work, or qualify a performance gate. The reader accepts only the
-current artifact schema, so artifacts from earlier schemas must be re-reported
-with the revision that collected them. JSON artifacts and reports use sorted
-keys, so re-reporting the same raw output produces byte-identical JSON. The
-source fingerprint covers tracked and non-ignored untracked files;
+entire environment. It also records the available macOS hardware model, memory
+size and CPU topology, the active power source (`pmset -g ps`) and the power
+settings currently applied (`pmset -g`) in a structured `host_environment`
+record. The record is taken once, after the release build and before the first
+benchmark process, so a power change during collection is not captured.
+Missing, failing, slow or undecodable optional system commands are labelled
+unavailable rather than guessed or treated as fatal. Available output is stored
+as reported, apart from surrounding whitespace and the masking below, and is
+not validated. Names of processes holding sleep assertions (everything after
+"prevented by" on a line), battery identifiers and the hibernation image path
+are masked. The reader rejects a record with missing, extra or reworded fields,
+and every report repeats the record with its limits. This is collection context
+for comparing artifacts; it does not pin CPU/frequency, measure thermal state,
+exclude background work, or qualify a performance gate. The reader accepts only
+the current artifact schema, so artifacts from earlier schemas must be
+re-reported with the revision that collected them. JSON artifacts and reports
+use sorted keys, so re-reporting the same raw output produces byte-identical
+JSON. The source fingerprint covers tracked and non-ignored untracked files;
 ignored/generated inputs, symlink targets, external Cargo configuration and
 system engine internals are not fully captured. OS build and SDK version
 identify the system-JSC tuple, not a WebKit source revision. The binary hash

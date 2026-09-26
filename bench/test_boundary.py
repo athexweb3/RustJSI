@@ -426,6 +426,9 @@ class ArtifactTests(unittest.TestCase):
             invalid["sysctl"]["physical_cpus"] = malformed
             self.assertFalse(boundary.valid_host_environment(invalid))
         invalid = self.host_environment()
+        del invalid["sysctl"]["memory_bytes"]
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
         invalid["sysctl"] = list(invalid["sysctl"].items())
         self.assertFalse(boundary.valid_host_environment(invalid))
         invalid = self.host_environment()
@@ -471,7 +474,10 @@ class ArtifactTests(unittest.TestCase):
             "12345678", "Editor", "powerd", "Player", "Renderer", "Code Helper", "custom-sleepimage",
         ):
             self.assertNotIn(secret, text)
-        self.assertIn("id=[redacted]", snapshot["power_source"]["output"])
+        self.assertEqual(
+            snapshot["power_source"]["output"].splitlines()[1],
+            " -InternalBattery-0 (id=[redacted])\t92%; charging",
+        )
         settings = snapshot["power_settings"]["output"].splitlines()
         self.assertEqual(settings[0], " sleep                1 (sleep prevented by [redacted]")
         self.assertEqual(settings[2], " standby              1 (standby prevented by [redacted]")
