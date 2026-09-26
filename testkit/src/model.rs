@@ -76,15 +76,20 @@ pub struct ModelRoot {
 /// available while the view exists. The model has no operation that mutates,
 /// detaches, or resizes buffer bytes, and the storage is never rebuilt, so the
 /// address, length, and contents stay fixed for the view's lifetime.
+///
+/// The owner allocation is freed, and counted as finalized, only when its last
+/// reference drops. A view leaked with [`std::mem::forget`] therefore leaks the
+/// allocation, and [`ModelBackend::external_buffer_stats`] keeps reporting its
+/// bytes as live.
 #[derive(Debug)]
 pub struct ModelBufferView<'view> {
-    bytes: Rc<Box<[u8]>>,
+    bytes: Rc<ModelExternalOwner>,
     scope: PhantomData<&'view ()>,
 }
 
 impl AsRef<[u8]> for ModelBufferView<'_> {
     fn as_ref(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes.bytes
     }
 }
 
@@ -110,6 +115,7 @@ pub struct ModelBackend {
     id: u64,
     state: RefCell<ModelState>,
     external_fault: Cell<ExternalFault>,
+    buffer_stats: Rc<Cell<ExternalBufferStats>>,
 }
 
 /// One scoped entry into [`ModelBackend`].
@@ -155,7 +161,6 @@ struct ModelState {
     roots: SlotMap<ValueId>,
     evaluations: VecDeque<Evaluation>,
     invocations: VecDeque<Invocation>,
-    stats: ExternalBufferStats,
 }
 
 #[derive(Debug)]
@@ -163,9 +168,44 @@ enum ModelValueEntry {
     Primitive(Primitive),
     Function,
     /// The accepted owner allocation, shared read-only with live views.
-    ///
-    /// Wrapping the `Box` keeps its heap payload in place; no bytes are copied.
-    External(Rc<Box<[u8]>>),
+    External(Rc<ModelExternalOwner>),
+}
+
+/// An accepted external-buffer owner and the counters that record its free.
+///
+/// Wrapping the `Box` keeps its heap payload in place; no bytes are copied.
+/// The counters live outside the model state `RefCell`, so this destructor only
+/// updates plain cells and is safe to run while that state is mutably borrowed.
+#[derive(Debug)]
+struct ModelExternalOwner {
+    bytes: Box<[u8]>,
+    stats: Rc<Cell<ExternalBufferStats>>,
+}
+
+impl ModelExternalOwner {
+    fn accept(bytes: Box<[u8]>, stats: &Rc<Cell<ExternalBufferStats>>) -> Self {
+        let mut current = stats.get();
+        current.accepted = current.accepted.saturating_add(1);
+        current.live_bytes = current.live_bytes.saturating_add(byte_count(&bytes));
+        stats.set(current);
+        Self {
+            bytes,
+            stats: Rc::clone(stats),
+        }
+    }
+}
+
+impl Drop for ModelExternalOwner {
+    fn drop(&mut self) {
+        let mut current = self.stats.get();
+        current.live_bytes = current.live_bytes.saturating_sub(byte_count(&self.bytes));
+        current.finalized = current.finalized.saturating_add(1);
+        self.stats.set(current);
+    }
+}
+
+fn byte_count(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +259,7 @@ impl ModelBackend {
             id,
             state: RefCell::new(ModelState::default()),
             external_fault: Cell::new(ExternalFault::None),
+            buffer_stats: Rc::new(Cell::new(ExternalBufferStats::default())),
         }
     }
 
@@ -245,7 +286,7 @@ impl ModelBackend {
     /// Returns external-buffer ownership counters.
     #[must_use]
     pub fn external_buffer_stats(&self) -> ExternalBufferStats {
-        self.state.borrow().stats
+        self.buffer_stats.get()
     }
 }
 
@@ -541,7 +582,6 @@ impl OwnedExternalBufferScope for ModelScope<'_> {
         &self,
         owner: Box<[u8]>,
     ) -> Result<Self::Value<'_>, OwnershipTransferError<Box<[u8]>>> {
-        let bytes = u64::try_from(owner.len()).unwrap_or(u64::MAX);
         match self.backend.external_fault.replace(ExternalFault::None) {
             ExternalFault::Reject => {
                 return Err(OwnershipTransferError::Rejected {
@@ -550,21 +590,17 @@ impl OwnedExternalBufferScope for ModelScope<'_> {
                 });
             }
             ExternalFault::AcceptThenFail => {
-                let mut state = self.backend.state.borrow_mut();
-                state.stats.accepted = state.stats.accepted.saturating_add(1);
-                state.stats.finalized = state.stats.finalized.saturating_add(1);
-                drop(owner);
+                drop(ModelExternalOwner::accept(
+                    owner,
+                    &self.backend.buffer_stats,
+                ));
                 return Err(OwnershipTransferError::Accepted {
                     error: BackendError::Failure("injected failure after ownership transfer"),
                 });
             }
             ExternalFault::None => {}
         }
-        {
-            let mut state = self.backend.state.borrow_mut();
-            state.stats.accepted = state.stats.accepted.saturating_add(1);
-            state.stats.live_bytes = state.stats.live_bytes.saturating_add(bytes);
-        }
+        let owner = ModelExternalOwner::accept(owner, &self.backend.buffer_stats);
         Ok(self.insert(ModelValueEntry::External(Rc::new(owner))))
     }
 }
@@ -607,24 +643,10 @@ impl ModelState {
     }
 
     fn remove_value(&mut self, value: ValueId) {
-        if let Some(ModelValueEntry::External(bytes)) =
-            self.values.remove(value.slot, value.generation)
-        {
-            // Views borrow their scope and can only name values local to that
-            // scope. Locals are removed only when the scope drops, and a root
-            // release keeps a local value, so no view outlives this removal.
-            // Dropping `bytes` here therefore frees the owner allocation.
-            debug_assert_eq!(
-                Rc::strong_count(&bytes),
-                1,
-                "buffer view outlived its value"
-            );
-            self.stats.live_bytes = self
-                .stats
-                .live_bytes
-                .saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            self.stats.finalized = self.stats.finalized.saturating_add(1);
-        }
+        // Dropping the entry releases the model's reference to an external
+        // owner. The owner itself is freed and counted by its destructor when
+        // the last reference drops, which a leaked view can postpone forever.
+        drop(self.values.remove(value.slot, value.generation));
     }
 }
 

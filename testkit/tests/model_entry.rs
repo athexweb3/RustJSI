@@ -361,3 +361,28 @@ fn borrowed_buffer_view_survives_evaluation_calls_and_root_work() {
         }
     );
 }
+
+#[test]
+fn leaked_buffer_view_keeps_owner_live_in_accounting() {
+    let mut model = ModelBackend::new();
+    {
+        let scope = model.open_scope().unwrap();
+        let buffer = scope
+            .externalize(vec![1_u8, 2, 3].into_boxed_slice())
+            .unwrap();
+        let view = scope.buffer_bytes(buffer).unwrap();
+        // Leaking a view is safe; the owner allocation then never drops.
+        std::mem::forget(view);
+    }
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 1,
+            finalized: 0,
+            live_bytes: 3,
+            copied_bytes: 0,
+        }
+    );
+    let scope = model.open_scope().unwrap();
+    verify_borrowed_buffer_stability_in_scope(&scope).unwrap();
+}
