@@ -152,14 +152,18 @@ impl Context<'_> {
     /// observation handle does not root the JavaScript wrapper.
     ///
     /// JavaScript may take offset views, call `transfer()`, or attempt
-    /// `resize()`. On the macOS `JavaScriptCore` builds tested, the backing-store
-    /// query made here during construction leaves the buffer non-detachable:
-    /// `transfer()` copies the payload into a new engine-owned buffer and leaves
-    /// this one attached, and `resize()` throws. That copy is engine work
-    /// requested by JavaScript, not part of this Rust-to-JavaScript transfer.
-    /// This is observed engine behavior, not a guarantee. Either way the
-    /// deallocator runs exactly once, after no JavaScript buffer can reach the
-    /// allocation, because Rust keeps no pointer to the bytes.
+    /// `resize()`. The backing-store pointer query made here during
+    /// construction pins the buffer in `JavaScriptCore`, so JavaScript cannot
+    /// detach it. On the macOS builds tested, every `transfer()` and
+    /// `transferToFixedLength()` form copies the preserved prefix into a new
+    /// engine-owned buffer and leaves this one attached, and `resize()` throws.
+    /// That copy is engine work requested by JavaScript; Rust copies nothing and
+    /// records no new external allocation for it. The backend tests fail if this
+    /// behavior changes; it is not a portable engine guarantee.
+    ///
+    /// `JavaScriptCore` decides when the deallocator runs. The tests observe a
+    /// single release only after the buffer became unreachable or the runtime
+    /// was torn down.
     ///
     /// # Errors
     ///
