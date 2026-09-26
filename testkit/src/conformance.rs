@@ -198,9 +198,11 @@ where
 /// same scope performs other permitted work.
 ///
 /// The view borrows the scope immutably, so the safe API still allows value
-/// creation, classification, a second view of the same buffer, and another
-/// ownership transfer while it exists. Each of those operations must succeed,
-/// and the first view must keep the same address, length, and contents.
+/// creation, classification, a second view of the same buffer, another
+/// ownership transfer, and persisting, resolving, and releasing roots while it
+/// exists. Each of those operations must succeed, and the first view must keep
+/// the same address, length, and contents. Evaluation and calls need
+/// engine-specific source text, so backend tests must cover those separately.
 /// For entry-borrowing backends, open a scope and use
 /// [`verify_borrowed_buffer_stability_in_scope`] instead.
 ///
@@ -209,8 +211,8 @@ where
 /// Returns the first backend, transfer, or conformance failure.
 pub fn verify_borrowed_buffer_stability<B>(backend: &mut B) -> Result<(), BackendError>
 where
-    B: BackendBase,
-    for<'scope> B::Scope<'scope>: OwnedExternalBufferScope + BorrowedBufferScope,
+    B: RootBackend,
+    for<'scope> B::Scope<'scope>: OwnedExternalBufferScope + BorrowedBufferScope + RootScope,
 {
     verify_borrowed_buffer_stability_in_scope(&backend.open_scope()?)
 }
@@ -234,7 +236,8 @@ where
 /// Returns the first backend, transfer, or conformance failure.
 pub fn verify_borrowed_buffer_stability_in_scope<S>(scope: &S) -> Result<(), BackendError>
 where
-    S: OwnedExternalBufferScope + BorrowedBufferScope,
+    S: OwnedExternalBufferScope + BorrowedBufferScope + RootScope,
+    S::Backend: RootBackend,
 {
     const EXPECTED: [u8; 6] = [6, 5, 4, 3, 2, 1];
     let value = scope
@@ -277,6 +280,17 @@ where
             "externalized value was not classified as a buffer",
         ));
     }
+    let root = scope.persist(value)?;
+    let resolved = scope.resolve(root)?;
+    let resolved_view = scope.buffer_bytes(resolved)?;
+    if resolved_view.as_ref().as_ptr() != pointer || resolved_view.as_ref() != EXPECTED {
+        return Err(BackendError::Failure(
+            "resolved root named a different buffer than the live view",
+        ));
+    }
+    let temporary = scope.persist(number)?;
+    scope.release(temporary)?;
+    scope.release(root)?;
 
     if view.as_ref().as_ptr() != pointer || view.as_ref() != EXPECTED {
         return Err(BackendError::Failure(
