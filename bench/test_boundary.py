@@ -399,6 +399,15 @@ class ArtifactTests(unittest.TestCase):
                 boundary.write_json(target, {"original": False})
             self.assertEqual(json.loads(target.read_text()), {"original": True})
 
+    def test_json_artifacts_use_canonical_key_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "record.json"
+            boundary.write_json(target, {"z": {"b": 2, "a": 1}, "a": 0})
+            self.assertEqual(
+                target.read_text(),
+                '{\n  "a": 0,\n  "z": {\n    "a": 1,\n    "b": 2\n  }\n}\n',
+            )
+
     def test_report_uses_raw_samples_and_requires_completion(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

@@ -618,7 +618,7 @@ def source_stamp():
 
 def write_json(path, value):
     with path.open("x", encoding="utf-8") as output:
-        json.dump(value, output, indent=2, allow_nan=False)
+        json.dump(value, output, indent=2, allow_nan=False, sort_keys=True)
         output.write("\n")
 
 
@@ -855,7 +855,7 @@ def main():
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"boundary: {error}\n")
-    print(json.dumps(result, indent=2, allow_nan=False))
+    print(json.dumps(result, indent=2, allow_nan=False, sort_keys=True))
 
 
 if __name__ == "__main__":
