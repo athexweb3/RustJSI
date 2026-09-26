@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
+import contextlib
+import io
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -334,32 +338,62 @@ class ArtifactTests(unittest.TestCase):
                 name: {"status": "available", "output": "test"}
                 for name in boundary.HOST_SYSCTL_KEYS
             },
-            "power_policy": {"status": "unavailable"},
+            "power_source": {"status": "available", "output": "Now drawing from 'AC Power'"},
+            "power_settings": {"status": "unavailable"},
             "limits": list(boundary.HOST_ENVIRONMENT_LIMITS),
         }
 
     def test_host_environment_records_optional_facts_without_claiming_control(self):
         values = {
             ("sysctl", "-n", "hw.model"): "TestMac",
-            ("sysctl", "-n", "hw.logicalcpu"): "10",
+            ("sysctl", "-n", "hw.logicalcpu"): "12",
             ("sysctl", "-n", "hw.physicalcpu"): "10",
             ("sysctl", "-n", "hw.memsize"): "17179869184",
             ("sysctl", "-n", "hw.perflevel0.physicalcpu"): "4",
             ("sysctl", "-n", "hw.perflevel1.physicalcpu"): "6",
-            ("pmset", "-g", "custom"): "AC Power:\n lowpowermode 0",
+            ("pmset", "-g", "ps"): "Now drawing from 'AC Power'",
+            ("pmset", "-g"): "Currently in use:\n lowpowermode 0",
         }
-        with patch.object(boundary, "command", side_effect=lambda args: values[tuple(args)]):
+        timeouts = set()
+
+        def fake_command(arguments, *, timeout):
+            timeouts.add(timeout)
+            return values[tuple(arguments)]
+
+        with patch.object(boundary, "command", side_effect=fake_command):
             snapshot = boundary.host_environment()
         self.assertTrue(boundary.valid_host_environment(snapshot))
         self.assertEqual(snapshot["kind"], "collection_context_not_isolation")
         self.assertIn("does_not_measure_thermal_state", snapshot["limits"])
-        self.assertEqual(snapshot["sysctl"]["model"]["output"], "TestMac")
+        self.assertIn("recorded_once_before_process_runs", snapshot["limits"])
+        self.assertEqual(snapshot["sysctl"], {
+            name: {"status": "available", "output": output}
+            for name, output in {
+                "model": "TestMac",
+                "logical_cpus": "12",
+                "physical_cpus": "10",
+                "memory_bytes": "17179869184",
+                "performance_level_0_physical_cpus": "4",
+                "performance_level_1_physical_cpus": "6",
+            }.items()
+        })
+        self.assertEqual(snapshot["power_source"]["output"], "Now drawing from 'AC Power'")
+        self.assertEqual(timeouts, {5})
 
     def test_host_environment_tolerates_unavailable_optional_fields(self):
-        with patch.object(boundary, "command", side_effect=OSError("missing")):
-            snapshot = boundary.host_environment()
-        self.assertTrue(boundary.valid_host_environment(snapshot))
-        self.assertEqual(snapshot["power_policy"], {"status": "unavailable"})
+        failures = (
+            OSError("missing"),
+            subprocess.CalledProcessError(1, "sysctl"),
+            subprocess.TimeoutExpired("pmset", boundary.HOST_COMMAND_TIMEOUT_SECONDS),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(boundary, "command", side_effect=failure):
+                    snapshot = boundary.host_environment()
+                self.assertTrue(boundary.valid_host_environment(snapshot))
+                for name in boundary.HOST_POWER_COMMANDS:
+                    self.assertEqual(snapshot[name], {"status": "unavailable"})
 
     def test_host_environment_validation_rejects_ambiguous_or_overclaimed_records(self):
         valid = self.host_environment()
@@ -370,6 +404,155 @@ class ArtifactTests(unittest.TestCase):
         invalid = self.host_environment()
         invalid["sysctl"] = {"model": {"status": "available"}}
         self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["power_source"] = {"status": "available", "output": "", "guessed": True}
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        for extra in ("performance_gate_qualified", "isolated"):
+            invalid = self.host_environment()
+            invalid[extra] = True
+            self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        del invalid["power_settings"]
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["sysctl"]["isolated_cpus"] = {"status": "available", "output": "4"}
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        for malformed in (
+            {"status": "isolated"},
+            {"status": "available", "output": "10", "guessed": True},
+            {"status": "unavailable", "output": "10"},
+        ):
+            invalid = self.host_environment()
+            invalid["sysctl"]["physical_cpus"] = malformed
+            self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["sysctl"] = list(invalid["sysctl"].items())
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["power_settings"] = {"status": "isolated"}
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["power_settings"] = {"status": "unavailable", "output": "guess"}
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        for output in (16, {"isolated": True}, None):
+            invalid = self.host_environment()
+            invalid["power_source"] = {"status": "available", "output": output}
+            self.assertFalse(boundary.valid_host_environment(invalid))
+
+    def test_optional_command_bounds_the_real_subprocess_call(self):
+        calls = []
+
+        def slow_run(arguments, **options):
+            calls.append(options["timeout"])
+            raise subprocess.TimeoutExpired(arguments, options["timeout"])
+
+        with patch.object(boundary.subprocess, "run", side_effect=slow_run):
+            self.assertEqual(
+                boundary.optional_command(["pmset", "-g"]), {"status": "unavailable"}
+            )
+        self.assertEqual(calls, [5])
+
+    def test_host_environment_masks_process_names_and_battery_identity(self):
+        outputs = {
+            ("pmset", "-g", "ps"): "Now drawing from 'AC Power'\n"
+            " -InternalBattery-0 (id=12345678)\t92%; charging",
+            ("pmset", "-g"): " sleep                1 (sleep prevented by Editor, powerd)\n"
+            " displaysleep         2 (display sleep prevented by Player)\n"
+            " standby              1 (standby prevented by Code Helper (Renderer), (null))\n"
+            " hibernatefile        /Volumes/Archive/custom-sleepimage",
+        }
+        with patch.object(
+            boundary, "command",
+            side_effect=lambda arguments, *, timeout: outputs.get(tuple(arguments), "1"),
+        ):
+            snapshot = boundary.host_environment()
+        text = json.dumps(snapshot)
+        for secret in (
+            "12345678", "Editor", "powerd", "Player", "Renderer", "Code Helper", "custom-sleepimage",
+        ):
+            self.assertNotIn(secret, text)
+        self.assertIn("id=[redacted]", snapshot["power_source"]["output"])
+        settings = snapshot["power_settings"]["output"].splitlines()
+        self.assertEqual(settings[0], " sleep                1 (sleep prevented by [redacted]")
+        self.assertEqual(settings[2], " standby              1 (standby prevented by [redacted]")
+        self.assertEqual(settings[3], " hibernatefile        [redacted]")
+        self.assertIn("Now drawing from 'AC Power'", snapshot["power_source"]["output"])
+        invalid = self.host_environment()
+        invalid["limits"] = invalid["limits"][:-1]
+        self.assertFalse(boundary.valid_host_environment(invalid))
+        invalid = self.host_environment()
+        invalid["limits"] = list(reversed(invalid["limits"]))
+        self.assertFalse(boundary.valid_host_environment(invalid))
+
+    def test_report_requires_host_context_for_current_schema(self):
+        variants = {"missing": None, "overclaimed": {
+            **self.host_environment(), "kind": "isolated_machine",
+        }}
+        for name, host in variants.items():
+            with self.subTest(host=name), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                metadata = {
+                    "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
+                    "source": {"head": "test"},
+                    "binary_sha256": self.HASHES,
+                    "callback_ordering": boundary.CALLBACK_ORDERING,
+                    "js_call_ordering": boundary.JS_CALL_ORDERING,
+                }
+                if host is not None:
+                    metadata["host_environment"] = host
+                boundary.write_json(directory / "metadata.json", metadata)
+                boundary.write_json(directory / "complete.json", {
+                    key: metadata[key] for key in ("source", "binary_sha256")
+                })
+                with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
+                    boundary.read_report(directory)
+
+    def test_cli_report_is_byte_identical_across_hash_seeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
+                "source": {"head": "test"},
+                "binary_sha256": self.HASHES,
+                "host_environment": self.host_environment(),
+                "callback_ordering": boundary.CALLBACK_ORDERING,
+                "js_call_ordering": boundary.JS_CALL_ORDERING,
+            }
+            boundary.write_json(directory / "metadata.json", metadata)
+            for index in range(12):
+                (directory / f"run-{index:03}.stdout").write_text(timing_sample(
+                    boundary.CALLBACK_SCHEDULE[index], boundary.JS_CALL_SCHEDULE[index],
+                ))
+                (directory / f"allocation-run-{index:03}.stdout").write_text(
+                    ALLOCATION_SAMPLE
+                )
+            boundary.write_json(directory / "complete.json", {
+                key: metadata[key] for key in ("source", "binary_sha256")
+            })
+            outputs = set()
+            # Set-typed metric names iterate in a seed-dependent order.
+            for seed in ("0", "1", "2"):
+                result = subprocess.run(
+                    [sys.executable, "-B", str(Path(boundary.__file__)), "report",
+                     str(directory)],
+                    capture_output=True, check=True, timeout=60,
+                    env={**os.environ, "PYTHONHASHSEED": seed},
+                )
+                outputs.add(result.stdout)
+            self.assertEqual(len(outputs), 1)
+
+    def test_cli_report_output_uses_canonical_key_order(self):
+        output = io.StringIO()
+        with (
+            patch.object(boundary, "read_report", return_value={"z": {"b": 2, "a": 1}, "a": 0}),
+            patch.object(boundary.sys, "argv", ["boundary.py", "report", "unused"]),
+            contextlib.redirect_stdout(output),
+        ):
+            boundary.main()
+        self.assertEqual(
+            output.getvalue(),
+            '{\n  "a": 0,\n  "z": {\n    "a": 1,\n    "b": 2\n  }\n}\n',
+        )
 
     def test_cargo_executable_selection(self):
         output = json.dumps({"reason": "build-finished", "success": True}) + "\n"
@@ -435,6 +618,7 @@ class ArtifactTests(unittest.TestCase):
             boundary.write_json(directory / "complete.json", completion)
             report = boundary.read_report(directory)
             self.assertEqual(report["compiler_selection"], "unverified")
+            self.assertEqual(report["host_environment"], metadata["host_environment"])
             self.assertEqual(report["metrics"]["direct_jsc_lower_bound"]["mean"], 100)
             # A stale summary is not used to reconstruct the report.
             boundary.write_json(directory / "summary.json", {"wrong": True})
@@ -502,7 +686,14 @@ class ArtifactTests(unittest.TestCase):
                     "executable": str(executable),
                 }) for name, executable in executables.items())
 
+                events = []
+
+                def fake_command(arguments, **_):
+                    events.append(("command", tuple(arguments)))
+                    return "test metadata"
+
                 def fake_process(arguments, destination, name, *, environment=None):
+                    events.append(("process", name))
                     if name == "build":
                         self.assertEqual(environment["RUSTC"], "/test/rustc")
                     if name == "build":
@@ -539,7 +730,7 @@ class ArtifactTests(unittest.TestCase):
                 with (
                     patch.object(boundary.platform, "system", return_value="Darwin"),
                     patch.object(boundary, "source_stamp", side_effect=[stamp, final]),
-                    patch.object(boundary, "command", return_value="test metadata"),
+                    patch.object(boundary, "command", side_effect=fake_command),
                     patch.object(boundary, "compiler_environment", return_value={
                         "RUSTC": "/test/rustc", "RUSTDOC": "/test/rustdoc",
                     }),
@@ -557,6 +748,22 @@ class ArtifactTests(unittest.TestCase):
                         report = boundary.collect(directory, 12, "test-toolchain")
                         self.assertEqual(boundary.read_report(directory), report)
                     self.assertEqual(run.call_count, 25)
+                    # Host context is captured exactly once, after the build and
+                    # before the first benchmark process.
+                    host_commands = {
+                        ("sysctl", "-n", key) for key in boundary.HOST_SYSCTL_KEYS.values()
+                    } | set(boundary.HOST_POWER_COMMANDS.values())
+                    host_positions = [
+                        index for index, event in enumerate(events)
+                        if event[0] == "command" and event[1] in host_commands
+                    ]
+                    self.assertEqual(len(host_positions), len(host_commands))
+                    self.assertEqual(
+                        {events[index][1] for index in host_positions}, host_commands
+                    )
+                    first_run = events.index(("process", "run-000"))
+                    self.assertLess(events.index(("process", "build")), min(host_positions))
+                    self.assertLess(max(host_positions), first_run)
                     # An existing collection is never reused, including failed ones.
                     with self.assertRaises(FileExistsError):
                         boundary.collect(directory, 12, "test-toolchain")
@@ -604,9 +811,9 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(hashes=hashes), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 boundary.write_json(directory / "metadata.json", {
-                "schema": boundary.SCHEMA,
-                "benchmark": "boundary",
-                "runs": 12,
+                    "schema": boundary.SCHEMA,
+                    "benchmark": "boundary",
+                    "runs": 12,
                     "source": {"head": "before"},
                     "binary_sha256": hashes,
                     "host_environment": self.host_environment(),
