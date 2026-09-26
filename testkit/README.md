@@ -14,6 +14,20 @@ backends. Replacement cycles preserve their logical runtime ID while advancing
 the attachment epoch, so stale work and foreign runtimes exercise one shared
 identity contract rather than test-only integers.
 
+`tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
+steps over three runtimes against an independent reference model. Sequences
+replace engines with new epochs, abandon issued epochs before activation, keep
+retired attachments reachable, and deliver queued work records to stale
+epochs, other runtimes, and attachments that are draining, invalid, or
+destroyed. Each record is checked by the lifecycle model and by a `ModelHost`
+that is asked to lend its backend whenever the record names its attachment, so
+the host's entry gate alone must refuse late work. After every step both must
+match the reference state, entry count, monotonic state order,
+single-occurrence terminal transitions, and number of backend loans. The
+runtimes share no state and run on one thread; this is not a concurrency test,
+and the lifecycle has no separate created-but-inactive state. Under Miri the
+same test runs 40 sequences.
+
 `ModelBackend::with_entry` lends a thread-affine backend adapter for testing
 borrowed access. Direct scopes and borrowed entries share root IDs, queued
 outcomes, and buffer ownership. Host fixtures supply their own admission and
