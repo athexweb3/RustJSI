@@ -5,7 +5,7 @@ use rustjsi_backend::{
     BackendScope, BorrowedBufferScope, CallReceiver, Capability, CapabilitySet,
     OwnedExternalBufferScope, OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -69,19 +69,22 @@ pub struct ModelRoot {
 }
 
 /// Scoped byte view returned by the deterministic external-buffer model.
+///
+/// The view shares ownership of the model's own immutable buffer storage, the
+/// exact allocation accepted by `externalize`. It does not hold a borrow of the
+/// model's mutable state, so every other operation the scope permits remains
+/// available while the view exists. The model has no operation that mutates,
+/// detaches, or resizes buffer bytes, and the storage is never rebuilt, so the
+/// address, length, and contents stay fixed for the view's lifetime.
 #[derive(Debug)]
 pub struct ModelBufferView<'view> {
-    entry: Ref<'view, ModelValueEntry>,
+    bytes: Rc<Box<[u8]>>,
+    scope: PhantomData<&'view ()>,
 }
 
 impl AsRef<[u8]> for ModelBufferView<'_> {
     fn as_ref(&self) -> &[u8] {
-        match &*self.entry {
-            ModelValueEntry::External(bytes) => bytes,
-            ModelValueEntry::Primitive(_) | ModelValueEntry::Function => {
-                unreachable!("validated buffer changed kind")
-            }
-        }
+        &self.bytes
     }
 }
 
@@ -159,7 +162,10 @@ struct ModelState {
 enum ModelValueEntry {
     Primitive(Primitive),
     Function,
-    External(Box<[u8]>),
+    /// The accepted owner allocation, shared read-only with live views.
+    ///
+    /// Wrapping the `Box` keeps its heap payload in place; no bytes are copied.
+    External(Rc<Box<[u8]>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,7 +565,7 @@ impl OwnedExternalBufferScope for ModelScope<'_> {
             state.stats.accepted = state.stats.accepted.saturating_add(1);
             state.stats.live_bytes = state.stats.live_bytes.saturating_add(bytes);
         }
-        Ok(self.insert(ModelValueEntry::External(owner)))
+        Ok(self.insert(ModelValueEntry::External(Rc::new(owner))))
     }
 }
 
@@ -573,13 +579,23 @@ impl BorrowedBufferScope for ModelScope<'_> {
         &'view self,
         value: Self::Value<'view>,
     ) -> Result<Self::BufferView<'view>, BackendError> {
-        self.require_kind(value, ValueKind::Buffer)?;
-        let state = self.backend.state.borrow();
-        let entry = Ref::filter_map(state, |state| {
-            state.values.get(value.id.slot, value.id.generation)
+        let id = self.require_kind(value, ValueKind::Buffer)?;
+        let bytes = match self
+            .backend
+            .state
+            .borrow()
+            .values
+            .get(id.slot, id.generation)
+        {
+            Some(ModelValueEntry::External(bytes)) => Rc::clone(bytes),
+            Some(ModelValueEntry::Primitive(_) | ModelValueEntry::Function) | None => {
+                unreachable!("validated buffer changed kind")
+            }
+        };
+        Ok(ModelBufferView {
+            bytes,
+            scope: PhantomData,
         })
-        .map_err(|_| BackendError::StaleHandle)?;
-        Ok(ModelBufferView { entry })
     }
 }
 
@@ -594,6 +610,15 @@ impl ModelState {
         if let Some(ModelValueEntry::External(bytes)) =
             self.values.remove(value.slot, value.generation)
         {
+            // Views borrow their scope and can only name values local to that
+            // scope. Locals are removed only when the scope drops, and a root
+            // release keeps a local value, so no view outlives this removal.
+            // Dropping `bytes` here therefore frees the owner allocation.
+            debug_assert_eq!(
+                Rc::strong_count(&bytes),
+                1,
+                "buffer view outlived its value"
+            );
             self.stats.live_bytes = self
                 .stats
                 .live_bytes
