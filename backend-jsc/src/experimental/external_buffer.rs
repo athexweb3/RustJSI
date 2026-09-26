@@ -151,6 +151,16 @@ impl Context<'_> {
     /// Rust retains no reference to the payload after this call. The returned
     /// observation handle does not root the JavaScript wrapper.
     ///
+    /// JavaScript may take offset views, call `transfer()`, or attempt
+    /// `resize()`. On the macOS `JavaScriptCore` builds tested, the backing-store
+    /// query made here during construction leaves the buffer non-detachable:
+    /// `transfer()` copies the payload into a new engine-owned buffer and leaves
+    /// this one attached, and `resize()` throws. That copy is engine work
+    /// requested by JavaScript, not part of this Rust-to-JavaScript transfer.
+    /// This is observed engine behavior, not a guarantee. Either way the
+    /// deallocator runs exactly once, after no JavaScript buffer can reach the
+    /// allocation, because Rust keeps no pointer to the bytes.
+    ///
     /// # Errors
     ///
     /// Returns a lifecycle, quota, construction, publication, or JavaScript
