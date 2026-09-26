@@ -194,6 +194,98 @@ where
     Ok(())
 }
 
+/// Verifies that a borrowed buffer view stays readable and unchanged while the
+/// same scope performs other permitted work.
+///
+/// The view borrows the scope immutably, so the safe API still allows value
+/// creation, classification, a second view of the same buffer, and another
+/// ownership transfer while it exists. Each of those operations must succeed,
+/// and the first view must keep the same address, length, and contents.
+/// For entry-borrowing backends, open a scope and use
+/// [`verify_borrowed_buffer_stability_in_scope`] instead.
+///
+/// # Errors
+///
+/// Returns the first backend, transfer, or conformance failure.
+pub fn verify_borrowed_buffer_stability<B>(backend: &mut B) -> Result<(), BackendError>
+where
+    B: BackendBase,
+    for<'scope> B::Scope<'scope>: OwnedExternalBufferScope + BorrowedBufferScope,
+{
+    verify_borrowed_buffer_stability_in_scope(&backend.open_scope()?)
+}
+
+/// Verifies borrowed-view stability across scope work in an already-open
+/// capable scope.
+///
+/// ```
+/// use rustjsi_backend::BackendBase;
+/// use rustjsi_testkit::{ModelBackend, verify_borrowed_buffer_stability_in_scope};
+///
+/// let mut model = ModelBackend::new();
+/// model.with_entry(|entry| {
+///     let scope = entry.open_scope().unwrap();
+///     verify_borrowed_buffer_stability_in_scope(&scope).unwrap();
+/// });
+/// ```
+///
+/// # Errors
+///
+/// Returns the first backend, transfer, or conformance failure.
+pub fn verify_borrowed_buffer_stability_in_scope<S>(scope: &S) -> Result<(), BackendError>
+where
+    S: OwnedExternalBufferScope + BorrowedBufferScope,
+{
+    const EXPECTED: [u8; 6] = [6, 5, 4, 3, 2, 1];
+    let value = scope
+        .externalize(EXPECTED.to_vec().into_boxed_slice())
+        .map_err(|error| error.error().clone())?;
+    let view = scope.buffer_bytes(value)?;
+    let pointer = view.as_ref().as_ptr();
+    if view.as_ref() != EXPECTED {
+        return Err(BackendError::Failure("borrowed buffer contents mismatch"));
+    }
+
+    let number = scope.number(11.0)?;
+    if (scope.as_number(number)? - 11.0).abs() > f64::EPSILON {
+        return Err(BackendError::Failure(
+            "number round-trip failed while a buffer view was live",
+        ));
+    }
+    let string = scope.string("view")?;
+    if scope.to_string(string)? != "view" {
+        return Err(BackendError::Failure(
+            "string round-trip failed while a buffer view was live",
+        ));
+    }
+    if scope.kind(value)? != ValueKind::Buffer {
+        return Err(BackendError::Failure(
+            "buffer changed kind while a view was live",
+        ));
+    }
+    let second = scope.buffer_bytes(value)?;
+    if second.as_ref().as_ptr() != pointer || second.as_ref() != EXPECTED {
+        return Err(BackendError::Failure(
+            "second view of a borrowed buffer disagreed with the first",
+        ));
+    }
+    let other = scope
+        .externalize(vec![9_u8; 3].into_boxed_slice())
+        .map_err(|error| error.error().clone())?;
+    if scope.kind(other)? != ValueKind::Buffer {
+        return Err(BackendError::Failure(
+            "externalized value was not classified as a buffer",
+        ));
+    }
+
+    if view.as_ref().as_ptr() != pointer || view.as_ref() != EXPECTED {
+        return Err(BackendError::Failure(
+            "borrowed buffer view changed during scope work",
+        ));
+    }
+    Ok(())
+}
+
 /// Verifies exact-owner acceptance and semantic buffer classification in one
 /// already-open scope.
 ///
