@@ -393,6 +393,47 @@ mod tests {
     }
 
     #[test]
+    fn foreign_host_unwind_drains_deferred_owned_runtime_without_masking_panic() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+        let inner = Runtime::new().unwrap();
+        let inner_shared = Rc::clone(&inner.shared);
+        let observed_shared = Rc::clone(&inner_shared);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            host.with_backend(move |_| {
+                drop(inner);
+                assert_eq!(observed_shared.gate.state(), HostState::Active);
+                assert_eq!(observed_shared.gate.active_entries(), 0);
+                assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+                panic!("foreign deferred teardown panic");
+            })
+            .unwrap();
+        }));
+
+        assert_eq!(
+            panic
+                .as_ref()
+                .err()
+                .and_then(|payload| payload.downcast_ref::<&str>()),
+            Some(&"foreign deferred teardown panic")
+        );
+        assert_eq!(host.source.active_entries.get(), 0);
+        assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+        assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+
+        host.with_backend(|_| ()).unwrap();
+        assert_eq!(host.source.entries, 2);
+        assert_eq!(host.source.active_entries.get(), 0);
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
+    }
+
+    #[test]
     fn guaranteed_detach_remains_retryable_after_entry_denial() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
