@@ -78,7 +78,7 @@ fn outstanding_cleanup_guard_rejects_teardown_before_engine_release() {
 }
 
 #[test]
-fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
+fn foreign_runtime_entry_rejects_invalidation_without_disturbing_outer_context() {
     struct PanicDrop {
         shared: Weak<Shared>,
         observed: Rc<Cell<bool>>,
@@ -110,7 +110,8 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
         .unwrap();
     outer
         .with_context(|cx| {
-            inner.invalidate().unwrap();
+            assert_eq!(inner.invalidate(), Err(RuntimeError::ActiveEntryConflict));
+            assert!(inner.context.is_some());
             assert!(
                 ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), Rc::as_ptr(&outer_shared)))
             );
@@ -119,6 +120,7 @@ fn cleanup_contains_destructor_panic_without_replacing_outer_runtime_entry() {
             assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
         })
         .unwrap();
+    inner.invalidate().unwrap();
     assert!(observed.get());
     assert_eq!(inner.callback_drop_panics(), 1);
     assert!(!inner.shared.gate.cleanup_in_progress());
