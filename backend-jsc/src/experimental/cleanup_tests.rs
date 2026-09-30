@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::{ACTIVE_CONTEXT, ACTIVE_RUNTIME, GateError, RuntimeError};
-use super::{HostState, Runtime, Shared, Value};
+use super::{HostState, Runtime, Shared, TestContextGroup, Value};
 use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy};
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
@@ -127,10 +127,12 @@ fn independent_runtime_invalidation_preserves_outer_context() {
 }
 
 #[test]
-fn matching_group_invalidation_remains_rejected_during_foreign_entry() {
-    let mut outer = Runtime::new().unwrap();
-    let mut inner = Runtime::new().unwrap();
-    inner.context_group = outer.context_group;
+fn shared_group_invalidation_remains_rejected_during_foreign_entry() {
+    let group = TestContextGroup::new();
+    let mut outer = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let mut inner = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    assert_eq!(outer.context_group, group.0);
+    assert_eq!(inner.context_group, group.0);
 
     outer
         .with_context(|_| {

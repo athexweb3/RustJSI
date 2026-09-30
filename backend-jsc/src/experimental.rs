@@ -105,6 +105,26 @@ pub struct Runtime {
     context_group: NonNull<sys::OpaqueContextGroup>,
 }
 
+#[cfg(test)]
+struct TestContextGroup(NonNull<sys::OpaqueContextGroup>);
+
+#[cfg(test)]
+impl TestContextGroup {
+    fn new() -> Self {
+        // SAFETY: The test owns the returned JSC group and releases it in Drop.
+        let group = unsafe { sys::context_group_create() };
+        Self(NonNull::new(group).expect("JSC test context group"))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestContextGroup {
+    fn drop(&mut self) {
+        // SAFETY: This helper owns one reference returned by JSContextGroupCreate.
+        unsafe { sys::context_group_release(self.0.as_ptr()) };
+    }
+}
+
 /// A scoped, legal entry into a runtime.
 pub struct Context<'cx> {
     shared: &'cx Rc<Shared>,
