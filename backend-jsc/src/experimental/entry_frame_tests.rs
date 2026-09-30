@@ -2,6 +2,14 @@
 
 use super::*;
 
+struct DropProbe(Rc<Cell<usize>>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
 #[test]
 fn active_entry_frame_restores_outer_state_after_nested_entry() {
     let runtime = Runtime::new().unwrap();
@@ -91,6 +99,58 @@ fn dropping_independent_owned_runtime_tears_it_down_before_outer_exit() {
 
             let value = cx.eval("40 + 2", "outer-after-inner-drop.js").unwrap();
             assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
+        })
+        .unwrap();
+}
+
+#[test]
+fn direct_owned_teardown_releases_retained_resources() {
+    let callback_drops = Rc::new(Cell::new(0));
+    let native_drops = Rc::new(Cell::new(0));
+    let mut inner = Runtime::new().unwrap();
+    let persistent = inner
+        .with_context({
+            let callback_probe = DropProbe(Rc::clone(&callback_drops));
+            let native_probe = DropProbe(Rc::clone(&native_drops));
+            move |cx| {
+                cx.install_host_function("teardownProbe", move |_| {
+                    let _probe = &callback_probe;
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+                cx.install_native_state("teardownState", native_probe)
+                    .unwrap();
+                let value = cx.eval("({ answer: 42 })", "teardown-root.js").unwrap();
+                cx.persist(&value).unwrap()
+            }
+        })
+        .unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+    assert!(
+        inner_shared
+            .roots
+            .borrow()
+            .get(persistent.lease.id)
+            .is_some()
+    );
+    assert_eq!(inner_shared.host_functions.borrow().len(), 1);
+
+    let mut outer = Runtime::new().unwrap();
+    outer
+        .with_context(move |_| {
+            drop(inner);
+            assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+            assert!(
+                inner_shared
+                    .roots
+                    .borrow()
+                    .get(persistent.lease.id)
+                    .is_none()
+            );
+            assert!(inner_shared.host_functions.borrow().is_empty());
+            assert_eq!(callback_drops.get(), 1);
+            assert_eq!(native_drops.get(), 1);
+            drop(persistent);
         })
         .unwrap();
 }
