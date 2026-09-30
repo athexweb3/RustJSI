@@ -427,14 +427,21 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns an affinity error or refuses teardown while entries remain.
+    /// Returns an affinity error or refuses teardown while a matching engine
+    /// group remains active.
     pub fn invalidate(&mut self) -> Result<(), RuntimeError> {
         self.shared.ensure_thread()?;
         if self.shared.gate.state() == HostState::Destroyed {
             return Ok(());
         }
         let context = self.context.ok_or(RuntimeError::Invalidated)?;
-        self.shared.ensure_entry_compatible(context)?;
+        if let Err(error) = self.shared.ensure_entry_compatible(context) {
+            if error != RuntimeError::ActiveEntryConflict
+                || !self.context_group_is_independent_from_active_entry()
+            {
+                return Err(error);
+            }
+        }
         destroy_owned_runtime(&self.shared, context)?;
         self.context = None;
         Ok(())
@@ -472,16 +479,12 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         if matches!(self.invalidate(), Err(RuntimeError::ActiveEntryConflict)) {
             if let Some(context) = self.context.take() {
-                if self.context_group_is_independent_from_active_entry() {
-                    let _ = destroy_owned_runtime(&self.shared, context);
-                } else {
-                    DEFERRED_OWNED_DROPS.with(|drops| {
-                        drops.borrow_mut().push(DeferredOwnedRuntimeDrop {
-                            shared: Rc::clone(&self.shared),
-                            context,
-                        });
+                DEFERRED_OWNED_DROPS.with(|drops| {
+                    drops.borrow_mut().push(DeferredOwnedRuntimeDrop {
+                        shared: Rc::clone(&self.shared),
+                        context,
                     });
-                }
+                });
             }
         }
     }
