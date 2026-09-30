@@ -78,7 +78,7 @@ fn outstanding_cleanup_guard_rejects_teardown_before_engine_release() {
 }
 
 #[test]
-fn foreign_runtime_entry_rejects_invalidation_without_disturbing_outer_context() {
+fn independent_runtime_invalidation_preserves_outer_context() {
     struct PanicDrop {
         shared: Weak<Shared>,
         observed: Rc<Cell<bool>>,
@@ -110,8 +110,9 @@ fn foreign_runtime_entry_rejects_invalidation_without_disturbing_outer_context()
         .unwrap();
     outer
         .with_context(|cx| {
-            assert_eq!(inner.invalidate(), Err(RuntimeError::ActiveEntryConflict));
-            assert!(inner.context.is_some());
+            inner.invalidate().unwrap();
+            assert!(inner.context.is_none());
+            assert_eq!(inner.shared.gate.state(), HostState::Destroyed);
             assert!(
                 ACTIVE_RUNTIME.with(|active| std::ptr::eq(active.get(), Rc::as_ptr(&outer_shared)))
             );
@@ -120,8 +121,25 @@ fn foreign_runtime_entry_rejects_invalidation_without_disturbing_outer_context()
             assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
         })
         .unwrap();
-    inner.invalidate().unwrap();
     assert!(observed.get());
     assert_eq!(inner.callback_drop_panics(), 1);
     assert!(!inner.shared.gate.cleanup_in_progress());
+}
+
+#[test]
+fn matching_group_invalidation_remains_rejected_during_foreign_entry() {
+    let mut outer = Runtime::new().unwrap();
+    let mut inner = Runtime::new().unwrap();
+    inner.context_group = outer.context_group;
+
+    outer
+        .with_context(|_| {
+            assert_eq!(inner.invalidate(), Err(RuntimeError::ActiveEntryConflict));
+            assert!(inner.context.is_some());
+            assert_eq!(inner.shared.gate.state(), HostState::Active);
+        })
+        .unwrap();
+
+    inner.invalidate().unwrap();
+    assert_eq!(inner.shared.gate.state(), HostState::Destroyed);
 }
