@@ -5,7 +5,11 @@
 #![forbid(unsafe_code)]
 
 mod drain;
+mod mailbox;
 
 pub use drain::{
     DrainAcquire, DrainAfter, DrainClose, DrainPermit, DrainRequest, DrainSignal, DrainState,
+};
+pub use mailbox::{
+    BoundedMailbox, MailboxAcquire, MailboxDrain, MailboxEnqueue, MailboxEnqueueError,
 };
