@@ -105,6 +105,26 @@ pub struct Runtime {
     context_group: NonNull<sys::OpaqueContextGroup>,
 }
 
+#[cfg(test)]
+struct TestContextGroup(NonNull<sys::OpaqueContextGroup>);
+
+#[cfg(test)]
+impl TestContextGroup {
+    fn new() -> Self {
+        // SAFETY: The test owns the returned JSC group and releases it in Drop.
+        let group = unsafe { sys::context_group_create() };
+        Self(NonNull::new(group).expect("JSC test context group"))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestContextGroup {
+    fn drop(&mut self) {
+        // SAFETY: This helper owns one reference returned by JSContextGroupCreate.
+        unsafe { sys::context_group_release(self.0.as_ptr()) };
+    }
+}
+
 /// A scoped, legal entry into a runtime.
 pub struct Context<'cx> {
     shared: &'cx Rc<Shared>,
@@ -369,14 +389,38 @@ impl Runtime {
     ///
     /// Returns a creation or runtime-identity error if initialization fails.
     pub fn new_with_root_limits(limits: RootLimits) -> Result<Self, RuntimeError> {
-        let mut identity =
-            RuntimeIdentity::allocate().map_err(|_| RuntimeError::IdentityExhausted)?;
-        let id = identity
-            .next_attachment()
-            .map_err(|_| RuntimeError::IdentityExhausted)?;
+        let id = Self::allocate_owned_attachment_id()?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
+        Self::from_owned_context(id, limits, context)
+    }
+
+    #[cfg(test)]
+    fn new_in_context_group_for_test(
+        group: NonNull<sys::OpaqueContextGroup>,
+    ) -> Result<Self, RuntimeError> {
+        let id = Self::allocate_owned_attachment_id()?;
+        // SAFETY: The test owns a live JSC context group for the full lifetime of
+        // each runtime it creates. A null class requests the default global class.
+        let context =
+            unsafe { sys::global_context_create_in_group(group.as_ptr(), ptr::null_mut()) };
+        Self::from_owned_context(id, RootLimits::default(), context)
+    }
+
+    fn allocate_owned_attachment_id() -> Result<AttachmentId, RuntimeError> {
+        let mut identity =
+            RuntimeIdentity::allocate().map_err(|_| RuntimeError::IdentityExhausted)?;
+        identity
+            .next_attachment()
+            .map_err(|_| RuntimeError::IdentityExhausted)
+    }
+
+    fn from_owned_context(
+        id: AttachmentId,
+        limits: RootLimits,
+        context: sys::GlobalContextRef,
+    ) -> Result<Self, RuntimeError> {
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
         // SAFETY: `context` is a newly created, live global context.
         let context_group = unsafe { sys::context_get_group(context.as_ptr()) };

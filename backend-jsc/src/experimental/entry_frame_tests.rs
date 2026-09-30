@@ -54,13 +54,13 @@ fn active_entry_frame_releases_tls_and_admission_during_unwind() {
 }
 
 #[test]
-fn matching_context_group_identity_defers_owned_teardown_until_outer_exit() {
+fn shared_context_group_defers_owned_teardown_until_outer_exit() {
     assert!(take_deferred_owned_drop_drain_observations().is_empty());
-    let mut outer = Runtime::new().unwrap();
-    let mut inner = Runtime::new().unwrap();
-    // Exercise the conservative fallback without requiring a second public
-    // standalone constructor that intentionally shares an engine group.
-    inner.context_group = outer.context_group;
+    let group = TestContextGroup::new();
+    let mut outer = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let inner = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    assert_eq!(outer.context_group, group.0);
+    assert_eq!(inner.context_group, group.0);
     let inner_shared = Rc::clone(&inner.shared);
     let observed_shared = Rc::clone(&inner_shared);
 

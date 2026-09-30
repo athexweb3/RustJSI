@@ -76,6 +76,21 @@ unsafe extern "C" {
     #[link_name = "JSGlobalContextCreate"]
     pub(crate) fn global_context_create(class: *mut ()) -> GlobalContextRef;
 
+    #[cfg(test)]
+    #[link_name = "JSContextGroupCreate"]
+    pub(crate) fn context_group_create() -> ContextGroupRef;
+
+    #[cfg(test)]
+    #[link_name = "JSContextGroupRelease"]
+    pub(crate) fn context_group_release(group: ContextGroupRef);
+
+    #[cfg(test)]
+    #[link_name = "JSGlobalContextCreateInGroup"]
+    pub(crate) fn global_context_create_in_group(
+        group: ContextGroupRef,
+        class: *mut (),
+    ) -> GlobalContextRef;
+
     #[link_name = "JSGlobalContextRelease"]
     pub(crate) fn global_context_release(context: GlobalContextRef);
 
