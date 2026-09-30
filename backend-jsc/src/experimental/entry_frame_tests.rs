@@ -46,10 +46,13 @@ fn active_entry_frame_releases_tls_and_admission_during_unwind() {
 }
 
 #[test]
-fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
+fn matching_context_group_identity_defers_owned_teardown_until_outer_exit() {
     assert!(take_deferred_owned_drop_drain_observations().is_empty());
     let mut outer = Runtime::new().unwrap();
-    let inner = Runtime::new().unwrap();
+    let mut inner = Runtime::new().unwrap();
+    // Exercise the conservative fallback without requiring a second public
+    // standalone constructor that intentionally shares an engine group.
+    inner.context_group = outer.context_group;
     let inner_shared = Rc::clone(&inner.shared);
     let observed_shared = Rc::clone(&inner_shared);
 
@@ -75,9 +78,71 @@ fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
 }
 
 #[test]
-fn backend_entry_drains_deferred_owned_teardown_at_outer_exit() {
+fn dropping_independent_owned_runtime_tears_it_down_before_outer_exit() {
     let mut outer = Runtime::new().unwrap();
     let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+
+    outer
+        .with_context(move |cx| {
+            drop(inner);
+            assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+
+            let value = cx.eval("40 + 2", "outer-after-inner-drop.js").unwrap();
+            assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
+        })
+        .unwrap();
+}
+
+#[test]
+fn independent_owned_teardown_during_outer_unwind_preserves_the_panic() {
+    let mut outer = Runtime::new().unwrap();
+    let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        outer
+            .with_context(move |_| {
+                drop(inner);
+                assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+                assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+                panic!("outer entry panic");
+            })
+            .unwrap();
+    }));
+
+    assert_eq!(
+        panic
+            .as_ref()
+            .err()
+            .and_then(|payload| payload.downcast_ref::<&str>()),
+        Some(&"outer entry panic")
+    );
+    assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
+    assert!(ACTIVE_CONTEXT.with(Cell::get).is_null());
+}
+
+#[test]
+fn backend_entry_tears_down_independent_owned_runtime_before_outer_exit() {
+    let mut outer = Runtime::new().unwrap();
+    let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+
+    outer
+        .with_backend(move |_| {
+            drop(inner);
+            assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+        })
+        .unwrap();
+}
+
+#[test]
+fn backend_entry_drains_deferred_owned_teardown_at_outer_exit() {
+    let mut outer = Runtime::new().unwrap();
+    let mut inner = Runtime::new().unwrap();
+    inner.context_group = outer.context_group;
     let inner_shared = Rc::clone(&inner.shared);
     let observed_shared = Rc::clone(&inner_shared);
 
@@ -102,7 +167,10 @@ fn nested_attachment_entry_does_not_drain_deferred_owned_teardown_early() {
     // attachment's legal final entry.
     let context = unsafe { sys::global_context_create(std::ptr::null_mut()) };
     let context = NonNull::new(context).expect("JSC test context");
-    let inner = Runtime::new().unwrap();
+    let mut inner = Runtime::new().unwrap();
+    // SAFETY: `context` is live for this test and the entry frame owns it.
+    let attachment_group = unsafe { sys::context_get_group(context.as_ptr()) };
+    inner.context_group = NonNull::new(attachment_group).expect("JSC context group");
     let inner_shared = Rc::clone(&inner.shared);
 
     let outer = ActiveEntryFrame::enter(&attachment.shared, context).unwrap();
@@ -137,7 +205,8 @@ fn nested_attachment_entry_does_not_drain_deferred_owned_teardown_early() {
 fn outer_unwind_drains_deferred_owned_teardown_without_masking_panic() {
     let mut outer = Runtime::new().unwrap();
     let outer_shared = Rc::clone(&outer.shared);
-    let inner = Runtime::new().unwrap();
+    let mut inner = Runtime::new().unwrap();
+    inner.context_group = outer.context_group;
     let inner_shared = Rc::clone(&inner.shared);
     let observed_shared = Rc::clone(&inner_shared);
 
