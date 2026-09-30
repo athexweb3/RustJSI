@@ -4,7 +4,7 @@
 
 use crate::sys;
 use rustjsi_host::{
-    AttachmentId, EntryGate, FinalEntryPolicy, GateError, HostState, RuntimeIdentity,
+    AttachmentId, EntryGate, EntryGuard, FinalEntryPolicy, GateError, HostState, RuntimeIdentity,
 };
 mod argument_roots;
 #[cfg(test)]
@@ -15,6 +15,8 @@ mod callback_budget_tests;
 #[cfg(test)]
 mod cleanup_tests;
 mod common;
+#[cfg(test)]
+mod entry_frame_tests;
 mod exception_message;
 #[cfg(test)]
 mod exception_tests;
@@ -290,6 +292,15 @@ struct ActiveRuntimeGuard {
     previous_context: sys::ContextRef,
 }
 
+/// Couples one admitted host entry to the runtime-affine TLS state.
+///
+/// The drop order is deliberate: callbacks and deferred maintenance may observe
+/// the restored runtime state only after this frame has released gate admission.
+struct ActiveEntryFrame<'gate> {
+    active: Option<ActiveRuntimeGuard>,
+    entry: Option<EntryGuard<'gate>>,
+}
+
 struct JsString(NonNull<sys::OpaqueString>);
 
 impl Runtime {
@@ -364,8 +375,7 @@ impl Runtime {
         self.shared.ensure_active()?;
         let context = self.context.ok_or(RuntimeError::Invalidated)?;
         self.shared.ensure_entry_compatible(context)?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), context);
+        let _entry = ActiveEntryFrame::enter(&self.shared, context)?;
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(context);
         let result = {
@@ -380,7 +390,6 @@ impl Runtime {
         };
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(context);
-        drop(active);
         Ok(result)
     }
 
@@ -1310,6 +1319,27 @@ impl ActiveRuntimeGuard {
             previous_runtime,
             previous_context,
         }
+    }
+}
+
+impl<'gate> ActiveEntryFrame<'gate> {
+    fn enter(
+        shared: &'gate Rc<Shared>,
+        context: NonNull<sys::OpaqueContext>,
+    ) -> Result<Self, RuntimeError> {
+        let entry = shared.gate.try_enter().map_err(RuntimeError::Host)?;
+        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(shared), context);
+        Ok(Self {
+            active: Some(active),
+            entry: Some(entry),
+        })
+    }
+}
+
+impl Drop for ActiveEntryFrame<'_> {
+    fn drop(&mut self) {
+        drop(self.active.take());
+        drop(self.entry.take());
     }
 }
 

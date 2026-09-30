@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::local_roots::LocalRoots;
-use super::{ActiveRuntimeGuard, Context, RootLimits, RuntimeError, Shared, sys};
+use super::{ActiveEntryFrame, Context, RootLimits, RuntimeError, Shared, sys};
 use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -107,8 +107,7 @@ impl Attachment {
         self.shared.ensure_active()?;
         let raw = borrowed_global_context(context)?;
         self.shared.ensure_entry_compatible(raw)?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
+        let _entry = ActiveEntryFrame::enter(&self.shared, raw)?;
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
         let result = {
@@ -123,7 +122,6 @@ impl Attachment {
         };
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
-        drop(active);
         Ok(result)
     }
 

@@ -6,7 +6,7 @@ use super::external_buffer::{make_external_object, new_observation};
 use super::local_budget::Reservation;
 use super::local_roots::LocalRoots;
 use super::{
-    ActiveRuntimeGuard, Attachment, JsError, JsException, JsString, RootId, Runtime, RuntimeError,
+    ActiveEntryFrame, Attachment, JsError, JsException, JsString, RootId, Runtime, RuntimeError,
     Shared, exception_to_owned, value_to_string,
 };
 use crate::sys;
@@ -116,8 +116,7 @@ impl Runtime {
         self.shared.ensure_active()?;
         let raw = self.context.ok_or(RuntimeError::Invalidated)?;
         self.shared.ensure_entry_compatible(raw)?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
+        let _entry = ActiveEntryFrame::enter(&self.shared, raw)?;
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
         let result = {
@@ -130,7 +129,6 @@ impl Runtime {
         };
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
-        drop(active);
         Ok(result)
     }
 }
@@ -174,8 +172,7 @@ impl Attachment {
         self.shared.ensure_active()?;
         let raw = super::attachment::borrowed_global_context(context)?;
         self.shared.ensure_entry_compatible(raw)?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
-        let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
+        let _entry = ActiveEntryFrame::enter(&self.shared, raw)?;
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
         let result = {
@@ -188,7 +185,6 @@ impl Attachment {
         };
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
-        drop(active);
         Ok(result)
     }
 }
