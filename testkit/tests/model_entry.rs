@@ -362,6 +362,7 @@ fn borrowed_buffer_view_survives_evaluation_calls_and_root_work() {
     );
 }
 
+#[cfg_attr(miri, ignore = "intentionally leaks a view to verify leak accounting")]
 #[test]
 fn leaked_buffer_view_keeps_owner_live_in_accounting() {
     let mut model = ModelBackend::new();
