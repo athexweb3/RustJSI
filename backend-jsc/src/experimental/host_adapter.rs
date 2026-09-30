@@ -302,20 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn attached_host_entry_drains_deferred_owned_runtime_after_operation() {
+    fn attached_host_entry_tears_down_independent_owned_runtime_before_exit() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
         let mut owner = ForeignOwner::new(attachment.attachment_id());
-        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
         let inner = Runtime::new().unwrap();
         let inner_shared = Rc::clone(&inner.shared);
         let observed_shared = Rc::clone(&inner_shared);
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
 
         host.with_backend(move |_| {
             drop(inner);
-            assert_eq!(observed_shared.gate.state(), HostState::Active);
+            assert_eq!(observed_shared.gate.state(), HostState::Destroyed);
             assert_eq!(observed_shared.gate.active_entries(), 0);
-            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
         })
         .unwrap();
 
@@ -397,10 +397,13 @@ mod tests {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
         let mut owner = ForeignOwner::new(attachment.attachment_id());
-        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
-        let inner = Runtime::new().unwrap();
+        let mut inner = Runtime::new().unwrap();
+        // SAFETY: The owner retains this context for the whole test.
+        let owner_group = unsafe { sys::context_get_group(owner.context.as_ptr()) };
+        inner.context_group = NonNull::new(owner_group).expect("JSC context group");
         let inner_shared = Rc::clone(&inner.shared);
         let observed_shared = Rc::clone(&inner_shared);
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             host.with_backend(move |_| {

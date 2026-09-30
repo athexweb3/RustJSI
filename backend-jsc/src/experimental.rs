@@ -102,6 +102,7 @@ const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 pub struct Runtime {
     shared: Rc<Shared>,
     context: Option<NonNull<sys::OpaqueContext>>,
+    context_group: NonNull<sys::OpaqueContextGroup>,
 }
 
 /// A scoped, legal entry into a runtime.
@@ -377,10 +378,18 @@ impl Runtime {
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
+        // SAFETY: `context` is a newly created, live global context.
+        let context_group = unsafe { sys::context_get_group(context.as_ptr()) };
+        let Some(context_group) = NonNull::new(context_group) else {
+            // SAFETY: `context` is owned by this constructor and has not escaped.
+            unsafe { sys::global_context_release(context.as_ptr()) };
+            return Err(RuntimeError::CreationFailed);
+        };
 
         Ok(Self {
             shared: Shared::new(id, FinalEntryPolicy::Guaranteed, limits),
             context: Some(context),
+            context_group,
         })
     }
 
@@ -445,18 +454,34 @@ impl Runtime {
     pub fn attachment_id(&self) -> AttachmentId {
         self.shared.id
     }
+
+    fn context_group_is_independent_from_active_entry(&self) -> bool {
+        let active_context = ACTIVE_CONTEXT.with(Cell::get);
+        if active_context.is_null() {
+            return false;
+        }
+
+        // SAFETY: `ACTIVE_CONTEXT` is installed only by a live same-thread
+        // `ActiveEntryFrame`; this cold `Drop` path only compares group identity.
+        let active_group = unsafe { sys::context_get_group(active_context) };
+        NonNull::new(active_group).is_some_and(|group| group != self.context_group)
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         if matches!(self.invalidate(), Err(RuntimeError::ActiveEntryConflict)) {
             if let Some(context) = self.context.take() {
-                DEFERRED_OWNED_DROPS.with(|drops| {
-                    drops.borrow_mut().push(DeferredOwnedRuntimeDrop {
-                        shared: Rc::clone(&self.shared),
-                        context,
+                if self.context_group_is_independent_from_active_entry() {
+                    let _ = destroy_owned_runtime(&self.shared, context);
+                } else {
+                    DEFERRED_OWNED_DROPS.with(|drops| {
+                        drops.borrow_mut().push(DeferredOwnedRuntimeDrop {
+                            shared: Rc::clone(&self.shared),
+                            context,
+                        });
                     });
-                });
+                }
             }
         }
     }
@@ -2460,6 +2485,23 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[test]
+    fn standalone_runtimes_use_distinct_context_groups() {
+        let first = Runtime::new().unwrap();
+        let second = Runtime::new().unwrap();
+        let first_context = first.context.unwrap();
+        let second_context = second.context.unwrap();
+
+        // SAFETY: Both contexts are owned by these live standalone runtimes.
+        let first_group = unsafe { sys::context_get_group(first_context.as_ptr()) };
+        // SAFETY: Both contexts are owned by these live standalone runtimes.
+        let second_group = unsafe { sys::context_get_group(second_context.as_ptr()) };
+
+        assert!(!first_group.is_null());
+        assert!(!second_group.is_null());
+        assert_ne!(first_group, second_group);
     }
 
     #[test]
