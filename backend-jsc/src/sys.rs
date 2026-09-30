@@ -14,11 +14,15 @@ pub(crate) const TYPED_ARRAY_NONE: c_int = 10;
 
 pub(crate) enum OpaqueClass {}
 pub(crate) enum OpaqueContext {}
+#[cfg(test)]
+pub(crate) enum OpaqueContextGroup {}
 pub(crate) enum OpaqueString {}
 pub(crate) enum OpaqueValue {}
 
 pub(crate) type ClassRef = *mut OpaqueClass;
 pub(crate) type ContextRef = *const OpaqueContext;
+#[cfg(test)]
+pub(crate) type ContextGroupRef = *mut OpaqueContextGroup;
 pub(crate) type GlobalContextRef = *mut OpaqueContext;
 pub(crate) type StringRef = *mut OpaqueString;
 pub(crate) type ValueRef = *const OpaqueValue;
@@ -82,6 +86,10 @@ unsafe extern "C" {
 
     #[link_name = "JSContextGetGlobalContext"]
     pub(crate) fn context_get_global_context(context: ContextRef) -> GlobalContextRef;
+
+    #[cfg(test)]
+    #[link_name = "JSContextGetGroup"]
+    pub(crate) fn context_get_group(context: ContextRef) -> ContextGroupRef;
 
     #[link_name = "JSEvaluateScript"]
     pub(crate) fn evaluate_script(

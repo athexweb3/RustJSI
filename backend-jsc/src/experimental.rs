@@ -2463,6 +2463,23 @@ mod tests {
     }
 
     #[test]
+    fn standalone_runtimes_use_distinct_context_groups() {
+        let first = Runtime::new().unwrap();
+        let second = Runtime::new().unwrap();
+        let first_context = first.context.unwrap();
+        let second_context = second.context.unwrap();
+
+        // SAFETY: Both contexts are owned by these live standalone runtimes.
+        let first_group = unsafe { sys::context_get_group(first_context.as_ptr()) };
+        // SAFETY: Both contexts are owned by these live standalone runtimes.
+        let second_group = unsafe { sys::context_get_group(second_context.as_ptr()) };
+
+        assert!(!first_group.is_null());
+        assert!(!second_group.is_null());
+        assert_ne!(first_group, second_group);
+    }
+
+    #[test]
     fn invalidation_is_idempotent() {
         let mut runtime = Runtime::new().unwrap();
         runtime.invalidate().unwrap();
