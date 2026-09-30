@@ -15,7 +15,8 @@ mod model_entry;
 mod model_host;
 
 pub use conformance::{
-    create_number_root, verify_base_values, verify_external_buffer_identity,
+    create_number_root, verify_base_values, verify_borrowed_buffer_stability,
+    verify_borrowed_buffer_stability_in_scope, verify_external_buffer_identity,
     verify_external_buffer_identity_in_scope, verify_number_root_and_release,
     verify_owned_external_buffer, verify_strong_root_round_trip,
 };

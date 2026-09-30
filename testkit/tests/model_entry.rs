@@ -3,11 +3,12 @@
 //! Contract checks across borrowed model entries.
 
 use rustjsi_backend::{
-    BackendBase, BackendError, BackendScope, BorrowedBufferScope, OwnedExternalBufferScope,
-    OwnershipTransferError, RootScope,
+    BackendBase, BackendError, BackendScope, BorrowedBufferScope, CallReceiver,
+    OwnedExternalBufferScope, OwnershipTransferError, RootScope,
 };
 use rustjsi_testkit::{
-    Evaluation, ExternalBufferStats, ModelBackend, Primitive, verify_base_values,
+    Evaluation, ExternalBufferStats, Invocation, ModelBackend, Primitive, verify_base_values,
+    verify_borrowed_buffer_stability, verify_borrowed_buffer_stability_in_scope,
     verify_external_buffer_identity_in_scope,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -293,4 +294,95 @@ fn scoped_buffer_conformance_returns_transfer_failures() {
             copied_bytes: 0,
         }
     );
+}
+
+#[test]
+fn borrowed_buffer_view_conformance_holds_for_direct_and_entry_scopes() {
+    let mut model = ModelBackend::new();
+    verify_borrowed_buffer_stability(&mut model).unwrap();
+    model.with_entry(|entry| {
+        let scope = entry.open_scope().unwrap();
+        verify_borrowed_buffer_stability_in_scope(&scope).unwrap();
+    });
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 4,
+            finalized: 4,
+            live_bytes: 0,
+            copied_bytes: 0,
+        }
+    );
+}
+
+#[test]
+fn borrowed_buffer_view_survives_evaluation_calls_and_root_work() {
+    let mut model = ModelBackend::new();
+    model.push_evaluation(Evaluation::ReturnFunction);
+    model.push_invocation(Invocation::Return(Primitive::Number(3.0)));
+    let owner = vec![7_u8, 8, 9].into_boxed_slice();
+    let pointer = owner.as_ptr();
+    let root = {
+        let scope = model.open_scope().unwrap();
+        let buffer = scope.externalize(owner).unwrap();
+        let view = scope.buffer_bytes(buffer).unwrap();
+
+        let function = scope.evaluate("ignored", "model.js").unwrap();
+        let result = scope
+            .call(function, CallReceiver::Object(buffer), &[buffer])
+            .unwrap();
+        assert!((scope.as_number(result).unwrap() - 3.0).abs() < f64::EPSILON);
+        let root = scope.persist(buffer).unwrap();
+        let resolved = scope.resolve(root).unwrap();
+        let temporary = scope.persist(result).unwrap();
+        scope.release(temporary).unwrap();
+        assert_eq!(scope.buffer_bytes(resolved).unwrap().as_ref(), &[7, 8, 9]);
+
+        assert_eq!(view.as_ref().as_ptr(), pointer);
+        assert_eq!(view.as_ref(), &[7, 8, 9]);
+        root
+    };
+    assert_eq!(model.external_buffer_stats().live_bytes, 3);
+    {
+        let scope = model.open_scope().unwrap();
+        let buffer = scope.resolve(root).unwrap();
+        let view = scope.buffer_bytes(buffer).unwrap();
+        scope.release(root).unwrap();
+        assert_eq!(view.as_ref().as_ptr(), pointer);
+        assert_eq!(view.as_ref(), &[7, 8, 9]);
+    }
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 1,
+            finalized: 1,
+            live_bytes: 0,
+            copied_bytes: 0,
+        }
+    );
+}
+
+#[test]
+fn leaked_buffer_view_keeps_owner_live_in_accounting() {
+    let mut model = ModelBackend::new();
+    {
+        let scope = model.open_scope().unwrap();
+        let buffer = scope
+            .externalize(vec![1_u8, 2, 3].into_boxed_slice())
+            .unwrap();
+        let view = scope.buffer_bytes(buffer).unwrap();
+        // Leaking a view is safe; the owner allocation then never drops.
+        std::mem::forget(view);
+    }
+    assert_eq!(
+        model.external_buffer_stats(),
+        ExternalBufferStats {
+            accepted: 1,
+            finalized: 0,
+            live_bytes: 3,
+            copied_bytes: 0,
+        }
+    );
+    let scope = model.open_scope().unwrap();
+    verify_borrowed_buffer_stability_in_scope(&scope).unwrap();
 }
