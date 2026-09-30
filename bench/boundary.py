@@ -85,7 +85,37 @@ JS_CALL_METRICS = {
     "direct": "direct_jsc_js_call",
     "common": "rustjsi_common_js_call",
 }
-SCHEMA = 11
+SCHEMA = 12
+HOST_SYSCTL_KEYS = {
+    "model": "hw.model",
+    "logical_cpus": "hw.logicalcpu",
+    "physical_cpus": "hw.physicalcpu",
+    "memory_bytes": "hw.memsize",
+    "performance_level_0_physical_cpus": "hw.perflevel0.physicalcpu",
+    "performance_level_1_physical_cpus": "hw.perflevel1.physicalcpu",
+}
+HOST_POWER_COMMANDS = {
+    # The active source and the settings applied to it, not every configured profile.
+    "power_source": ("pmset", "-g", "ps"),
+    "power_settings": ("pmset", "-g"),
+}
+HOST_COMMAND_TIMEOUT_SECONDS = 5
+# Power reports name the processes holding sleep assertions and include a
+# battery identifier; neither describes the measurement host, so both are masked.
+HOST_OUTPUT_REDACTIONS = (
+    # Mask to the end of the line: process names may themselves contain parentheses.
+    (re.compile(r"prevented by .*$", re.MULTILINE), "prevented by [redacted]"),
+    (re.compile(r"\bid=\d+"), "id=[redacted]"),
+    # A custom hibernation image path can name a user's home directory.
+    (re.compile(r"^(\s*hibernatefile\s+).*$", re.MULTILINE), r"\1[redacted]"),
+)
+HOST_ENVIRONMENT_LIMITS = (
+    "recorded_once_before_process_runs",
+    "does_not_pin_cpu_or_frequency",
+    "does_not_measure_thermal_state",
+    "does_not_exclude_background_work",
+    "does_not_make_a_performance_gate_qualified",
+)
 
 
 def valid_run_count(value):
@@ -522,11 +552,63 @@ def describe_distribution(values, processes, samples_per_process, unit):
     return result
 
 
-def command(arguments, *, cwd=ROOT):
+def command(arguments, *, cwd=ROOT, timeout=60):
     result = subprocess.run(
-        arguments, cwd=cwd, capture_output=True, text=True, check=True, timeout=60
+        arguments, cwd=cwd, capture_output=True, text=True, check=True, timeout=timeout
     )
     return result.stdout.strip()
+
+
+def optional_command(arguments):
+    """Capture a host fact without making an optional platform detail fatal."""
+    try:
+        output = command(arguments, timeout=HOST_COMMAND_TIMEOUT_SECONDS)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"status": "unavailable"}
+    for pattern, replacement in HOST_OUTPUT_REDACTIONS:
+        output = pattern.sub(replacement, output)
+    return {"status": "available", "output": output}
+
+
+def host_environment():
+    """Record collection context; this is evidence, not machine isolation."""
+    return {
+        "kind": "collection_context_not_isolation",
+        "sysctl": {
+            name: optional_command(["sysctl", "-n", key])
+            for name, key in HOST_SYSCTL_KEYS.items()
+        },
+        **{
+            name: optional_command(list(arguments))
+            for name, arguments in HOST_POWER_COMMANDS.items()
+        },
+        "limits": list(HOST_ENVIRONMENT_LIMITS),
+    }
+
+
+def valid_host_environment(value):
+    if not isinstance(value, dict) or value.keys() != {
+        "kind", "sysctl", "limits", *HOST_POWER_COMMANDS
+    }:
+        return False
+    if value.get("kind") != "collection_context_not_isolation":
+        return False
+    sysctls = value.get("sysctl")
+    if not isinstance(sysctls, dict) or sysctls.keys() != HOST_SYSCTL_KEYS.keys():
+        return False
+    fields = (*sysctls.values(), *(value[name] for name in HOST_POWER_COMMANDS))
+    for field in fields:
+        if not isinstance(field, dict) or field.get("status") not in {
+            "available", "unavailable"
+        }:
+            return False
+        if field["status"] == "available" and (
+            set(field) != {"status", "output"} or not isinstance(field["output"], str)
+        ):
+            return False
+        if field["status"] == "unavailable" and set(field) != {"status"}:
+            return False
+    return value.get("limits") == list(HOST_ENVIRONMENT_LIMITS)
 
 
 def source_stamp():
@@ -562,7 +644,7 @@ def source_stamp():
 
 def write_json(path, value):
     with path.open("x", encoding="utf-8") as output:
-        json.dump(value, output, indent=2, allow_nan=False)
+        json.dump(value, output, indent=2, allow_nan=False, sort_keys=True)
         output.write("\n")
 
 
@@ -639,6 +721,7 @@ def read_report(directory):
         metadata.get("schema") != SCHEMA
         or metadata.get("benchmark") != "boundary"
         or not valid_binary_hashes(metadata.get("binary_sha256"))
+        or not valid_host_environment(metadata.get("host_environment"))
         or metadata.get("callback_ordering") != CALLBACK_ORDERING
         or metadata.get("js_call_ordering") != JS_CALL_ORDERING
     ):
@@ -664,6 +747,7 @@ def read_report(directory):
     ]
     report = summarize(samples)
     report["compiler_selection"] = metadata.get("compiler_selection", "unverified")
+    report["host_environment"] = metadata["host_environment"]
     return report
 
 
@@ -725,6 +809,7 @@ def collect(directory, runs, toolchain):
             "os": command(["sw_vers"]),
             "architecture": platform.machine(),
             "cpu": command(["sysctl", "-n", "machdep.cpu.brand_string"]),
+            "host_environment": host_environment(),
             "sdk": command(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
             "binary_sha256": binary_hashes,
             "environment_overrides": {
@@ -767,6 +852,7 @@ def collect(directory, runs, toolchain):
             raise RuntimeError("a benchmark executable changed during collection")
         report = summarize(samples)
         report["compiler_selection"] = "explicit"
+        report["host_environment"] = metadata["host_environment"]
         write_json(directory / "summary.json", report)
         write_json(directory / "complete.json", {
             "source": final_stamp,
@@ -797,7 +883,7 @@ def main():
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(1, f"boundary: {error}\n")
-    print(json.dumps(result, indent=2, allow_nan=False))
+    print(json.dumps(result, indent=2, allow_nan=False, sort_keys=True))
 
 
 if __name__ == "__main__":
