@@ -88,6 +88,10 @@ where
                 .detach_without_context()
                 .map_err(JscHostError::Runtime);
         }
+        attachment
+            .shared
+            .ensure_no_foreign_active_entry()
+            .map_err(JscHostError::Runtime)?;
         self.source
             .with_global_context(attachment.attachment_id(), |context| {
                 // SAFETY: JscEntrySource's unsafe contract establishes every
@@ -131,6 +135,10 @@ where
         operation: impl for<'entry> FnOnce(&mut <Self::Family as BackendFamily>::Backend<'entry>) -> R,
     ) -> Result<R, Self::Error> {
         let attachment = &mut *self.attachment;
+        attachment
+            .shared
+            .ensure_no_foreign_active_entry()
+            .map_err(JscHostError::Runtime)?;
         self.source
             .with_global_context(attachment.attachment_id(), |context| {
                 // SAFETY: JscEntrySource's unsafe contract establishes every
@@ -145,6 +153,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experimental::Runtime;
     use crate::sys;
     use rustjsi_backend::{BackendError, BackendFamily, BackendScope, RootScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
@@ -232,6 +241,31 @@ mod tests {
             // SAFETY: ForeignOwner owns and releases this context exactly once.
             unsafe { sys::global_context_release(self.context.as_ptr()) };
         }
+    }
+
+    #[test]
+    fn adapter_rejects_foreign_active_runtime_before_source_entry() {
+        let mut outer = Runtime::new().unwrap();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        outer
+            .with_context(|_| {
+                assert_eq!(
+                    host.with_backend(|_| panic!("foreign host operation ran")),
+                    Err(JscHostError::Runtime(RuntimeError::ActiveEntryConflict))
+                );
+                assert_eq!(host.source.entries, 0);
+                assert_eq!(host.source.active_entries.get(), 0);
+            })
+            .unwrap();
+
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
     }
 
     #[test]

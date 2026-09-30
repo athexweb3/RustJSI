@@ -106,6 +106,7 @@ impl Attachment {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let raw = borrowed_global_context(context)?;
+        self.shared.ensure_entry_compatible(raw)?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
@@ -145,6 +146,8 @@ impl Attachment {
         context: *mut c_void,
     ) -> Result<DetachReport, RuntimeError> {
         self.shared.ensure_thread()?;
+        let raw = borrowed_global_context(context)?;
+        self.shared.ensure_entry_compatible(raw)?;
         if self.shared.gate.state() == HostState::Destroyed {
             return Ok(self.empty_report());
         }
@@ -155,7 +158,6 @@ impl Attachment {
             .gate
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
-        let raw = borrowed_global_context(context)?;
         let (released_persistent_roots, released_host_functions, finalized_native_states) =
             self.shared.release_engine_resources(raw);
         cleanup.complete();
@@ -362,6 +364,7 @@ pub(super) fn borrowed_global_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experimental::Runtime;
     use crate::{Value, sys};
     use std::cell::Cell;
 
@@ -400,6 +403,38 @@ mod tests {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
+    }
+
+    #[test]
+    fn foreign_attachment_entry_rejects_another_active_runtime() {
+        let mut outer = Runtime::new().unwrap();
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+
+        outer
+            .with_context(|cx| {
+                assert_eq!(
+                    unsafe { attachment.with_context(owner.as_raw(), |_| ()) },
+                    Err(RuntimeError::ActiveEntryConflict)
+                );
+                assert_eq!(
+                    unsafe { attachment.detach_with_context(owner.as_raw()) },
+                    Err(RuntimeError::ActiveEntryConflict)
+                );
+                assert_eq!(attachment.state(), HostState::Active);
+
+                let value = cx.eval("40 + 2", "outer.js").unwrap();
+                assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
+            })
+            .unwrap();
+
+        assert_eq!(
+            unsafe { attachment.detach_with_context(owner.as_raw()) }
+                .unwrap()
+                .final_entry(),
+            FinalEntryOutcome::Completed
+        );
     }
 
     #[test]

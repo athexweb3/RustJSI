@@ -191,6 +191,8 @@ pub enum RuntimeError {
     Invalidated,
     /// The operation was attempted from a different thread.
     WrongThread,
+    /// A different `RustJSI` runtime entry is already active on this thread.
+    ActiveEntryConflict,
     /// A handle belongs to another runtime.
     WrongRuntime,
     /// A handle no longer names a protected value.
@@ -360,8 +362,9 @@ impl Runtime {
         operation: impl for<'cx> FnOnce(&mut Context<'cx>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let context = self.context.ok_or(RuntimeError::Invalidated)?;
+        self.shared.ensure_entry_compatible(context)?;
+        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), context);
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(context);
@@ -391,6 +394,8 @@ impl Runtime {
         if self.shared.gate.state() == HostState::Destroyed {
             return Ok(());
         }
+        let context = self.context.ok_or(RuntimeError::Invalidated)?;
+        self.shared.ensure_entry_compatible(context)?;
 
         self.shared.gate.request_drain();
         let cleanup = self
@@ -398,7 +403,6 @@ impl Runtime {
             .gate
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
-        let context = self.context.ok_or(RuntimeError::Invalidated)?;
         self.shared.release_engine_resources(context);
         cleanup.complete();
         self.shared
@@ -993,6 +997,7 @@ impl fmt::Display for RuntimeError {
             Self::NullContext => "host supplied a null JavaScriptCore context",
             Self::Invalidated => "runtime is invalidated",
             Self::WrongThread => "runtime entered from the wrong thread",
+            Self::ActiveEntryConflict => "another RustJSI runtime entry is active on this thread",
             Self::WrongRuntime => "handle belongs to another runtime",
             Self::StaleHandle => "handle is stale",
             Self::IdentityExhausted => "runtime identity space is exhausted",
@@ -1080,6 +1085,32 @@ impl Shared {
             Ok(())
         } else {
             Err(RuntimeError::Invalidated)
+        }
+    }
+
+    fn ensure_entry_compatible(
+        &self,
+        context: NonNull<sys::OpaqueContext>,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_no_foreign_active_entry()?;
+        let active_runtime = ACTIVE_RUNTIME.with(Cell::get);
+        let active_context = ACTIVE_CONTEXT.with(Cell::get);
+        if active_runtime.is_null()
+            || (std::ptr::eq(active_runtime, self) && active_context == context.as_ptr())
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::ActiveEntryConflict)
+        }
+    }
+
+    fn ensure_no_foreign_active_entry(&self) -> Result<(), RuntimeError> {
+        self.ensure_thread()?;
+        let active_runtime = ACTIVE_RUNTIME.with(Cell::get);
+        if active_runtime.is_null() || std::ptr::eq(active_runtime, self) {
+            Ok(())
+        } else {
+            Err(RuntimeError::ActiveEntryConflict)
         }
     }
 
@@ -2315,25 +2346,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_runtime_locals_before_entering_jsc() {
+    fn rejects_nested_foreign_runtime_before_using_outer_local() {
         let mut first = Runtime::new().unwrap();
         let mut second = Runtime::new().unwrap();
         assert_ne!(first.attachment_id(), second.attachment_id());
         first
             .with_context(|first_context| {
                 let local = first_context.eval("42", "first.js").unwrap();
-                second
-                    .with_context(|second_context| {
-                        assert_eq!(
-                            second_context.number(&local).unwrap_err(),
-                            JsError::Runtime(RuntimeError::WrongRuntime)
-                        );
-                        assert_eq!(
-                            second_context.persist(&local).unwrap_err(),
-                            JsError::Runtime(RuntimeError::WrongRuntime)
-                        );
-                    })
-                    .unwrap();
+                assert_eq!(
+                    second.with_context(|_| panic!("foreign runtime entry ran")),
+                    Err(RuntimeError::ActiveEntryConflict)
+                );
+                assert_eq!(
+                    first_context.number(&local).unwrap().to_bits(),
+                    42.0_f64.to_bits()
+                );
             })
             .unwrap();
     }
@@ -2472,28 +2499,21 @@ mod tests {
     }
 
     #[test]
-    fn nested_runtime_panic_restores_outer_entry_and_callback_dispatch() {
+    fn nested_foreign_runtime_entry_is_rejected_without_disturbing_outer_context() {
         let mut first = Runtime::new().unwrap();
         let mut second = Runtime::new().unwrap();
         let first_shared = Rc::clone(&first.shared);
         let second_shared = Rc::clone(&second.shared);
         let first_context = first.context.unwrap();
-        let second_context = second.context.unwrap();
         first
             .with_context(|cx| {
                 assert_eq!(ACTIVE_CONTEXT.with(Cell::get), first_context.as_ptr());
                 cx.install_host_function("outerAnswer", |_| Ok(Value::Number(42.0)))
                     .unwrap();
-                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    second.with_backend(|_| {
-                        assert_eq!(first_shared.gate.active_entries(), 1);
-                        assert_eq!(second_shared.gate.active_entries(), 1);
-                        assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&second_shared));
-                        assert_eq!(ACTIVE_CONTEXT.with(Cell::get), second_context.as_ptr());
-                        panic!("nested entry panic");
-                    })
-                }));
-                assert!(panic.is_err());
+                assert_eq!(
+                    second.with_backend(|_| panic!("foreign runtime entry ran")),
+                    Err(RuntimeError::ActiveEntryConflict)
+                );
                 assert_eq!(second_shared.gate.active_entries(), 0);
                 assert_eq!(ACTIVE_RUNTIME.with(Cell::get), Rc::as_ptr(&first_shared));
                 assert_eq!(ACTIVE_CONTEXT.with(Cell::get), first_context.as_ptr());
