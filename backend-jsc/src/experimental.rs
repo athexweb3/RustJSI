@@ -19,6 +19,8 @@ mod exception_message;
 #[cfg(test)]
 mod exception_tests;
 mod external_buffer;
+#[cfg(test)]
+mod external_buffer_transfer_tests;
 mod host_adapter;
 mod local_budget;
 #[cfg(test)]
