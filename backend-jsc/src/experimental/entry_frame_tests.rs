@@ -44,3 +44,23 @@ fn active_entry_frame_releases_tls_and_admission_during_unwind() {
     assert!(ACTIVE_RUNTIME.with(Cell::get).is_null());
     assert!(ACTIVE_CONTEXT.with(Cell::get).is_null());
 }
+
+#[test]
+fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
+    let mut outer = Runtime::new().unwrap();
+    let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+    let observed_shared = Rc::clone(&inner_shared);
+
+    outer
+        .with_context(move |_| {
+            drop(inner);
+            assert_eq!(observed_shared.gate.state(), HostState::Active);
+            assert_eq!(observed_shared.gate.active_entries(), 0);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+        })
+        .unwrap();
+
+    assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+}

@@ -76,6 +76,7 @@ impl Default for RootLimits {
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
     static ACTIVE_CONTEXT: Cell<sys::ContextRef> = const { Cell::new(ptr::null()) };
+    static DEFERRED_OWNED_DROPS: RefCell<Vec<DeferredOwnedRuntimeDrop>> = const { RefCell::new(Vec::new()) };
 }
 
 const INLINE_ARGUMENTS: usize = 8;
@@ -301,6 +302,11 @@ struct ActiveEntryFrame<'gate> {
     entry: Option<EntryGuard<'gate>>,
 }
 
+struct DeferredOwnedRuntimeDrop {
+    shared: Rc<Shared>,
+    context: NonNull<sys::OpaqueContext>,
+}
+
 struct JsString(NonNull<sys::OpaqueString>);
 
 impl Runtime {
@@ -405,29 +411,8 @@ impl Runtime {
         }
         let context = self.context.ok_or(RuntimeError::Invalidated)?;
         self.shared.ensure_entry_compatible(context)?;
-
-        self.shared.gate.request_drain();
-        let cleanup = self
-            .shared
-            .gate
-            .try_begin_cleanup()
-            .map_err(RuntimeError::Host)?;
-        self.shared.release_engine_resources(context);
-        cleanup.complete();
-        self.shared
-            .gate
-            .finish_drain()
-            .map_err(RuntimeError::Host)?;
-
-        // SAFETY: `Runtime` owns the retained global context, all RustJSI roots have
-        // been released, and the owning thread is performing the single release.
-        unsafe { sys::global_context_release(context.as_ptr()) };
+        destroy_owned_runtime(&self.shared, context)?;
         self.context = None;
-        self.shared.retire_native_states();
-        self.shared
-            .gate
-            .mark_destroyed()
-            .map_err(RuntimeError::Host)?;
         Ok(())
     }
 
@@ -449,7 +434,16 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _ = self.invalidate();
+        if matches!(self.invalidate(), Err(RuntimeError::ActiveEntryConflict)) {
+            if let Some(context) = self.context.take() {
+                DEFERRED_OWNED_DROPS.with(|drops| {
+                    drops.borrow_mut().push(DeferredOwnedRuntimeDrop {
+                        shared: Rc::clone(&self.shared),
+                        context,
+                    });
+                });
+            }
+        }
     }
 }
 
@@ -1340,6 +1334,36 @@ impl Drop for ActiveEntryFrame<'_> {
     fn drop(&mut self) {
         drop(self.active.take());
         drop(self.entry.take());
+        if ACTIVE_RUNTIME.with(Cell::get).is_null() {
+            drain_deferred_owned_drops();
+        }
+    }
+}
+
+fn destroy_owned_runtime(
+    shared: &Rc<Shared>,
+    context: NonNull<sys::OpaqueContext>,
+) -> Result<(), RuntimeError> {
+    shared.gate.request_drain();
+    let cleanup = shared
+        .gate
+        .try_begin_cleanup()
+        .map_err(RuntimeError::Host)?;
+    shared.release_engine_resources(context);
+    cleanup.complete();
+    shared.gate.finish_drain().map_err(RuntimeError::Host)?;
+    // SAFETY: The standalone runtime owns this context, all RustJSI roots are
+    // released, and teardown runs on the context's owner thread.
+    unsafe { sys::global_context_release(context.as_ptr()) };
+    shared.retire_native_states();
+    shared.gate.mark_destroyed().map_err(RuntimeError::Host)
+}
+
+fn drain_deferred_owned_drops() {
+    loop {
+        let deferred = DEFERRED_OWNED_DROPS.with(|drops| drops.borrow_mut().pop());
+        let Some(deferred) = deferred else { break };
+        let _ = destroy_owned_runtime(&deferred.shared, deferred.context);
     }
 }
 
