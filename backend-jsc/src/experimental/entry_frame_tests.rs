@@ -156,6 +156,61 @@ fn direct_owned_teardown_releases_retained_resources() {
 }
 
 #[test]
+fn shared_context_group_deferred_teardown_releases_retained_resources() {
+    let callback_drops = Rc::new(Cell::new(0));
+    let native_drops = Rc::new(Cell::new(0));
+    let group = TestContextGroup::new();
+    let mut inner = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let persistent = inner
+        .with_context({
+            let callback_probe = DropProbe(Rc::clone(&callback_drops));
+            let native_probe = DropProbe(Rc::clone(&native_drops));
+            move |cx| {
+                cx.install_host_function("deferredTeardownProbe", move |_| {
+                    let _probe = &callback_probe;
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+                cx.install_native_state("deferredTeardownState", native_probe)
+                    .unwrap();
+                let value = cx
+                    .eval("({ answer: 42 })", "deferred-teardown-root.js")
+                    .unwrap();
+                cx.persist(&value).unwrap()
+            }
+        })
+        .unwrap();
+    let persistent_id = persistent.lease.id;
+    let inner_shared = Rc::clone(&inner.shared);
+    let observed_shared = Rc::clone(&inner_shared);
+    let observed_callback_drops = Rc::clone(&callback_drops);
+    let observed_native_drops = Rc::clone(&native_drops);
+    assert!(inner_shared.roots.borrow().get(persistent_id).is_some());
+    assert_eq!(inner_shared.host_functions.borrow().len(), 1);
+
+    let mut outer = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    outer
+        .with_context(move |_| {
+            drop(inner);
+            assert_eq!(observed_shared.gate.state(), HostState::Active);
+            assert!(observed_shared.roots.borrow().get(persistent_id).is_some());
+            assert_eq!(observed_shared.host_functions.borrow().len(), 1);
+            assert_eq!(observed_callback_drops.get(), 0);
+            assert_eq!(observed_native_drops.get(), 0);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+            drop(persistent);
+        })
+        .unwrap();
+
+    assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+    assert!(inner_shared.roots.borrow().get(persistent_id).is_none());
+    assert!(inner_shared.host_functions.borrow().is_empty());
+    assert_eq!(callback_drops.get(), 1);
+    assert_eq!(native_drops.get(), 1);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+}
+
+#[test]
 fn independent_owned_teardown_during_outer_unwind_preserves_the_panic() {
     let mut outer = Runtime::new().unwrap();
     let inner = Runtime::new().unwrap();
