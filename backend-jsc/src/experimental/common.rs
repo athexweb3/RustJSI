@@ -114,8 +114,9 @@ impl Runtime {
         operation: impl for<'entry> FnOnce(&mut JscBackend<'entry>) -> R,
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
-        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let raw = self.context.ok_or(RuntimeError::Invalidated)?;
+        self.shared.ensure_entry_compatible(raw)?;
+        let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
         self.shared.drain_root_releases(raw);
@@ -172,6 +173,7 @@ impl Attachment {
     ) -> Result<R, RuntimeError> {
         self.shared.ensure_active()?;
         let raw = super::attachment::borrowed_global_context(context)?;
+        self.shared.ensure_entry_compatible(raw)?;
         let _entry = self.shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(&self.shared), raw);
         self.shared.drain_native_finalizers();
@@ -688,6 +690,9 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::WrongThread => {
             BackendError::Failure("JavaScriptCore runtime thread mismatch")
         }
+        RuntimeError::ActiveEntryConflict => {
+            BackendError::Failure("another RustJSI runtime entry is active")
+        }
         RuntimeError::IdentityExhausted => BackendError::Failure("runtime identity exhausted"),
         RuntimeError::ScopeDepthExceeded => BackendError::Failure("Context scope depth exceeded"),
         RuntimeError::PersistentRootLimitReached => {
@@ -838,31 +843,32 @@ mod tests {
     #[test]
     fn call_rejects_foreign_values_before_execution() {
         let mut first = Runtime::new().unwrap();
-        let mut second = Runtime::new().unwrap();
+        let second = Runtime::new().unwrap();
+        let foreign_attachment = second.attachment_id();
         first
             .with_backend(|backend| {
                 let scope = backend.open_scope().unwrap();
                 let function = scope
                     .evaluate("(() => { throw 'must not execute'; })", "foreign.js")
                     .unwrap();
-                second
-                    .with_backend(|other| {
-                        let foreign = other.open_scope().unwrap();
-                        let number = foreign.number(1.0).unwrap();
-                        assert_eq!(
-                            scope.call(function, CallReceiver::Global, &[number]),
-                            Err(BackendError::WrongBackend)
-                        );
-                        assert_eq!(
-                            scope.call(number, CallReceiver::Global, &[]),
-                            Err(BackendError::WrongBackend)
-                        );
-                        assert_eq!(
-                            scope.call(function, CallReceiver::Object(number), &[]),
-                            Err(BackendError::WrongBackend)
-                        );
-                    })
-                    .unwrap();
+                let foreign = JscValue {
+                    attachment: foreign_attachment,
+                    raw: NonNull::dangling(),
+                    _scope: PhantomData,
+                    _affine: PhantomData,
+                };
+                assert_eq!(
+                    scope.call(function, CallReceiver::Global, &[foreign]),
+                    Err(BackendError::WrongBackend)
+                );
+                assert_eq!(
+                    scope.call(foreign, CallReceiver::Global, &[]),
+                    Err(BackendError::WrongBackend)
+                );
+                assert_eq!(
+                    scope.call(function, CallReceiver::Object(foreign), &[]),
+                    Err(BackendError::WrongBackend)
+                );
             })
             .unwrap();
     }
