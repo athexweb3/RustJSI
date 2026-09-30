@@ -153,13 +153,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::experimental::Runtime;
+    use crate::experimental::{DEFERRED_OWNED_DROPS, Runtime};
     use crate::sys;
     use rustjsi_backend::{BackendError, BackendFamily, BackendScope, RootScope};
     use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::NonNull;
+    use std::rc::Rc;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum EntryDenied {
@@ -298,6 +299,33 @@ mod tests {
             FinalEntryOutcome::Completed
         );
         assert_eq!(host.source.entries, 2);
+    }
+
+    #[test]
+    fn attached_host_entry_drains_deferred_owned_runtime_after_operation() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+        let inner = Runtime::new().unwrap();
+        let inner_shared = Rc::clone(&inner.shared);
+        let observed_shared = Rc::clone(&inner_shared);
+
+        host.with_backend(move |_| {
+            drop(inner);
+            assert_eq!(observed_shared.gate.state(), HostState::Active);
+            assert_eq!(observed_shared.gate.active_entries(), 0);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+        })
+        .unwrap();
+
+        assert_eq!(host.source.active_entries.get(), 0);
+        assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+        assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
     }
 
     #[test]

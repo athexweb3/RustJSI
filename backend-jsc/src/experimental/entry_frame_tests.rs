@@ -66,6 +66,26 @@ fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
 }
 
 #[test]
+fn backend_entry_drains_deferred_owned_teardown_at_outer_exit() {
+    let mut outer = Runtime::new().unwrap();
+    let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+    let observed_shared = Rc::clone(&inner_shared);
+
+    outer
+        .with_backend(move |_| {
+            drop(inner);
+            assert_eq!(observed_shared.gate.state(), HostState::Active);
+            assert_eq!(observed_shared.gate.active_entries(), 0);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+        })
+        .unwrap();
+
+    assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+}
+
+#[test]
 fn outer_unwind_drains_deferred_owned_teardown_without_masking_panic() {
     let mut outer = Runtime::new().unwrap();
     let outer_shared = Rc::clone(&outer.shared);
