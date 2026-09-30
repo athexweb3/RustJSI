@@ -47,6 +47,7 @@ fn active_entry_frame_releases_tls_and_admission_during_unwind() {
 
 #[test]
 fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
+    assert!(take_deferred_owned_drop_drain_observations().is_empty());
     let mut outer = Runtime::new().unwrap();
     let inner = Runtime::new().unwrap();
     let inner_shared = Rc::clone(&inner.shared);
@@ -63,6 +64,14 @@ fn dropping_foreign_runtime_defers_owned_teardown_until_outer_exit() {
 
     assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
     assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+    assert_eq!(
+        take_deferred_owned_drop_drain_observations(),
+        vec![DeferredOwnedDropDrainObservation {
+            outer_active_entries: 0,
+            active_runtime_present: false,
+            active_context_present: false,
+        }]
+    );
 }
 
 #[test]
