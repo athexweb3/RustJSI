@@ -544,6 +544,39 @@ mod tests {
     }
 
     #[test]
+    fn finalizer_queue_close_races_publication_without_retaining_a_token() {
+        const ROUNDS: usize = 256;
+
+        for slot in 0..ROUNDS {
+            let queue = Arc::new(FinalizerQueue::new());
+            let start = Arc::new(Barrier::new(2));
+
+            std::thread::scope(|scope| {
+                let worker_queue = Arc::clone(&queue);
+                let worker_start = Arc::clone(&start);
+                scope.spawn(move || {
+                    let token = test_finalizer_token(&worker_queue, slot);
+                    worker_start.wait();
+                    // SAFETY: This worker publishes its unique test token using
+                    // the same ownership handoff as an engine finalizer.
+                    unsafe { worker_queue.push(token) };
+                });
+
+                start.wait();
+                let detached = queue.close();
+                // SAFETY: `close` returns the unique list published before its
+                // closed sentinel became visible. A late publication is dropped
+                // by `push` instead and does not appear in this list.
+                assert!(unsafe { drop_test_finalizer_tokens(detached) } <= 1);
+            });
+
+            assert!(queue.take().is_null());
+            assert!(queue.close().is_null());
+            assert_eq!(Arc::strong_count(&queue), 1, "round {slot}");
+        }
+    }
+
+    #[test]
     fn native_access_releases_the_registry_borrow_before_user_code() {
         let mut runtime = Runtime::new().unwrap();
         let shared = Rc::clone(&runtime.shared);
