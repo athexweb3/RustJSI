@@ -86,6 +86,45 @@ fn backend_entry_drains_deferred_owned_teardown_at_outer_exit() {
 }
 
 #[test]
+fn nested_attachment_entry_does_not_drain_deferred_owned_teardown_early() {
+    let mut identity = RuntimeIdentity::allocate().unwrap();
+    let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+    // SAFETY: This test owns the JSC global context and releases it after the
+    // attachment's legal final entry.
+    let context = unsafe { sys::global_context_create(std::ptr::null_mut()) };
+    let context = NonNull::new(context).expect("JSC test context");
+    let inner = Runtime::new().unwrap();
+    let inner_shared = Rc::clone(&inner.shared);
+
+    let outer = ActiveEntryFrame::enter(&attachment.shared, context).unwrap();
+    let nested = ActiveEntryFrame::enter(&attachment.shared, context).unwrap();
+    assert_eq!(attachment.shared.gate.active_entries(), 2);
+
+    drop(inner);
+    assert_eq!(inner_shared.gate.state(), HostState::Active);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+
+    drop(nested);
+    assert_eq!(attachment.shared.gate.active_entries(), 1);
+    assert_eq!(inner_shared.gate.state(), HostState::Active);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 1);
+
+    drop(outer);
+    assert_eq!(attachment.shared.gate.active_entries(), 0);
+    assert_eq!(inner_shared.gate.state(), HostState::Destroyed);
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+
+    // SAFETY: No entry remains, `attachment` is bound to this live context, and
+    // this call performs its required final cleanup before this test releases it.
+    unsafe {
+        let _ = attachment
+            .detach_with_context(context.as_ptr().cast())
+            .unwrap();
+        sys::global_context_release(context.as_ptr());
+    }
+}
+
+#[test]
 fn outer_unwind_drains_deferred_owned_teardown_without_masking_panic() {
     let mut outer = Runtime::new().unwrap();
     let outer_shared = Rc::clone(&outer.shared);
