@@ -79,6 +79,11 @@ thread_local! {
     static DEFERRED_OWNED_DROPS: RefCell<Vec<DeferredOwnedRuntimeDrop>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static DEFERRED_OWNED_DROP_DRAIN_OBSERVATIONS: RefCell<Vec<DeferredOwnedDropDrainObservation>> = const { RefCell::new(Vec::new()) };
+}
+
 const INLINE_ARGUMENTS: usize = 8;
 const MAX_HOST_FUNCTIONS: usize = 4096;
 const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
@@ -298,8 +303,18 @@ struct ActiveRuntimeGuard {
 /// The drop order is deliberate: callbacks and deferred maintenance may observe
 /// the restored runtime state only after this frame has released gate admission.
 struct ActiveEntryFrame<'gate> {
+    #[cfg(test)]
+    shared: &'gate Rc<Shared>,
     active: Option<ActiveRuntimeGuard>,
     entry: Option<EntryGuard<'gate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredOwnedDropDrainObservation {
+    outer_active_entries: u32,
+    active_runtime_present: bool,
+    active_context_present: bool,
 }
 
 struct DeferredOwnedRuntimeDrop {
@@ -1324,6 +1339,8 @@ impl<'gate> ActiveEntryFrame<'gate> {
         let entry = shared.gate.try_enter().map_err(RuntimeError::Host)?;
         let active = ActiveRuntimeGuard::enter(Rc::as_ptr(shared), context);
         Ok(Self {
+            #[cfg(test)]
+            shared,
             active: Some(active),
             entry: Some(entry),
         })
@@ -1335,6 +1352,8 @@ impl Drop for ActiveEntryFrame<'_> {
         drop(self.active.take());
         drop(self.entry.take());
         if ACTIVE_RUNTIME.with(Cell::get).is_null() {
+            #[cfg(test)]
+            observe_deferred_owned_drop_drain(self.shared);
             drain_deferred_owned_drops();
         }
     }
@@ -1365,6 +1384,30 @@ fn drain_deferred_owned_drops() {
         let Some(deferred) = deferred else { break };
         let _ = destroy_owned_runtime(&deferred.shared, deferred.context);
     }
+}
+
+#[cfg(test)]
+fn observe_deferred_owned_drop_drain(outer: &Rc<Shared>) {
+    let pending = DEFERRED_OWNED_DROPS.with(|drops| !drops.borrow().is_empty());
+    if !pending {
+        return;
+    }
+
+    DEFERRED_OWNED_DROP_DRAIN_OBSERVATIONS.with(|observations| {
+        observations
+            .borrow_mut()
+            .push(DeferredOwnedDropDrainObservation {
+                outer_active_entries: outer.gate.active_entries(),
+                active_runtime_present: !ACTIVE_RUNTIME.with(Cell::get).is_null(),
+                active_context_present: !ACTIVE_CONTEXT.with(Cell::get).is_null(),
+            });
+    });
+}
+
+#[cfg(test)]
+fn take_deferred_owned_drop_drain_observations() -> Vec<DeferredOwnedDropDrainObservation> {
+    DEFERRED_OWNED_DROP_DRAIN_OBSERVATIONS
+        .with(|observations| std::mem::take(&mut *observations.borrow_mut()))
 }
 
 impl Drop for ActiveRuntimeGuard {
