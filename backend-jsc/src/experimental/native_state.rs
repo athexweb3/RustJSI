@@ -450,6 +450,39 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::mem::{align_of, size_of};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Barrier};
+
+    fn test_finalizer_token(queue: &Arc<FinalizerQueue>, slot: usize) -> *mut FinalizerToken {
+        Box::into_raw(Box::new(FinalizerToken {
+            queue: Arc::clone(queue),
+            id: NativeId {
+                slot,
+                generation: 1,
+            },
+            next: AtomicPtr::new(ptr::null_mut()),
+        }))
+    }
+
+    /// Reclaims a list returned by [`FinalizerQueue::take`] or
+    /// [`FinalizerQueue::close`] without consulting the native-state registry.
+    ///
+    /// # Safety
+    ///
+    /// `token` must be the unique detached list returned by this queue, and it
+    /// must not have been reclaimed already.
+    unsafe fn drop_test_finalizer_tokens(mut token: *mut FinalizerToken) -> usize {
+        let mut count = 0;
+        while let Some(current) = NonNull::new(token) {
+            // SAFETY: The caller transferred the unique detached list to this
+            // helper. Each node is removed from the list before it is dropped.
+            let boxed = unsafe { Box::from_raw(current.as_ptr()) };
+            token = boxed.next.load(Ordering::Relaxed);
+            drop(boxed);
+            count += 1;
+        }
+        count
+    }
 
     struct DropProbe {
         value: usize,
@@ -460,6 +493,54 @@ mod tests {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
         }
+    }
+
+    #[test]
+    fn finalizer_queue_drains_every_concurrent_publication_once() {
+        const PRODUCERS: usize = 8;
+        const TOKENS_PER_PRODUCER: usize = 128;
+
+        let queue = Arc::new(FinalizerQueue::new());
+        let start = Arc::new(Barrier::new(PRODUCERS + 1));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut reclaimed = 0;
+
+        std::thread::scope(|scope| {
+            for producer in 0..PRODUCERS {
+                let queue = Arc::clone(&queue);
+                let start = Arc::clone(&start);
+                let finished = Arc::clone(&finished);
+                scope.spawn(move || {
+                    start.wait();
+                    for offset in 0..TOKENS_PER_PRODUCER {
+                        let slot = producer * TOKENS_PER_PRODUCER + offset;
+                        // SAFETY: This worker transfers each uniquely owned test
+                        // token to the queue exactly as a finalizer would.
+                        unsafe { queue.push(test_finalizer_token(&queue, slot)) };
+                    }
+                    finished.fetch_add(1, Ordering::Release);
+                });
+            }
+
+            start.wait();
+            loop {
+                let token = queue.take();
+                // SAFETY: `take` gives this owner thread a unique detached list.
+                reclaimed += unsafe { drop_test_finalizer_tokens(token) };
+
+                if finished.load(Ordering::Acquire) == PRODUCERS {
+                    let remaining = queue.take();
+                    // SAFETY: The final `take` detaches every remaining node.
+                    reclaimed += unsafe { drop_test_finalizer_tokens(remaining) };
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        assert_eq!(reclaimed, PRODUCERS * TOKENS_PER_PRODUCER);
+        assert!(queue.take().is_null());
+        assert_eq!(Arc::strong_count(&queue), 1);
     }
 
     #[test]
