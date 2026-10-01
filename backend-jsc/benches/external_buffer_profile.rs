@@ -2,6 +2,9 @@
 
 //! Matched direct and `RustJSI` owned-external-buffer construction profile.
 
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
 #[cfg(target_os = "macos")]
 fn main() {
     const BLOCK_SIZE: usize = 8;
