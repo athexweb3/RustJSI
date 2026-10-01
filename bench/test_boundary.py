@@ -788,39 +788,92 @@ class ArtifactTests(unittest.TestCase):
                     metadata["host_environment"] = host
                 boundary.write_json(directory / "metadata.json", metadata)
                 boundary.write_json(directory / "complete.json", {
-                    key: metadata[key] for key in ("source", "binary_sha256")
+                    **{key: metadata[key] for key in ("source", "binary_sha256")},
+                    "host_environment": self.host_environment(),
                 })
                 with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
                     boundary.read_report(directory)
 
     def test_report_requires_valid_collection_preconditions(self):
         cases = (
-            (boundary.collection_preconditions(True, False), "power_source", "Now drawing from 'Battery Power'"),
-            (boundary.collection_preconditions(False, True), "power_settings", "lowpowermode 1"),
+            (
+                boundary.collection_preconditions(True, False),
+                "power_source",
+                "Now drawing from 'Battery Power'",
+            ),
+            (
+                boundary.collection_preconditions(False, True),
+                "power_settings",
+                "lowpowermode 1",
+            ),
         )
         for preconditions, field, output in cases:
-            with self.subTest(preconditions=preconditions), tempfile.TemporaryDirectory() as temporary:
-                directory = Path(temporary)
-                metadata = {
-                    "schema": boundary.SCHEMA,
-                    "benchmark": "boundary",
-                    "runs": 12,
-                    "source": {"head": "test"},
-                    "binary_sha256": self.HASHES,
-                    "host_environment": self.host_environment(),
-                    "collection_preconditions": preconditions,
-                    "callback_ordering": boundary.CALLBACK_ORDERING,
-                    "js_call_ordering": boundary.JS_CALL_ORDERING,
-                    "entry_ordering": boundary.ENTRY_ORDERING,
-                    "scalar_ordering": boundary.SCALAR_ORDERING,
-                }
-                metadata["host_environment"][field]["output"] = output
-                boundary.write_json(directory / "metadata.json", metadata)
-                boundary.write_json(directory / "complete.json", {
-                    key: metadata[key] for key in ("source", "binary_sha256")
-                })
-                with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
-                    boundary.read_report(directory)
+            for location in ("metadata", "completion"):
+                with (
+                    self.subTest(preconditions=preconditions, location=location),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    directory = Path(temporary)
+                    metadata = {
+                        "schema": boundary.SCHEMA,
+                        "benchmark": "boundary",
+                        "runs": 12,
+                        "source": {"head": "test"},
+                        "binary_sha256": self.HASHES,
+                        "host_environment": self.host_environment(),
+                        "collection_preconditions": preconditions,
+                        "callback_ordering": boundary.CALLBACK_ORDERING,
+                        "js_call_ordering": boundary.JS_CALL_ORDERING,
+                        "entry_ordering": boundary.ENTRY_ORDERING,
+                        "scalar_ordering": boundary.SCALAR_ORDERING,
+                    }
+                    completion = {
+                        **{key: metadata[key] for key in ("source", "binary_sha256")},
+                        "host_environment": self.host_environment(),
+                    }
+                    target = (
+                        metadata["host_environment"]
+                        if location == "metadata"
+                        else completion["host_environment"]
+                    )
+                    target[field]["output"] = output
+                    boundary.write_json(directory / "metadata.json", metadata)
+                    boundary.write_json(directory / "complete.json", completion)
+                    if location == "metadata":
+                        with self.assertRaisesRegex(
+                            ValueError, "unsupported benchmark metadata"
+                        ):
+                            boundary.read_report(directory)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "unsupported benchmark completion metadata"
+                        ):
+                            boundary.read_report(directory)
+
+    def test_report_requires_final_host_context(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": boundary.SCHEMA,
+                "benchmark": "boundary",
+                "runs": 12,
+                "source": {"head": "test"},
+                "binary_sha256": self.HASHES,
+                "host_environment": self.host_environment(),
+                "collection_preconditions": self.collection_preconditions(),
+                "callback_ordering": boundary.CALLBACK_ORDERING,
+                "js_call_ordering": boundary.JS_CALL_ORDERING,
+                "entry_ordering": boundary.ENTRY_ORDERING,
+                "scalar_ordering": boundary.SCALAR_ORDERING,
+            }
+            boundary.write_json(directory / "metadata.json", metadata)
+            boundary.write_json(directory / "complete.json", {
+                key: metadata[key] for key in ("source", "binary_sha256")
+            })
+            with self.assertRaisesRegex(
+                ValueError, "unsupported benchmark completion metadata"
+            ):
+                boundary.read_report(directory)
 
     def test_cli_report_is_byte_identical_across_hash_seeds(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -850,7 +903,8 @@ class ArtifactTests(unittest.TestCase):
                     )
                 )
             boundary.write_json(directory / "complete.json", {
-                key: metadata[key] for key in ("source", "binary_sha256")
+                **{key: metadata[key] for key in ("source", "binary_sha256")},
+                "host_environment": self.host_environment(),
             })
             outputs = set()
             # Set-typed metric names iterate in a seed-dependent order.
@@ -964,11 +1018,15 @@ class ArtifactTests(unittest.TestCase):
                 )
             with self.assertRaises(FileNotFoundError):
                 boundary.read_report(directory)
-            completion = {key: metadata[key] for key in ("source", "binary_sha256")}
+            completion = {
+                **{key: metadata[key] for key in ("source", "binary_sha256")},
+                "host_environment": self.host_environment(),
+            }
             boundary.write_json(directory / "complete.json", completion)
             report = boundary.read_report(directory)
             self.assertEqual(report["compiler_selection"], "unverified")
             self.assertEqual(report["host_environment"], metadata["host_environment"])
+            self.assertEqual(report["final_host_environment"], completion["host_environment"])
             self.assertEqual(report["metrics"]["direct_jsc_lower_bound"]["mean"], 100)
             # A stale summary is not used to reconstruct the report.
             boundary.write_json(directory / "summary.json", {"wrong": True})
@@ -1021,7 +1079,7 @@ class ArtifactTests(unittest.TestCase):
             self.assertNotEqual(before["worktree_sha256"], after["worktree_sha256"])
 
     def test_collection_success_and_changed_inputs(self):
-        for changed in (None, "source", "binary"):
+        for changed in (None, "source", "binary", "power"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 executables = {
@@ -1097,6 +1155,23 @@ class ArtifactTests(unittest.TestCase):
 
                 stamp = {"head": "original"}
                 final = {"head": "changed"} if changed == "source" else stamp
+                final_power = self.host_environment()
+                final_power["power_source"]["output"] = (
+                    "Now drawing from 'Battery Power'"
+                )
+                host_context = (
+                    patch.object(
+                        boundary,
+                        "host_environment",
+                        side_effect=[
+                            self.host_environment(),
+                            self.host_environment(),
+                            final_power,
+                        ],
+                    )
+                    if changed == "power"
+                    else contextlib.nullcontext()
+                )
                 with (
                     patch.object(boundary.platform, "system", return_value="Darwin"),
                     patch.object(boundary, "source_stamp", side_effect=[stamp, final]),
@@ -1106,10 +1181,20 @@ class ArtifactTests(unittest.TestCase):
                     }),
                     patch.object(boundary, "record_process", side_effect=fake_process) as run,
                     patch("builtins.print"),
+                    host_context,
                 ):
-                    if changed:
+                    if changed in {"source", "binary"}:
                         with self.assertRaisesRegex(RuntimeError, "changed during collection"):
                             boundary.collect(directory, 12, "test-toolchain")
+                    elif changed == "power":
+                        with self.assertRaisesRegex(ValueError, "AC power is required"):
+                            boundary.collect(
+                                directory,
+                                12,
+                                "test-toolchain",
+                                require_ac_power=True,
+                            )
+                    if changed:
                         self.assertFalse((directory / "complete.json").exists())
                         self.assertFalse((directory / "summary.json").exists())
                         with self.assertRaisesRegex(ValueError, "collection failed"):
@@ -1118,8 +1203,8 @@ class ArtifactTests(unittest.TestCase):
                         report = boundary.collect(directory, 12, "test-toolchain")
                         self.assertEqual(boundary.read_report(directory), report)
                     self.assertEqual(run.call_count, 25)
-                    # Host context is captured exactly once, after the build and
-                    # before the first benchmark process.
+                    # Host context is captured after the build before the first
+                    # benchmark process, then again after the final process.
                     host_commands = {
                         ("sysctl", "-n", key) for key in boundary.HOST_SYSCTL_KEYS.values()
                     } | set(boundary.HOST_POWER_COMMANDS.values())
@@ -1127,13 +1212,35 @@ class ArtifactTests(unittest.TestCase):
                         index for index, event in enumerate(events)
                         if event[0] == "command" and event[1] in host_commands
                     ]
-                    self.assertEqual(len(host_positions), len(host_commands))
-                    self.assertEqual(
-                        {events[index][1] for index in host_positions}, host_commands
-                    )
-                    first_run = events.index(("process", "run-000"))
-                    self.assertLess(events.index(("process", "build")), min(host_positions))
-                    self.assertLess(max(host_positions), first_run)
+                    if changed == "power":
+                        self.assertEqual(host_positions, [])
+                    else:
+                        self.assertEqual(len(host_positions), 2 * len(host_commands))
+                        self.assertEqual(
+                            {
+                                events[index][1]
+                                for index in host_positions[:len(host_commands)]
+                            },
+                            host_commands,
+                        )
+                        self.assertEqual(
+                            {
+                                events[index][1]
+                                for index in host_positions[len(host_commands):]
+                            },
+                            host_commands,
+                        )
+                        first_run = events.index(("process", "run-000"))
+                        first_snapshot = host_positions[:len(host_commands)]
+                        final_snapshot = host_positions[len(host_commands):]
+                        self.assertLess(
+                            events.index(("process", "build")), min(first_snapshot)
+                        )
+                        self.assertLess(max(first_snapshot), first_run)
+                        self.assertLess(
+                            events.index(("process", "allocation-run-011")),
+                            min(final_snapshot),
+                        )
                     # An existing collection is never reused, including failed ones.
                     with self.assertRaises(FileExistsError):
                         boundary.collect(directory, 12, "test-toolchain")

@@ -179,16 +179,17 @@ builds or test suites.
 
 The metadata records whether AC power and Low Power Mode-off requirements were
 selected. A report rejects an artifact whose declared requirements conflict with
-its recorded pre-process power snapshot. The checks only describe the two
-collection admission instants; they do not prove that power remained unchanged
-during all benchmark processes.
+either recorded endpoint snapshot: immediately before the first benchmark
+process and immediately after the last. The checks do not continuously observe
+power state or prove that it remained unchanged during all benchmark processes.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
 entire environment. It also records the available macOS hardware model, memory
 size and CPU topology, the active power source (`pmset -g ps`) and the power
-settings currently applied (`pmset -g`) in a structured `host_environment`
-record. The record is taken once, after the release build and before the first
-benchmark process, so a power change during collection is not captured.
+settings currently applied (`pmset -g`) in a structured pre-process
+`host_environment` record and a matching post-process completion record.
+Endpoint snapshots can detect a changed condition at either end, but not a
+transient change during collection.
 Missing, failing, slow or undecodable optional system commands are labelled
 unavailable rather than guessed or treated as fatal. Available output is stored
 as reported, apart from surrounding whitespace and the masking below, and is
