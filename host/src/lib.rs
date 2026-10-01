@@ -19,6 +19,6 @@ pub use identity::{AttachmentEpoch, AttachmentId, IdentityError, RuntimeId, Runt
 pub use post::DrainPoster;
 pub use work::{ScheduledWork, WorkDispatchError};
 pub use work_mailbox::{
-    ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkMailbox,
-    ScheduledWorkPostError, TerminalScheduledWorkDrain,
+    ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkFinishError,
+    ScheduledWorkMailbox, ScheduledWorkPostError, TerminalScheduledWorkDrain,
 };
