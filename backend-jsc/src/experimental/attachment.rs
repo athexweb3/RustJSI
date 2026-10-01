@@ -382,9 +382,9 @@ impl Drop for Attachment {
 impl DetachReport {
     /// Returns bounded terminal accounting for the tracked attachment resources.
     ///
-    /// This is not a JavaScriptCore heap or total-process allocation report.
+    /// This is not a `JavaScriptCore` heap or total-process allocation report.
     /// `remaining` records external buffer storage that remains owned by the
-    /// foreign JavaScriptCore context after this detach operation.
+    /// foreign `JavaScriptCore` context after this detach operation.
     #[must_use]
     pub const fn resources(&self) -> TerminalResourceReport {
         self.resources
@@ -788,18 +788,28 @@ mod tests {
                     .install_host_function("unresolved", |_| Ok(Value::Undefined))
                     .unwrap();
                 let native = cx.install_native_state("native", 42_u64).unwrap();
-                (root, function, native)
+                let external = cx
+                    .install_external_buffer(
+                        "unresolvedExternal",
+                        vec![1_u8, 2, 3, 4].into_boxed_slice(),
+                    )
+                    .unwrap();
+                (root, function, native, external)
             })
         }
         .unwrap();
 
         let report = attachment.detach_without_context().unwrap();
+        let resources = report.resources();
         assert_eq!(report.final_entry(), FinalEntryOutcome::Unavailable);
         assert_eq!(report.released_persistent_roots(), 0);
         assert_eq!(report.released_host_functions(), 0);
         assert_eq!(report.unresolved_persistent_roots(), 1);
         assert_eq!(report.unresolved_host_functions(), 1);
         assert_eq!(report.retired_native_states(), 1);
+        assert_eq!(resources.settled(), ResourceLedger::new(0, 0, 1, 0, 0));
+        assert_eq!(resources.unresolved(), ResourceLedger::new(1, 1, 0, 0, 0));
+        assert_eq!(resources.remaining(), ResourceLedger::new(0, 0, 0, 1, 4));
         assert_eq!(attachment.state(), HostState::Destroyed);
         drop(handles);
     }
