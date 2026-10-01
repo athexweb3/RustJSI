@@ -184,8 +184,16 @@ Captured exception messages are limited to 4 KiB of UTF-8, including a
 truncation suffix. `JsException::is_truncated()` and the common
 `BackendException::is_truncated()` preserve that distinction. Small messages,
 including embedded NULs, are retained in full. Ordinary string values are not
-truncated. This bounds the Rust diagnostic copy, not JSC string allocation,
-user `toString()` execution, caller-created `HostError` strings or error redaction.
+truncated. This bounds the Rust diagnostic copy, not JSC string allocation or
+user `toString()` execution.
+
+`HostError::new` preserves the existing behavior of exposing its message to
+JavaScript, subject to the outbound 4 KiB cap. `HostError::redacted` retains
+the supplied diagnostic for Rust-side display and logging while JavaScript sees
+the fixed `"native host function failed"` message. The redacted path borrows
+that fixed message before JSC conversion; it does not bound the caller's
+original `String` allocation, JavaScript error-object allocation, stack
+construction, or engine work.
 
 The `exception_capture` bench repeatedly throws pre-created strings and measures
 evaluation, diagnostic copying and error destruction. Message creation and

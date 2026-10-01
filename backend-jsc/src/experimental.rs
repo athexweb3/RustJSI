@@ -460,6 +460,16 @@ pub enum Value {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostError {
     message: String,
+    disclosure: HostErrorDisclosure,
+}
+
+/// Controls whether a host-function error message is visible to JavaScript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostErrorDisclosure {
+    /// Expose the diagnostic message to JavaScript, subject to the outbound size cap.
+    Exposed,
+    /// Keep the diagnostic message in Rust while JavaScript receives a fixed message.
+    Redacted,
 }
 
 /// An owned JavaScript exception.
@@ -1397,6 +1407,20 @@ impl HostError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            disclosure: HostErrorDisclosure::Exposed,
+        }
+    }
+
+    /// Creates a host-function error whose diagnostic message is not exposed to
+    /// JavaScript.
+    ///
+    /// Rust-side display and logging retain `message`; JavaScript receives the
+    /// fixed `"native host function failed"` message instead.
+    #[must_use]
+    pub fn redacted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            disclosure: HostErrorDisclosure::Redacted,
         }
     }
 
@@ -1404,6 +1428,24 @@ impl HostError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Returns this error's JavaScript disclosure policy.
+    #[must_use]
+    pub const fn disclosure(&self) -> HostErrorDisclosure {
+        self.disclosure
+    }
+
+    /// Returns the message exposed to JavaScript.
+    ///
+    /// This borrows a fixed string for [`HostErrorDisclosure::Redacted`] and
+    /// does not format or allocate a replacement diagnostic.
+    #[must_use]
+    pub fn javascript_message(&self) -> &str {
+        match self.disclosure {
+            HostErrorDisclosure::Exposed => &self.message,
+            HostErrorDisclosure::Redacted => "native host function failed",
+        }
     }
 
     fn from_js(error: &JsError) -> Self {
@@ -1996,7 +2038,7 @@ unsafe extern "C" fn host_function_callback(
             }
         },
         Ok(Err(error)) => {
-            write_exception(context, exception, error.message());
+            write_exception(context, exception, error.javascript_message());
             // SAFETY: JSC supplied a live callback context.
             unsafe { sys::value_make_undefined(context) }
         }
