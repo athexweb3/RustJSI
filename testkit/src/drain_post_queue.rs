@@ -83,7 +83,6 @@ impl DrainPostQueue {
     }
 
     /// Acquires queued attachment posts without entering a host or backend.
-    #[must_use]
     pub fn acquire(&self) -> DrainPostAcquire<'_> {
         match self.mailbox.acquire() {
             MailboxAcquire::Idle => DrainPostAcquire::Idle,
@@ -126,7 +125,6 @@ impl DrainPostDrain<'_> {
     ///
     /// [`DrainAfter::Pending`] means at least one accepted post remains for a
     /// later deterministic drain; it does not create a platform wake-up.
-    #[must_use]
     pub fn finish(self) -> DrainAfter {
         self.drain.finish()
     }
