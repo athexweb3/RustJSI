@@ -5,8 +5,8 @@ use std::num::NonZeroUsize;
 use rustjsi_backend::BackendFamily;
 use rustjsi_runtime::{
     ClosableMailbox, ClosableMailboxAcquire, ClosableMailboxDrain, ClosableMailboxEnqueueError,
-    DrainAfter, IngressClose, MailboxEnqueue, TerminalAcquireError, TerminalDrainFinishError,
-    TerminalMailboxDrain,
+    ClosableMailboxPostError, DrainAfter, IngressClose, MailboxEnqueue, TerminalAcquireError,
+    TerminalDrainFinishError, TerminalMailboxDrain,
 };
 
 use crate::DrainPoster;
@@ -134,18 +134,22 @@ impl<T> ScheduledWorkMailbox<T> {
     where
         P: DrainPoster,
     {
-        let outcome = self
-            .enqueue(payload)
-            .map_err(ScheduledWorkPostError::Enqueue)?;
-        if outcome == MailboxEnqueue::Scheduled {
-            poster
-                .post_drain(self.attachment)
-                .map_err(|error| ScheduledWorkPostError::Post {
+        self.mailbox
+            .enqueue_and_post(ScheduledWork::new(self.attachment, payload), || {
+                poster.post_drain(self.attachment)
+            })
+            .map_err(|error| match error {
+                ClosableMailboxPostError::Enqueue(ClosableMailboxEnqueueError::Full(work)) => {
+                    ScheduledWorkPostError::Enqueue(ScheduledWorkEnqueueError::Full(work))
+                }
+                ClosableMailboxPostError::Enqueue(ClosableMailboxEnqueueError::Closed(work)) => {
+                    ScheduledWorkPostError::Enqueue(ScheduledWorkEnqueueError::Closed(work))
+                }
+                ClosableMailboxPostError::Post(error) => ScheduledWorkPostError::Post {
                     attachment: self.attachment,
                     error,
-                })?;
-        }
-        Ok(outcome)
+                },
+            })
     }
 
     /// Posts a retry only while the mailbox still has a pending normal drain.

@@ -42,6 +42,16 @@ pub enum ClosableMailboxEnqueueError<T> {
     Closed(T),
 }
 
+/// Failure while enqueueing work and accepting its required initial post.
+#[derive(Debug)]
+#[must_use]
+pub enum ClosableMailboxPostError<T, E> {
+    /// Queue admission rejected and returned the original payload.
+    Enqueue(ClosableMailboxEnqueueError<T>),
+    /// The payload is retained, but the requested host post failed.
+    Post(E),
+}
+
 /// Result of attempting to acquire a normal drain.
 #[derive(Debug)]
 #[must_use]
@@ -195,6 +205,46 @@ impl<T> ClosableMailbox<T> {
             DrainRequest::Coalesced => crate::MailboxEnqueue::Coalesced,
             DrainRequest::Closed => unreachable!("producer admission prevents this race"),
         };
+        drop(admission);
+        Ok(outcome)
+    }
+
+    /// Enqueues one payload and accepts its initial host post before release.
+    ///
+    /// `post` runs only when this enqueue creates a new drain obligation. The
+    /// producer admission remains live through that call, so terminal close
+    /// cannot claim retained work between scheduling and post acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Queue admission errors return the original payload. A post error leaves
+    /// the payload retained with its pending drain obligation intact.
+    pub fn enqueue_and_post<E>(
+        &self,
+        value: T,
+        post: impl FnOnce() -> Result<(), E>,
+    ) -> Result<crate::MailboxEnqueue, ClosableMailboxPostError<T, E>> {
+        let admission = match self.producer_gate.reserve() {
+            Ok(admission) => admission,
+            Err(
+                IngressReserveError::NotOpen(_) | IngressReserveError::ReservationSpaceExhausted,
+            ) => {
+                return Err(ClosableMailboxPostError::Enqueue(
+                    ClosableMailboxEnqueueError::Closed(value),
+                ));
+            }
+        };
+        self.queue.push(value).map_err(|value| {
+            ClosableMailboxPostError::Enqueue(ClosableMailboxEnqueueError::Full(value))
+        })?;
+        let outcome = match self.signal.request() {
+            DrainRequest::Scheduled => crate::MailboxEnqueue::Scheduled,
+            DrainRequest::Coalesced => crate::MailboxEnqueue::Coalesced,
+            DrainRequest::Closed => unreachable!("producer admission prevents this race"),
+        };
+        if outcome == crate::MailboxEnqueue::Scheduled {
+            post().map_err(ClosableMailboxPostError::Post)?;
+        }
         drop(admission);
         Ok(outcome)
     }
@@ -434,6 +484,24 @@ mod tests {
             mailbox.acquire(),
             ClosableMailboxAcquire::Unavailable(ClosableMailboxState::Closed)
         ));
+    }
+
+    #[test]
+    fn initial_post_runs_before_terminal_can_claim_producer_work() {
+        let mailbox = ClosableMailbox::new(capacity(1));
+        let outcome = mailbox.enqueue_and_post(7, || {
+            let _ = mailbox.begin_close();
+            assert!(matches!(
+                mailbox.try_begin_terminal_drain(),
+                Err(TerminalAcquireError::ProducerReservationsRemain(count)) if count.get() == 1
+            ));
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(outcome, Ok(MailboxEnqueue::Scheduled)));
+
+        let terminal = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(terminal.pop(), Some(7));
+        terminal.finish().unwrap();
     }
 
     #[test]
