@@ -155,8 +155,12 @@ mod tests {
     use super::*;
     use crate::experimental::{DEFERRED_OWNED_DROPS, Runtime};
     use crate::sys;
-    use rustjsi_backend::{BackendError, BackendFamily, BackendScope, RootScope};
-    use rustjsi_host::{FinalEntryOutcome, FinalEntryPolicy, RuntimeIdentity};
+    use rustjsi_backend::{BackendBase, BackendError, BackendFamily, BackendScope, RootScope};
+    use rustjsi_host::{
+        AttachmentWorkOwner, AttachmentWorkResolution, DrainPoster, FinalEntryOutcome,
+        FinalEntryPolicy, RuntimeIdentity, ScheduledWorkAcquire,
+    };
+    use rustjsi_testkit::{DrainPostAcquire, DrainPostQueue};
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::NonNull;
@@ -299,6 +303,76 @@ mod tests {
             FinalEntryOutcome::Completed
         );
         assert_eq!(host.source.entries, 2);
+    }
+
+    #[test]
+    fn attached_host_dispatches_current_mailbox_work_without_stale_reentry() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
+        let attachment_id = attachment.attachment_id();
+        let replacement = identity.next_attachment().unwrap();
+        let mut source = ForeignOwner::new(attachment_id);
+        let mut work_owner =
+            AttachmentWorkOwner::new(attachment_id, std::num::NonZeroUsize::new(1).unwrap());
+        let posts = DrainPostQueue::new(std::num::NonZeroUsize::new(2).unwrap());
+
+        let sender = work_owner.sender();
+        assert!(sender.enqueue_and_post(&posts, 41_u32).is_ok());
+        let DrainPostAcquire::Acquired(post_drain) = posts.acquire() else {
+            panic!("accepted work must retain one attachment-only post");
+        };
+        assert_eq!(post_drain.pop(), Some(attachment_id));
+
+        let AttachmentWorkResolution::Current(mailbox) =
+            work_owner.resolve_drain_task(attachment_id)
+        else {
+            panic!("current attachment task must lend its current mailbox");
+        };
+        let ScheduledWorkAcquire::Acquired(work_drain) = mailbox.acquire() else {
+            panic!("current attachment mailbox must retain its queued work");
+        };
+        let mut host = JscAttachedHost::new(&mut attachment, &mut source);
+        let value = work_drain
+            .dispatch_next(&mut host, |backend, payload| {
+                let scope = backend.open_scope().expect("open source-linked JSC scope");
+                let value = scope
+                    .number(f64::from(payload + 1))
+                    .expect("make source-linked JSC number");
+                scope
+                    .as_number(value)
+                    .expect("read source-linked JSC number")
+            })
+            .unwrap();
+        assert_eq!(value, Some(42.0));
+        let _ = work_drain.finish();
+        let _ = post_drain.finish();
+        assert_eq!(host.source.entries, 1);
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        let _ = work_owner.begin_close();
+        let terminal = work_owner.try_begin_terminal_drain().unwrap();
+        assert!(terminal.pop().is_none());
+        terminal.finish().unwrap();
+        work_owner
+            .replace(replacement, std::num::NonZeroUsize::new(1).unwrap())
+            .unwrap();
+
+        posts.post_drain(attachment_id).unwrap();
+        let DrainPostAcquire::Acquired(stale_post) = posts.acquire() else {
+            panic!("retired attachment post must remain observable");
+        };
+        assert_eq!(stale_post.pop(), Some(attachment_id));
+        assert!(matches!(
+            work_owner.resolve_drain_task(attachment_id),
+            AttachmentWorkResolution::Retired
+        ));
+        let _ = stale_post.finish();
+        assert_eq!(host.source.entries, 1);
+
+        assert_eq!(
+            host.detach_with_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Completed
+        );
     }
 
     #[test]
