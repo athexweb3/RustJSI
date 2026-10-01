@@ -2,7 +2,12 @@
 
 //! Conformance tests for attachment-bound host work delivery.
 
-use rustjsi_host::{Host, RuntimeIdentity, ScheduledWork, WorkDispatchError};
+use std::num::NonZeroUsize;
+
+use rustjsi_host::{
+    Host, RuntimeIdentity, ScheduledWork, ScheduledWorkAcquire, ScheduledWorkMailbox,
+    WorkDispatchError,
+};
 use rustjsi_testkit::ModelHost;
 
 #[test]
@@ -82,4 +87,46 @@ fn draining_host_rejects_matching_work_without_consuming_payload() {
         }
         other => panic!("expected host entry rejection, got {other:?}"),
     }
+}
+
+#[test]
+fn mailbox_delivery_preserves_attachment_check_before_host_entry() {
+    let mut host = ModelHost::new().unwrap();
+    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(host.attachment_id(), 41_u32).unwrap();
+
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("queued work must acquire a normal drain");
+    };
+    let work = drain.pop().expect("one work record must be retained");
+    assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+
+    let value = work.dispatch(&mut host, |_, payload| payload + 1).unwrap();
+    assert_eq!(value, 42);
+}
+
+#[test]
+fn terminal_mailbox_drain_retains_stale_attachment_for_caller_policy() {
+    let mut identity = RuntimeIdentity::allocate().unwrap();
+    let stale = identity.next_attachment().unwrap();
+    let current = identity.next_attachment().unwrap();
+    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(stale, String::from("stale")).unwrap();
+    let _ = mailbox.begin_close();
+
+    let terminal = mailbox.try_begin_terminal_drain().unwrap();
+    let work = terminal
+        .pop()
+        .expect("residual work must transfer to caller");
+    terminal.finish().unwrap();
+
+    let mut host = ModelHost::for_attachment(current);
+    let error = work
+        .dispatch(&mut host, |_, _| {
+            panic!("stale terminal work must not enter")
+        })
+        .expect_err("caller must still receive normal attachment rejection");
+    let work = error.into_work().expect("rejection retains terminal work");
+    assert_eq!(work.attachment_id(), stale);
+    assert_eq!(work.into_payload(), "stale");
 }
