@@ -7,12 +7,14 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use rustjsi_host::{
     DrainPoster, Host, RuntimeIdentity, ScheduledWork, ScheduledWorkAcquire,
     ScheduledWorkFinishError, ScheduledWorkMailbox, ScheduledWorkPostError, WorkDispatchError,
 };
-use rustjsi_runtime::{DrainAfter, TerminalAcquireError};
+use rustjsi_runtime::{DrainAfter, MailboxEnqueue, TerminalAcquireError};
 use rustjsi_testkit::{DrainPostAcquire, DrainPostQueue, ModelHost};
 
 #[test]
@@ -249,6 +251,70 @@ fn mailbox_posts_once_for_a_coalesced_drain() {
 
     assert_eq!(poster.posts.get(), 1);
     assert_eq!(poster.last_attachment.get(), Some(attachment));
+}
+
+#[test]
+fn producer_threads_share_work_mailbox_while_drain_remains_host_affine() {
+    const PRODUCERS: usize = 8;
+
+    fn require_send_sync<T: Send + Sync>() {}
+
+    require_send_sync::<ScheduledWorkMailbox<u8>>();
+
+    let mut identity = RuntimeIdentity::allocate().unwrap();
+    let attachment = identity.next_attachment().unwrap();
+    let mailbox = Arc::new(ScheduledWorkMailbox::new(
+        attachment,
+        NonZeroUsize::new(PRODUCERS).unwrap(),
+    ));
+    let posts = Arc::new(DrainPostQueue::new(NonZeroUsize::new(1).unwrap()));
+    let barrier = Arc::new(Barrier::new(PRODUCERS + 1));
+    let mut workers = Vec::with_capacity(PRODUCERS);
+
+    for payload in 0..u8::try_from(PRODUCERS).unwrap() {
+        let mailbox = Arc::clone(&mailbox);
+        let posts = Arc::clone(&posts);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            mailbox.enqueue_and_post(posts.as_ref(), payload)
+        }));
+    }
+
+    barrier.wait();
+    let mut scheduled = 0;
+    for worker in workers {
+        match worker
+            .join()
+            .expect("producer must not panic")
+            .expect("fixed capacity must retain every producer payload")
+        {
+            MailboxEnqueue::Scheduled => scheduled += 1,
+            MailboxEnqueue::Coalesced => {}
+        }
+    }
+    assert_eq!(scheduled, 1);
+
+    let DrainPostAcquire::Acquired(post_drain) = posts.acquire() else {
+        panic!("shared producer work must retain one attachment-only post");
+    };
+    assert_eq!(post_drain.pop(), Some(attachment));
+    assert_eq!(post_drain.pop(), None);
+    assert_eq!(post_drain.finish(), DrainAfter::Idle);
+
+    let ScheduledWorkAcquire::Acquired(work_drain) = mailbox.acquire() else {
+        panic!("accepted producer payloads must acquire one host drain");
+    };
+    let mut payloads = Vec::with_capacity(PRODUCERS);
+    while let Some(work) = work_drain.pop() {
+        payloads.push(work.into_payload());
+    }
+    payloads.sort_unstable();
+    assert_eq!(
+        payloads,
+        (0..u8::try_from(PRODUCERS).unwrap()).collect::<Vec<_>>()
+    );
+    assert_eq!(work_drain.finish(), DrainAfter::Idle);
 }
 
 #[test]
