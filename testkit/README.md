@@ -25,6 +25,11 @@ not deduplicate attachment records, validate lifecycle, create a platform
 wake-up, or establish a host retry policy. Its purpose is to make bounded post
 acceptance, saturation, and retry handoff reproducible.
 
+Producers may share this queue across threads because a post carries only an
+inert attachment identity. Its acquired drain remains thread-affine and is not
+an engine entry capability; a driver must finish it on its chosen consumer
+thread before separately validating attachment and host entry.
+
 `tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
 steps over three runtimes against an independent reference model. Sequences
 replace engines with new epochs, abandon issued epochs before activation, keep
