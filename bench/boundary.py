@@ -85,7 +85,38 @@ JS_CALL_METRICS = {
     "direct": "direct_jsc_js_call",
     "common": "rustjsi_common_js_call",
 }
-SCHEMA = 14
+ENTRY_ORDERS = (
+    "gate,common,foreign",
+    "gate,foreign,common",
+    "common,gate,foreign",
+    "common,foreign,gate",
+    "foreign,gate,common",
+    "foreign,common,gate",
+)
+ENTRY_SCHEDULE = ENTRY_ORDERS + tuple(reversed(ENTRY_ORDERS))
+ENTRY_ORDERING = {
+    "design": "mirrored_complete_six_permutation_pairs",
+    "sequence": list(ENTRY_SCHEDULE),
+}
+ENTRY_ORDER_METRICS = {
+    "gate": "host_gate_admit_and_exit",
+    "common": "jsc_common_empty_entry",
+    "foreign": "jsc_foreign_common_empty_entry",
+}
+SCALAR_ORDERS = ("direct,common", "common,direct")
+SCALAR_SCHEDULE = tuple(
+    SCALAR_ORDERS[index % len(SCALAR_ORDERS)]
+    for index in range(len(CALLBACK_SCHEDULE))
+)
+SCALAR_ORDERING = {
+    "design": "alternating_pair_across_mirrored_callback_block",
+    "sequence": list(SCALAR_SCHEDULE),
+}
+SCALAR_ORDER_METRICS = {
+    "direct": "direct_jsc_scalar",
+    "common": "rustjsi_common_scalar",
+}
+SCHEMA = 15
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
@@ -142,6 +173,9 @@ def parse_sample(output):
     rust_allocations = {}
     callback_order = None
     js_call_order = None
+    entry_order = None
+    scalar_order = None
+    allocation_entry_order = None
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -156,6 +190,18 @@ def parse_sample(output):
             if js_call_order is not None or payload not in JS_CALL_ORDERS:
                 raise ValueError("invalid or duplicate JavaScript call order")
             js_call_order = payload
+        elif name == "entry_order":
+            if entry_order is not None or payload not in ENTRY_ORDERS:
+                raise ValueError("invalid or duplicate entry order")
+            entry_order = payload
+        elif name == "scalar_order":
+            if scalar_order is not None or payload not in SCALAR_ORDERS:
+                raise ValueError("invalid or duplicate scalar order")
+            scalar_order = payload
+        elif name == "allocation_entry_order":
+            if allocation_entry_order is not None or payload not in ENTRY_ORDERS:
+                raise ValueError("invalid or duplicate allocation entry order")
+            allocation_entry_order = payload
         elif name in METRICS:
             number, separator, unit = payload.partition(" ")
             if not separator or unit != METRICS[name] or name in values:
@@ -274,8 +320,13 @@ def parse_sample(output):
         or rust_allocations.keys() != ALLOCATION_METRICS
         or callback_order is None
         or js_call_order is None
+        or entry_order is None
+        or scalar_order is None
+        or allocation_entry_order is None
     ):
         raise ValueError("incomplete benchmark output")
+    if entry_order != allocation_entry_order:
+        raise ValueError("timing and allocation entry orders differ")
     for name, samples in entry_batches.items():
         if not math.isclose(statistics.mean(samples), values[name], abs_tol=0.011):
             raise ValueError(f"entry batch mean does not match metric: {name}")
@@ -294,6 +345,8 @@ def parse_sample(output):
         "rust_allocations": rust_allocations,
         "callback_order": callback_order,
         "js_call_order": js_call_order,
+        "entry_order": entry_order,
+        "scalar_order": scalar_order,
     }
 
 
@@ -440,6 +493,32 @@ def summarize(samples):
     }
     if len(set(js_call_order_counts.values())) != 1:
         raise ValueError("JavaScript call workload orders are not balanced")
+    actual_entry_orders = [sample["entry_order"] for sample in samples]
+    expected_entry_orders = [
+        ENTRY_SCHEDULE[index % len(ENTRY_SCHEDULE)]
+        for index in range(len(samples))
+    ]
+    if actual_entry_orders != expected_entry_orders:
+        raise ValueError("entry workload schedule does not match metadata")
+    entry_order_counts = {
+        order: sum(sample["entry_order"] == order for sample in samples)
+        for order in ENTRY_ORDERS
+    }
+    if len(set(entry_order_counts.values())) != 1:
+        raise ValueError("entry workload orders are not balanced")
+    actual_scalar_orders = [sample["scalar_order"] for sample in samples]
+    expected_scalar_orders = [
+        SCALAR_SCHEDULE[index % len(SCALAR_SCHEDULE)]
+        for index in range(len(samples))
+    ]
+    if actual_scalar_orders != expected_scalar_orders:
+        raise ValueError("scalar workload schedule does not match metadata")
+    scalar_order_counts = {
+        order: sum(sample["scalar_order"] == order for sample in samples)
+        for order in SCALAR_ORDERS
+    }
+    if len(set(scalar_order_counts.values())) != 1:
+        raise ValueError("scalar workload orders are not balanced")
     metrics = {
         name: {
             "unit": unit,
@@ -480,6 +559,16 @@ def summarize(samples):
             "counts": js_call_order_counts,
         },
         "js_call_position_effects": summarize_js_call_positions(samples),
+        "entry_ordering": {
+            "design": "mirrored_complete_six_permutation_pairs",
+            "counts": entry_order_counts,
+        },
+        "entry_position_effects": summarize_entry_positions(samples),
+        "scalar_ordering": {
+            "design": "alternating_pair_across_mirrored_callback_block",
+            "counts": scalar_order_counts,
+        },
+        "scalar_position_effects": summarize_scalar_positions(samples),
         "callback_batch_latency": {
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
@@ -573,6 +662,46 @@ def summarize_js_call_positions(samples):
                 sample["metrics"][metric]
                 for sample in samples
                 if sample["js_call_order"].split(",")[index] == workload
+            ])
+        means = [position["mean"] for position in positions.values()]
+        result[metric] = {
+            "unit": METRICS[metric],
+            "positions": positions,
+            "max_mean_spread": max(means) / min(means) - 1,
+        }
+    return result
+
+
+def summarize_entry_positions(samples):
+    position_names = ("first", "second", "third")
+    result = {}
+    for workload, metric in ENTRY_ORDER_METRICS.items():
+        positions = {}
+        for index, position in enumerate(position_names):
+            positions[position] = describe([
+                sample["metrics"][metric]
+                for sample in samples
+                if sample["entry_order"].split(",")[index] == workload
+            ])
+        means = [position["mean"] for position in positions.values()]
+        result[metric] = {
+            "unit": METRICS[metric],
+            "positions": positions,
+            "max_mean_spread": max(means) / min(means) - 1,
+        }
+    return result
+
+
+def summarize_scalar_positions(samples):
+    position_names = ("first", "second")
+    result = {}
+    for workload, metric in SCALAR_ORDER_METRICS.items():
+        positions = {}
+        for index, position in enumerate(position_names):
+            positions[position] = describe([
+                sample["metrics"][metric]
+                for sample in samples
+                if sample["scalar_order"].split(",")[index] == workload
             ])
         means = [position["mean"] for position in positions.values()]
         result[metric] = {
@@ -843,6 +972,8 @@ def read_report(directory):
         or not valid_host_environment(metadata.get("host_environment"))
         or metadata.get("callback_ordering") != CALLBACK_ORDERING
         or metadata.get("js_call_ordering") != JS_CALL_ORDERING
+        or metadata.get("entry_ordering") != ENTRY_ORDERING
+        or metadata.get("scalar_ordering") != SCALAR_ORDERING
     ):
         raise ValueError("unsupported benchmark metadata")
     count = metadata.get("runs")
@@ -915,6 +1046,8 @@ def collect(directory, runs, toolchain):
             "calibration_empty_batch_iterations": ENTRY_BATCH_ITERATIONS,
             "callback_ordering": CALLBACK_ORDERING,
             "js_call_ordering": JS_CALL_ORDERING,
+            "entry_ordering": ENTRY_ORDERING,
+            "scalar_ordering": SCALAR_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
             "build_command": build,
@@ -943,9 +1076,13 @@ def collect(directory, runs, toolchain):
         for index in range(runs):
             callback_order = CALLBACK_SCHEDULE[index % len(CALLBACK_SCHEDULE)]
             js_call_order = JS_CALL_SCHEDULE[index % len(JS_CALL_SCHEDULE)]
+            entry_order = ENTRY_SCHEDULE[index % len(ENTRY_SCHEDULE)]
+            scalar_order = SCALAR_SCHEDULE[index % len(SCALAR_SCHEDULE)]
             timing_environment = os.environ.copy()
             timing_environment["RUSTJSI_CALLBACK_ORDER"] = callback_order
             timing_environment["RUSTJSI_JS_CALL_ORDER"] = js_call_order
+            timing_environment["RUSTJSI_ENTRY_ORDER"] = entry_order
+            timing_environment["RUSTJSI_SCALAR_ORDER"] = scalar_order
             timing = record_process(
                 [str(executables["boundary"])],
                 directory,

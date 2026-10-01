@@ -70,20 +70,27 @@ CALIBRATION_SAMPLE = (
     + ",".join(["1.0000"] * 1000)
     + " ns/operation\n"
 )
-ALLOCATION_SAMPLE = "".join(
+ALLOCATION_SAMPLE = (
+    f"allocation_entry_order: {boundary.ENTRY_ORDERS[0]}\n"
+    + "".join(
     f"rust_alloc_{name}: 0 calls 0 bytes 0 deallocations "
     + "0 deallocated-bytes (1000000 iterations)\n"
     for name in boundary.ALLOCATION_METRICS
+    )
 )
 
 
 def timing_sample(
     callback_order=boundary.CALLBACK_ORDERS[0],
     js_call_order=boundary.JS_CALL_ORDERS[0],
+    entry_order=boundary.ENTRY_ORDERS[0],
+    scalar_order=boundary.SCALAR_ORDERS[0],
 ):
     return (
         f"callback_order: {callback_order}\n"
         f"js_call_order: {js_call_order}\n"
+        f"entry_order: {entry_order}\n"
+        f"scalar_order: {scalar_order}\n"
         + TIMING_METRICS
         + CALIBRATION_SAMPLE
     )
@@ -91,9 +98,16 @@ def timing_sample(
 
 def balanced_samples():
     return [
-        boundary.parse_sample(timing_sample(callback_order, js_call_order) + ALLOCATION_SAMPLE)
-        for callback_order, js_call_order in zip(
-            boundary.CALLBACK_SCHEDULE, boundary.JS_CALL_SCHEDULE, strict=True
+        boundary.parse_sample(
+            timing_sample(callback_order, js_call_order, entry_order, scalar_order)
+            + ALLOCATION_SAMPLE.replace(boundary.ENTRY_ORDERS[0], entry_order, 1)
+        )
+        for callback_order, js_call_order, entry_order, scalar_order in zip(
+            boundary.CALLBACK_SCHEDULE,
+            boundary.JS_CALL_SCHEDULE,
+            boundary.ENTRY_SCHEDULE,
+            boundary.SCALAR_SCHEDULE,
+            strict=True,
         )
     ]
 
@@ -131,6 +145,8 @@ class SampleTests(unittest.TestCase):
         )
         self.assertEqual(sample["callback_order"], boundary.CALLBACK_ORDERS[0])
         self.assertEqual(sample["js_call_order"], boundary.JS_CALL_ORDERS[0])
+        self.assertEqual(sample["entry_order"], boundary.ENTRY_ORDERS[0])
+        self.assertEqual(sample["scalar_order"], boundary.SCALAR_ORDERS[0])
 
     def test_bad_samples(self):
         cases = [
@@ -145,6 +161,8 @@ class SampleTests(unittest.TestCase):
             SAMPLE.replace("direct_jsc_lower_bound: ", "direct_jsc_lower_bound="),
             SAMPLE.replace("reused,prepared,rustjsi", "reused,reused,rustjsi"),
             SAMPLE.replace("direct,common", "direct,direct"),
+            SAMPLE.replace("gate,common,foreign", "gate,gate,foreign"),
+            SAMPLE.replace("allocation_entry_order: gate,common,foreign", "allocation_entry_order: foreign,common,gate"),
             SAMPLE.replace("4.0000", "NaN", 1),
             SAMPLE.replace("4.0000,", "", 1),
             SAMPLE.replace("4.00 ns/entry", "5.00 ns/entry", 1),
@@ -393,6 +411,8 @@ class SampleTests(unittest.TestCase):
             set(report["callback_ordering"]["counts"].values()), {2}
         )
         self.assertEqual(set(report["js_call_ordering"]["counts"].values()), {6})
+        self.assertEqual(set(report["entry_ordering"]["counts"].values()), {2})
+        self.assertEqual(set(report["scalar_ordering"]["counts"].values()), {6})
         for metric in boundary.CALLBACK_METRICS.values():
             effects = report["callback_position_effects"][metric]
             self.assertEqual(effects["max_mean_spread"], 0)
@@ -401,6 +421,18 @@ class SampleTests(unittest.TestCase):
             )
         for metric in boundary.JS_CALL_METRICS.values():
             effects = report["js_call_position_effects"][metric]
+            self.assertEqual(effects["max_mean_spread"], 0)
+            self.assertEqual(
+                {item["samples"] for item in effects["positions"].values()}, {6}
+            )
+        for metric in boundary.ENTRY_ORDER_METRICS.values():
+            effects = report["entry_position_effects"][metric]
+            self.assertEqual(effects["max_mean_spread"], 0)
+            self.assertEqual(
+                {item["samples"] for item in effects["positions"].values()}, {4}
+            )
+        for metric in boundary.SCALAR_ORDER_METRICS.values():
+            effects = report["scalar_position_effects"][metric]
             self.assertEqual(effects["max_mean_spread"], 0)
             self.assertEqual(
                 {item["samples"] for item in effects["positions"].values()}, {6}
@@ -583,6 +615,8 @@ class ArtifactTests(unittest.TestCase):
                     "binary_sha256": self.HASHES,
                     "callback_ordering": boundary.CALLBACK_ORDERING,
                     "js_call_ordering": boundary.JS_CALL_ORDERING,
+                    "entry_ordering": boundary.ENTRY_ORDERING,
+                    "scalar_ordering": boundary.SCALAR_ORDERING,
                 }
                 if host is not None:
                     metadata["host_environment"] = host
@@ -603,14 +637,21 @@ class ArtifactTests(unittest.TestCase):
                 "host_environment": self.host_environment(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
+                "entry_ordering": boundary.ENTRY_ORDERING,
+                "scalar_ordering": boundary.SCALAR_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(12):
                 (directory / f"run-{index:03}.stdout").write_text(timing_sample(
-                    boundary.CALLBACK_SCHEDULE[index], boundary.JS_CALL_SCHEDULE[index],
+                    boundary.CALLBACK_SCHEDULE[index],
+                    boundary.JS_CALL_SCHEDULE[index],
+                    boundary.ENTRY_SCHEDULE[index],
+                    boundary.SCALAR_SCHEDULE[index],
                 ))
                 (directory / f"allocation-run-{index:03}.stdout").write_text(
-                    ALLOCATION_SAMPLE
+                    ALLOCATION_SAMPLE.replace(
+                        boundary.ENTRY_ORDERS[0], boundary.ENTRY_SCHEDULE[index], 1
+                    )
                 )
             boundary.write_json(directory / "complete.json", {
                 key: metadata[key] for key in ("source", "binary_sha256")
@@ -687,16 +728,20 @@ class ArtifactTests(unittest.TestCase):
                 "host_environment": self.host_environment(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
+                "entry_ordering": boundary.ENTRY_ORDERING,
+                "scalar_ordering": boundary.SCALAR_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             for index in range(12):
                 callback_order = boundary.CALLBACK_SCHEDULE[index]
                 js_call_order = boundary.JS_CALL_SCHEDULE[index]
+                entry_order = boundary.ENTRY_SCHEDULE[index]
+                scalar_order = boundary.SCALAR_SCHEDULE[index]
                 (directory / f"run-{index:03}.stdout").write_text(
-                    timing_sample(callback_order, js_call_order)
+                    timing_sample(callback_order, js_call_order, entry_order, scalar_order)
                 )
                 (directory / f"allocation-run-{index:03}.stdout").write_text(
-                    ALLOCATION_SAMPLE
+                    ALLOCATION_SAMPLE.replace(boundary.ENTRY_ORDERS[0], entry_order, 1)
                 )
             with self.assertRaises(FileNotFoundError):
                 boundary.read_report(directory)
@@ -799,11 +844,31 @@ class ArtifactTests(unittest.TestCase):
                                 % len(boundary.JS_CALL_SCHEDULE)
                             ],
                         )
-                        output = ALLOCATION_SAMPLE
+                        self.assertEqual(
+                            environment["RUSTJSI_ENTRY_ORDER"],
+                            boundary.ENTRY_SCHEDULE[
+                                int(name.rsplit("-", 1)[1])
+                                % len(boundary.ENTRY_SCHEDULE)
+                            ],
+                        )
+                        self.assertEqual(
+                            environment["RUSTJSI_SCALAR_ORDER"],
+                            boundary.SCALAR_SCHEDULE[
+                                int(name.rsplit("-", 1)[1])
+                                % len(boundary.SCALAR_SCHEDULE)
+                            ],
+                        )
+                        output = ALLOCATION_SAMPLE.replace(
+                            boundary.ENTRY_ORDERS[0],
+                            environment["RUSTJSI_ENTRY_ORDER"],
+                            1,
+                        )
                     else:
                         output = timing_sample(
                             environment["RUSTJSI_CALLBACK_ORDER"],
                             environment["RUSTJSI_JS_CALL_ORDER"],
+                            environment["RUSTJSI_ENTRY_ORDER"],
+                            environment["RUSTJSI_SCALAR_ORDER"],
                         )
                     (destination / f"{name}.stdout").write_text(output)
                     (destination / f"{name}.stderr").write_text("")
@@ -864,6 +929,8 @@ class ArtifactTests(unittest.TestCase):
                 "host_environment": self.host_environment(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
+                "entry_ordering": boundary.ENTRY_ORDERING,
+                "scalar_ordering": boundary.SCALAR_ORDERING,
             }
             boundary.write_json(directory / "metadata.json", metadata)
             boundary.write_json(directory / "complete.json", {

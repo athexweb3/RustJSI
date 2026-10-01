@@ -11,6 +11,10 @@ mod callbacks;
 mod js_calls;
 
 #[cfg(target_os = "macos")]
+#[path = "support/entries.rs"]
+mod entries;
+
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static COUNTING_ALLOCATOR: allocation::CountingAllocator = allocation::CountingAllocator;
 
@@ -38,42 +42,64 @@ fn main() {
         print_measurement(workload.labels().1, measurement, ITERATIONS);
     }
 
+    let entry_order = entries::selected_order();
     let gate = EntryGate::new(
         NonZeroU32::new(64).expect("nonzero entry limit"),
         FinalEntryPolicy::Unavailable,
     );
-    let gate_allocations = measure(WARMUP, ITERATIONS, || {
-        let entry = black_box(&gate).try_enter().expect("admit host entry");
-        black_box(&entry);
-        drop(entry);
-    });
-
     let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
-    let common_allocations = measure(WARMUP, ITERATIONS, || {
-        black_box(&mut runtime)
-            .with_backend(|_| black_box(()))
-            .expect("enter common backend");
-    });
-
     let foreign_owner = raw::OwnedContext::new();
     let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
     let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
         .expect("create foreign attachment");
-    let foreign_allocations = measure(WARMUP, ITERATIONS, || {
-        // SAFETY: The benchmark owner keeps this context live on the current
-        // thread and lends the same global context to every entry.
-        unsafe {
-            black_box(&mut attachment)
-                .with_backend(foreign_owner.as_void(), |_| black_box(()))
-                .expect("enter foreign common backend");
+    let mut gate_allocations = None;
+    let mut common_allocations = None;
+    let mut foreign_allocations = None;
+    for workload in entry_order {
+        let measurement = match workload {
+            entries::EntryWorkload::Gate => measure(WARMUP, ITERATIONS, || {
+                let entry = black_box(&gate).try_enter().expect("admit host entry");
+                black_box(&entry);
+                drop(entry);
+            }),
+            entries::EntryWorkload::Common => measure(WARMUP, ITERATIONS, || {
+                black_box(&mut runtime)
+                    .with_backend(|_| black_box(()))
+                    .expect("enter common backend");
+            }),
+            entries::EntryWorkload::Foreign => measure(WARMUP, ITERATIONS, || {
+                // SAFETY: The benchmark owner keeps this context live on the
+                // current thread and lends the same global context to every entry.
+                unsafe {
+                    black_box(&mut attachment)
+                        .with_backend(foreign_owner.as_void(), |_| black_box(()))
+                        .expect("enter foreign common backend");
+                }
+            }),
+        };
+        match workload {
+            entries::EntryWorkload::Gate => gate_allocations = Some(measurement),
+            entries::EntryWorkload::Common => common_allocations = Some(measurement),
+            entries::EntryWorkload::Foreign => foreign_allocations = Some(measurement),
         }
-    });
+    }
 
-    print_measurement("host_gate_admit_and_exit", gate_allocations, ITERATIONS);
-    print_measurement("jsc_common_empty_entry", common_allocations, ITERATIONS);
+    let [first, second, third] = entry_order.map(|workload| workload.labels().0);
+    println!("allocation_entry_order: {first},{second},{third}");
+
+    print_measurement(
+        "host_gate_admit_and_exit",
+        gate_allocations.expect("measure host gate allocations"),
+        ITERATIONS,
+    );
+    print_measurement(
+        "jsc_common_empty_entry",
+        common_allocations.expect("measure common entry allocations"),
+        ITERATIONS,
+    );
     print_measurement(
         "jsc_foreign_common_empty_entry",
-        foreign_allocations,
+        foreign_allocations.expect("measure foreign common entry allocations"),
         ITERATIONS,
     );
 

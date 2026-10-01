@@ -11,13 +11,16 @@ mod callbacks;
 mod js_calls;
 
 #[cfg(target_os = "macos")]
+#[path = "support/entries.rs"]
+mod entries;
+
+#[cfg(target_os = "macos")]
+#[path = "support/scalars.rs"]
+mod scalars;
+
+#[cfg(target_os = "macos")]
 fn main() {
-    use rustjsi_backend::{BackendBase, BackendScope};
-    use rustjsi_backend_jsc::{Attachment, Runtime};
-    use rustjsi_host::{EntryGate, FinalEntryPolicy, RuntimeIdentity};
     use std::hint::black_box;
-    use std::num::NonZeroU32;
-    use std::time::Instant;
 
     const WARMUP: u32 = 10_000;
     const ITERATIONS: u32 = 1_000_000;
@@ -28,55 +31,10 @@ fn main() {
     let calls = measure_callback_workloads(callback_order, WARMUP, ITERATIONS, CALLBACK_BATCHES);
     let js_call_order = js_calls::selected_order();
     let js_calls = measure_js_call_workloads(js_call_order, WARMUP, ITERATIONS, CALLBACK_BATCHES);
-    let direct_scalar = raw::measure_scalar(WARMUP, ITERATIONS);
-
-    let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
-    let gate = EntryGate::new(NonZeroU32::new(64).unwrap(), FinalEntryPolicy::Unavailable);
-    let gate_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
-        let entry = black_box(&gate).try_enter().expect("admit host entry");
-        black_box(&entry);
-        drop(entry);
-    });
-    let common_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
-        black_box(&mut runtime)
-            .with_backend(|_| black_box(()))
-            .expect("enter common backend");
-    });
-    let foreign_owner = raw::OwnedContext::new();
-    let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
-    let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
-        .expect("create foreign attachment");
-    let foreign_common_entry = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
-        // SAFETY: The benchmark owner keeps this context live on the current
-        // thread and lends the same global context to every entry.
-        unsafe {
-            black_box(&mut attachment)
-                .with_backend(foreign_owner.as_void(), |_| black_box(()))
-                .expect("enter foreign common backend");
-        }
-    });
-    let mut common_scalar = 0.0;
-    runtime
-        .with_backend(|backend| {
-            let scope = backend.open_scope().expect("open common JSC scope");
-            let value = scope.number(42.0).expect("preflight number");
-            assert_answer(scope.as_number(value).expect("read preflight number"));
-            for _ in 0..WARMUP {
-                let value = scope.number(black_box(42.0)).expect("make number");
-                black_box(scope.as_number(value).expect("read number"));
-            }
-
-            let started = Instant::now();
-            for _ in 0..ITERATIONS {
-                let value = scope.number(black_box(42.0)).expect("make number");
-                black_box(scope.as_number(value).expect("read number"));
-            }
-            let elapsed = started.elapsed();
-            common_scalar = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(ITERATIONS);
-            let value = scope.number(42.0).expect("postflight number");
-            assert_answer(scope.as_number(value).expect("read postflight number"));
-        })
-        .expect("enter common JSC backend");
+    let entry_order = entries::selected_order();
+    let entry = measure_entry_workloads(entry_order, WARMUP, ITERATIONS, ENTRY_BATCHES);
+    let scalar_order = scalars::selected_order();
+    let scalar = measure_scalar_workloads(scalar_order, WARMUP, ITERATIONS);
 
     let timer_pairs = measure_timer_pairs(ENTRY_BATCHES);
     let empty_batches = measure_batches(WARMUP, ITERATIONS, ENTRY_BATCHES, &mut || {
@@ -85,15 +43,8 @@ fn main() {
 
     print_call_measurements(callback_order, &calls, ITERATIONS);
     print_js_call_measurements(js_call_order, &js_calls, ITERATIONS);
-    print_entry_measurement("host_gate_admit_and_exit", &gate_entry);
-    print_entry_measurement("jsc_common_empty_entry", &common_entry);
-    print_entry_measurement("jsc_foreign_common_empty_entry", &foreign_common_entry);
-    println!("direct_jsc_scalar: {direct_scalar:.2} ns/round-trip");
-    println!("rustjsi_common_scalar: {common_scalar:.2} ns/round-trip");
-    println!(
-        "common_scalar_over_direct: {:.3}x ({ITERATIONS} iterations)",
-        common_scalar / direct_scalar
-    );
+    print_entry_measurements(entry_order, &entry);
+    print_scalar_measurements(scalar_order, &scalar, ITERATIONS);
     print_samples(
         "calibration_timer_pair",
         "samples",
@@ -102,9 +53,174 @@ fn main() {
         &timer_pairs,
     );
     print_batch_samples("calibration", "empty_batch", "ns/operation", &empty_batches);
+}
+
+#[cfg(target_os = "macos")]
+struct EntryMeasurements {
+    gate: BatchMeasurement,
+    common: BatchMeasurement,
+    foreign: BatchMeasurement,
+}
+
+#[cfg(target_os = "macos")]
+fn measure_entry_workloads(
+    order: [entries::EntryWorkload; 3],
+    warmup: u32,
+    iterations: u32,
+    batches: u32,
+) -> EntryMeasurements {
+    use rustjsi_backend_jsc::{Attachment, Runtime};
+    use rustjsi_host::{EntryGate, FinalEntryPolicy, RuntimeIdentity};
+    use std::hint::black_box;
+    use std::num::NonZeroU32;
+
+    let gate = EntryGate::new(
+        NonZeroU32::new(64).expect("nonzero entry limit"),
+        FinalEntryPolicy::Unavailable,
+    );
+    let mut runtime = Runtime::new().expect("create RustJSI JSC runtime");
+    let foreign_owner = raw::OwnedContext::new();
+    let mut identity = RuntimeIdentity::allocate().expect("allocate foreign host identity");
+    let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed)
+        .expect("create foreign attachment");
+    let mut gate_measurement = None;
+    let mut common_measurement = None;
+    let mut foreign_measurement = None;
+
+    for workload in order {
+        let measurement = match workload {
+            entries::EntryWorkload::Gate => {
+                measure_batches(warmup, iterations, batches, &mut || {
+                    let entry = black_box(&gate).try_enter().expect("admit host entry");
+                    black_box(&entry);
+                    drop(entry);
+                })
+            }
+            entries::EntryWorkload::Common => {
+                measure_batches(warmup, iterations, batches, &mut || {
+                    black_box(&mut runtime)
+                        .with_backend(|_| black_box(()))
+                        .expect("enter common backend");
+                })
+            }
+            entries::EntryWorkload::Foreign => {
+                measure_batches(warmup, iterations, batches, &mut || {
+                    // SAFETY: The benchmark owner keeps this context live on the
+                    // current thread and lends the same global context to every entry.
+                    unsafe {
+                        black_box(&mut attachment)
+                            .with_backend(foreign_owner.as_void(), |_| black_box(()))
+                            .expect("enter foreign common backend");
+                    }
+                })
+            }
+        };
+        match workload {
+            entries::EntryWorkload::Gate => gate_measurement = Some(measurement),
+            entries::EntryWorkload::Common => common_measurement = Some(measurement),
+            entries::EntryWorkload::Foreign => foreign_measurement = Some(measurement),
+        }
+    }
+
     // SAFETY: This is the same still-live context used for every measured entry.
     let _ = unsafe { attachment.detach_with_context(foreign_owner.as_void()) }
         .expect("detach foreign benchmark attachment");
+    EntryMeasurements {
+        gate: gate_measurement.expect("measure host gate entry"),
+        common: common_measurement.expect("measure common entry"),
+        foreign: foreign_measurement.expect("measure foreign common entry"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_entry_measurements(order: [entries::EntryWorkload; 3], measurements: &EntryMeasurements) {
+    let [first, second, third] = order.map(|workload| workload.labels().0);
+    println!("entry_order: {first},{second},{third}");
+    print_entry_measurement("host_gate_admit_and_exit", &measurements.gate);
+    print_entry_measurement("jsc_common_empty_entry", &measurements.common);
+    print_entry_measurement("jsc_foreign_common_empty_entry", &measurements.foreign);
+}
+
+#[cfg(target_os = "macos")]
+struct ScalarMeasurements {
+    direct: f64,
+    common: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn measure_scalar_workloads(
+    order: [scalars::ScalarWorkload; 2],
+    warmup: u32,
+    iterations: u32,
+) -> ScalarMeasurements {
+    let mut direct = None;
+    let mut common = None;
+    for workload in order {
+        let measurement = match workload {
+            scalars::ScalarWorkload::Direct => raw::measure_scalar(warmup, iterations),
+            scalars::ScalarWorkload::Common => measure_common_scalar(warmup, iterations),
+        };
+        match workload {
+            scalars::ScalarWorkload::Direct => direct = Some(measurement),
+            scalars::ScalarWorkload::Common => common = Some(measurement),
+        }
+    }
+    ScalarMeasurements {
+        direct: direct.expect("measure direct scalar round-trip"),
+        common: common.expect("measure common scalar round-trip"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn measure_common_scalar(warmup: u32, iterations: u32) -> f64 {
+    use rustjsi_backend::{BackendBase, BackendScope};
+    use rustjsi_backend_jsc::Runtime;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let mut runtime = Runtime::new().expect("create common scalar runtime");
+    runtime
+        .with_backend(|backend| {
+            let scope = backend.open_scope().expect("open common JSC scope");
+            let value = scope.number(42.0).expect("preflight number");
+            assert_answer(scope.as_number(value).expect("read preflight number"));
+            for _ in 0..warmup {
+                let value = scope.number(black_box(42.0)).expect("make number");
+                black_box(scope.as_number(value).expect("read number"));
+            }
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let value = scope.number(black_box(42.0)).expect("make number");
+                black_box(scope.as_number(value).expect("read number"));
+            }
+            let elapsed = started.elapsed();
+            let value = scope.number(42.0).expect("postflight number");
+            assert_answer(scope.as_number(value).expect("read postflight number"));
+            elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+        })
+        .expect("enter common JSC backend")
+}
+
+#[cfg(target_os = "macos")]
+fn print_scalar_measurements(
+    order: [scalars::ScalarWorkload; 2],
+    measurements: &ScalarMeasurements,
+    iterations: u32,
+) {
+    let [first, second] = order.map(|workload| workload.labels().0);
+    println!("scalar_order: {first},{second}");
+    println!(
+        "direct_jsc_scalar: {:.2} ns/round-trip",
+        measurements.direct
+    );
+    println!(
+        "rustjsi_common_scalar: {:.2} ns/round-trip",
+        measurements.common
+    );
+    println!(
+        "common_scalar_over_direct: {:.3}x ({iterations} iterations)",
+        measurements.common / measurements.direct
+    );
 }
 
 #[cfg(target_os = "macos")]
