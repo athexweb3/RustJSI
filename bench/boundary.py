@@ -116,7 +116,7 @@ SCALAR_ORDER_METRICS = {
     "direct": "direct_jsc_scalar",
     "common": "rustjsi_common_scalar",
 }
-SCHEMA = 15
+SCHEMA = 16
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
@@ -152,6 +152,7 @@ HOST_ENVIRONMENT_LIMITS = (
     "does_not_exclude_background_work",
     "does_not_make_a_performance_gate_qualified",
 )
+AC_POWER_LINE = re.compile(r"^Now drawing from 'AC Power'$", re.MULTILINE)
 
 
 def valid_run_count(value):
@@ -859,6 +860,35 @@ def valid_host_environment(value):
     return value.get("limits") == list(HOST_ENVIRONMENT_LIMITS)
 
 
+def is_ac_power(host):
+    """Return whether a captured host context explicitly reports AC power."""
+    power_source = host.get("power_source") if isinstance(host, dict) else None
+    return (
+        isinstance(power_source, dict)
+        and power_source.get("status") == "available"
+        and isinstance(power_source.get("output"), str)
+        and AC_POWER_LINE.search(power_source["output"]) is not None
+    )
+
+
+def collection_preconditions(require_ac_power):
+    return {"ac_power": "required" if require_ac_power else "not_required"}
+
+
+def valid_collection_preconditions(value, host):
+    if value not in (
+        {"ac_power": "required"},
+        {"ac_power": "not_required"},
+    ):
+        return False
+    return value["ac_power"] != "required" or is_ac_power(host)
+
+
+def ensure_ac_power(host):
+    if not is_ac_power(host):
+        raise ValueError("AC power is required but not confirmed by the host snapshot")
+
+
 def source_stamp():
     # Ignored files are excluded; only hashes of public worktree contents are saved.
     diff = subprocess.run(
@@ -965,11 +995,14 @@ def read_report(directory):
         completion = json.load(source)
     if not isinstance(metadata, dict) or not isinstance(completion, dict):
         raise ValueError("metadata and completion must be objects")
+    host = metadata.get("host_environment")
+    preconditions = metadata.get("collection_preconditions")
     if (
         metadata.get("schema") != SCHEMA
         or metadata.get("benchmark") != "boundary"
         or not valid_binary_hashes(metadata.get("binary_sha256"))
-        or not valid_host_environment(metadata.get("host_environment"))
+        or not valid_host_environment(host)
+        or not valid_collection_preconditions(preconditions, host)
         or metadata.get("callback_ordering") != CALLBACK_ORDERING
         or metadata.get("js_call_ordering") != JS_CALL_ORDERING
         or metadata.get("entry_ordering") != ENTRY_ORDERING
@@ -1001,7 +1034,7 @@ def read_report(directory):
     return report
 
 
-def collect(directory, runs, toolchain):
+def collect(directory, runs, toolchain, *, require_ac_power=False):
     if platform.system() != "Darwin":
         raise ValueError("the boundary benchmark requires macOS system JavaScriptCore")
     if not valid_run_count(runs):
@@ -1015,6 +1048,9 @@ def collect(directory, runs, toolchain):
             raise ValueError("output inside the repository must be Git-ignored")
     directory.mkdir(parents=True, exist_ok=False)
     try:
+        if require_ac_power:
+            require_ac_power_snapshot = host_environment()
+            ensure_ac_power(require_ac_power_snapshot)
         stamp = source_stamp()
         build_environment = compiler_environment(toolchain)
         build = [
@@ -1030,6 +1066,9 @@ def collect(directory, runs, toolchain):
             name: hashlib.sha256(path.read_bytes()).hexdigest()
             for name, path in executables.items()
         }
+        host = host_environment()
+        if require_ac_power:
+            ensure_ac_power(host)
         metadata = {
             "schema": SCHEMA,
             "benchmark": "boundary",
@@ -1050,6 +1089,7 @@ def collect(directory, runs, toolchain):
             "scalar_ordering": SCALAR_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
+            "collection_preconditions": collection_preconditions(require_ac_power),
             "build_command": build,
             "compiler_selection": "explicit",
             "compiler_paths": {
@@ -1061,7 +1101,7 @@ def collect(directory, runs, toolchain):
             "os": command(["sw_vers"]),
             "architecture": platform.machine(),
             "cpu": command(["sysctl", "-n", "machdep.cpu.brand_string"]),
-            "host_environment": host_environment(),
+            "host_environment": host,
             "sdk": command(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
             "binary_sha256": binary_hashes,
             "environment_overrides": {
@@ -1128,12 +1168,22 @@ def main():
     run.add_argument("--output", type=Path, required=True, help="new output directory")
     run.add_argument("--runs", type=int, default=12)
     run.add_argument("--toolchain", default="1.98.0")
+    run.add_argument(
+        "--require-ac-power",
+        action="store_true",
+        help="reject collection unless AC power is confirmed before build and process launch",
+    )
     report = commands.add_parser("report", help="recompute statistics from saved raw stdout")
     report.add_argument("directory", type=Path)
     args = parser.parse_args()
     try:
         result = (
-            collect(args.output.resolve(), args.runs, args.toolchain)
+            collect(
+                args.output.resolve(),
+                args.runs,
+                args.toolchain,
+                require_ac_power=args.require_ac_power,
+            )
             if args.action == "run"
             else read_report(args.directory)
         )

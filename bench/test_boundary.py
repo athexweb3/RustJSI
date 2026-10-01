@@ -455,6 +455,10 @@ class ArtifactTests(unittest.TestCase):
             "limits": list(boundary.HOST_ENVIRONMENT_LIMITS),
         }
 
+    @staticmethod
+    def collection_preconditions():
+        return boundary.collection_preconditions(False)
+
     def test_host_environment_records_optional_facts_without_claiming_control(self):
         values = {
             ("sysctl", "-n", "hw.model"): "TestMac",
@@ -506,6 +510,83 @@ class ArtifactTests(unittest.TestCase):
                 self.assertTrue(boundary.valid_host_environment(snapshot))
                 for name in boundary.HOST_POWER_COMMANDS:
                     self.assertEqual(snapshot[name], {"status": "unavailable"})
+
+    def test_ac_power_requirement_fails_closed_on_ambiguous_snapshots(self):
+        ac = self.host_environment()
+        battery = self.host_environment()
+        battery["power_source"]["output"] = "Now drawing from 'Battery Power'"
+        unavailable = self.host_environment()
+        unavailable["power_source"] = {"status": "unavailable"}
+
+        self.assertTrue(boundary.is_ac_power(ac))
+        self.assertFalse(boundary.is_ac_power(battery))
+        self.assertFalse(boundary.is_ac_power(unavailable))
+        self.assertTrue(
+            boundary.valid_collection_preconditions({"ac_power": "required"}, ac)
+        )
+        self.assertFalse(
+            boundary.valid_collection_preconditions({"ac_power": "required"}, battery)
+        )
+        self.assertFalse(boundary.valid_collection_preconditions({}, ac))
+        self.assertTrue(
+            boundary.valid_collection_preconditions(
+                {"ac_power": "not_required"}, unavailable
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "AC power is required"):
+            boundary.ensure_ac_power(unavailable)
+
+    def test_ac_power_requirement_rejects_before_build(self):
+        battery = self.host_environment()
+        battery["power_source"]["output"] = "Now drawing from 'Battery Power'"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "results"
+            with (
+                patch.object(boundary.platform, "system", return_value="Darwin"),
+                patch.object(boundary, "host_environment", return_value=battery),
+                patch.object(boundary, "record_process") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "AC power is required"):
+                    boundary.collect(directory, 12, "test-toolchain", require_ac_power=True)
+
+            run.assert_not_called()
+            failure = json.loads((directory / "failure.json").read_text())
+            self.assertIn("AC power is required", failure["error"])
+
+    def test_ac_power_requirement_rechecks_after_build(self):
+        ac = self.host_environment()
+        battery = self.host_environment()
+        battery["power_source"]["output"] = "Now drawing from 'Battery Power'"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "results"
+            executables = {name: root / name for name in boundary.BENCHMARKS}
+            for executable in executables.values():
+                executable.write_bytes(b"benchmark")
+            artifacts = "\n".join(json.dumps({
+                "reason": "compiler-artifact",
+                "target": {"name": name, "kind": ["bench"]},
+                "executable": str(executable),
+            }) for name, executable in executables.items())
+
+            with (
+                patch.object(boundary.platform, "system", return_value="Darwin"),
+                patch.object(boundary, "host_environment", side_effect=[ac, battery]),
+                patch.object(boundary, "source_stamp", return_value={"head": "test"}),
+                patch.object(boundary, "compiler_environment", return_value={
+                    "RUSTC": "/test/rustc", "RUSTDOC": "/test/rustdoc",
+                }),
+                patch.object(boundary, "record_process", return_value=artifacts) as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "AC power is required"):
+                    boundary.collect(directory, 12, "test-toolchain", require_ac_power=True)
+
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[2], "build")
+            failure = json.loads((directory / "failure.json").read_text())
+            self.assertIn("AC power is required", failure["error"])
 
     def test_host_environment_validation_rejects_ambiguous_or_overclaimed_records(self):
         valid = self.host_environment()
@@ -613,6 +694,7 @@ class ArtifactTests(unittest.TestCase):
                     "schema": boundary.SCHEMA, "benchmark": "boundary", "runs": 12,
                     "source": {"head": "test"},
                     "binary_sha256": self.HASHES,
+                    "collection_preconditions": self.collection_preconditions(),
                     "callback_ordering": boundary.CALLBACK_ORDERING,
                     "js_call_ordering": boundary.JS_CALL_ORDERING,
                     "entry_ordering": boundary.ENTRY_ORDERING,
@@ -627,6 +709,32 @@ class ArtifactTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
                     boundary.read_report(directory)
 
+    def test_report_requires_valid_collection_preconditions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "schema": boundary.SCHEMA,
+                "benchmark": "boundary",
+                "runs": 12,
+                "source": {"head": "test"},
+                "binary_sha256": self.HASHES,
+                "host_environment": self.host_environment(),
+                "collection_preconditions": {"ac_power": "required"},
+                "callback_ordering": boundary.CALLBACK_ORDERING,
+                "js_call_ordering": boundary.JS_CALL_ORDERING,
+                "entry_ordering": boundary.ENTRY_ORDERING,
+                "scalar_ordering": boundary.SCALAR_ORDERING,
+            }
+            metadata["host_environment"]["power_source"]["output"] = (
+                "Now drawing from 'Battery Power'"
+            )
+            boundary.write_json(directory / "metadata.json", metadata)
+            boundary.write_json(directory / "complete.json", {
+                key: metadata[key] for key in ("source", "binary_sha256")
+            })
+            with self.assertRaisesRegex(ValueError, "unsupported benchmark metadata"):
+                boundary.read_report(directory)
+
     def test_cli_report_is_byte_identical_across_hash_seeds(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -635,6 +743,7 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "test"},
                 "binary_sha256": self.HASHES,
                 "host_environment": self.host_environment(),
+                "collection_preconditions": self.collection_preconditions(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
                 "entry_ordering": boundary.ENTRY_ORDERING,
@@ -681,6 +790,26 @@ class ArtifactTests(unittest.TestCase):
             '{\n  "a": 0,\n  "z": {\n    "a": 1,\n    "b": 2\n  }\n}\n',
         )
 
+    def test_cli_passes_the_optional_ac_power_requirement(self):
+        output = io.StringIO()
+        with (
+            patch.object(
+                boundary.sys,
+                "argv",
+                [
+                    "boundary.py",
+                    "run",
+                    "--output",
+                    "/tmp/boundary-ac-power",
+                    "--require-ac-power",
+                ],
+            ),
+            patch.object(boundary, "collect", return_value={}) as collect,
+            contextlib.redirect_stdout(output),
+        ):
+            boundary.main()
+        self.assertTrue(collect.call_args.kwargs["require_ac_power"])
+
     def test_cargo_executable_selection(self):
         output = json.dumps({"reason": "build-finished", "success": True}) + "\n"
         with self.assertRaises(ValueError):
@@ -726,6 +855,7 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "test"},
                 "binary_sha256": self.HASHES,
                 "host_environment": self.host_environment(),
+                "collection_preconditions": self.collection_preconditions(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
                 "entry_ordering": boundary.ENTRY_ORDERING,
@@ -927,6 +1057,7 @@ class ArtifactTests(unittest.TestCase):
                 "source": {"head": "before"},
                 "binary_sha256": self.HASHES,
                 "host_environment": self.host_environment(),
+                "collection_preconditions": self.collection_preconditions(),
                 "callback_ordering": boundary.CALLBACK_ORDERING,
                 "js_call_ordering": boundary.JS_CALL_ORDERING,
                 "entry_ordering": boundary.ENTRY_ORDERING,
@@ -970,6 +1101,7 @@ class ArtifactTests(unittest.TestCase):
                     "source": {"head": "before"},
                     "binary_sha256": hashes,
                     "host_environment": self.host_environment(),
+                    "collection_preconditions": self.collection_preconditions(),
                 })
                 boundary.write_json(directory / "complete.json", {
                     "source": {"head": "before"}, "binary_sha256": hashes,
