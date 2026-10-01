@@ -8,18 +8,19 @@ python3 -B bench/boundary.py report bench/results/boundary-001
 ```
 
 For a collection intended to contribute to a controlled-machine comparison,
-require confirmed AC power explicitly:
+require confirmed AC power and disabled Low Power Mode explicitly:
 
 ```sh
 python3 -B bench/boundary.py run \
   --output bench/results/boundary-ac-001 \
-  --require-ac-power
+  --require-ac-power \
+  --require-low-power-mode-off
 ```
 
-The optional check fails closed when macOS cannot confirm AC power. It checks
-once before the release build and again before benchmark processes start. It
-does not pin CPU frequency, verify thermal stability, exclude background work,
-or itself qualify a performance gate.
+The optional checks fail closed when macOS cannot confirm AC power or that Low
+Power Mode is off. Each check runs once before the release build and again
+before benchmark processes start. They do not pin CPU frequency, verify thermal
+stability, exclude background work, or themselves qualify a performance gate.
 
 The runner builds the timing and allocation-probe executables once with Rust
 1.98.0, then launches each executable in twelve separate process pairs.
@@ -176,10 +177,11 @@ scheduler, cache or between-process effects. Use an otherwise idle machine and
 record power/thermal conditions separately. Do not run collection alongside
 builds or test suites.
 
-The metadata records whether AC power was required. A report rejects an artifact
-whose declared AC requirement conflicts with its recorded pre-process power
-snapshot. The check only describes the two collection admission instants; it
-does not prove that power remained unchanged during all benchmark processes.
+The metadata records whether AC power and Low Power Mode-off requirements were
+selected. A report rejects an artifact whose declared requirements conflict with
+its recorded pre-process power snapshot. The checks only describe the two
+collection admission instants; they do not prove that power remained unchanged
+during all benchmark processes.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
 entire environment. It also records the available macOS hardware model, memory

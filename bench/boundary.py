@@ -116,7 +116,7 @@ SCALAR_ORDER_METRICS = {
     "direct": "direct_jsc_scalar",
     "common": "rustjsi_common_scalar",
 }
-SCHEMA = 16
+SCHEMA = 17
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
@@ -152,7 +152,10 @@ HOST_ENVIRONMENT_LIMITS = (
     "does_not_exclude_background_work",
     "does_not_make_a_performance_gate_qualified",
 )
-AC_POWER_LINE = re.compile(r"^Now drawing from 'AC Power'$", re.MULTILINE)
+POWER_SOURCE_LINE = re.compile(
+    r"^Now drawing from '(AC Power|Battery Power)'$", re.MULTILINE
+)
+LOW_POWER_MODE_LINE = re.compile(r"^\s*lowpowermode\s+([01])\s*$", re.MULTILINE)
 
 
 def valid_run_count(value):
@@ -863,30 +866,64 @@ def valid_host_environment(value):
 def is_ac_power(host):
     """Return whether a captured host context explicitly reports AC power."""
     power_source = host.get("power_source") if isinstance(host, dict) else None
-    return (
+    if not (
         isinstance(power_source, dict)
         and power_source.get("status") == "available"
         and isinstance(power_source.get("output"), str)
-        and AC_POWER_LINE.search(power_source["output"]) is not None
-    )
+    ):
+        return False
+    return POWER_SOURCE_LINE.findall(power_source["output"]) == ["AC Power"]
 
 
-def collection_preconditions(require_ac_power):
-    return {"ac_power": "required" if require_ac_power else "not_required"}
+def is_low_power_mode_off(host):
+    """Return whether a captured host context explicitly disables low-power mode."""
+    power_settings = host.get("power_settings") if isinstance(host, dict) else None
+    if not (
+        isinstance(power_settings, dict)
+        and power_settings.get("status") == "available"
+        and isinstance(power_settings.get("output"), str)
+    ):
+        return False
+    return LOW_POWER_MODE_LINE.findall(power_settings["output"]) == ["0"]
+
+
+def collection_preconditions(require_ac_power, require_low_power_mode_off):
+    return {
+        "ac_power": "required" if require_ac_power else "not_required",
+        "low_power_mode": (
+            "required_off" if require_low_power_mode_off else "not_required"
+        ),
+    }
 
 
 def valid_collection_preconditions(value, host):
-    if value not in (
-        {"ac_power": "required"},
-        {"ac_power": "not_required"},
+    if (
+        not isinstance(value, dict)
+        or value.keys() != {"ac_power", "low_power_mode"}
     ):
         return False
-    return value["ac_power"] != "required" or is_ac_power(host)
+    if value["ac_power"] not in {"required", "not_required"}:
+        return False
+    if value["low_power_mode"] not in {"required_off", "not_required"}:
+        return False
+    return (
+        (value["ac_power"] != "required" or is_ac_power(host))
+        and (
+            value["low_power_mode"] != "required_off" or is_low_power_mode_off(host)
+        )
+    )
 
 
 def ensure_ac_power(host):
     if not is_ac_power(host):
         raise ValueError("AC power is required but not confirmed by the host snapshot")
+
+
+def ensure_low_power_mode_off(host):
+    if not is_low_power_mode_off(host):
+        raise ValueError(
+            "low-power mode must be off but is not confirmed by the host snapshot"
+        )
 
 
 def source_stamp():
@@ -1034,7 +1071,14 @@ def read_report(directory):
     return report
 
 
-def collect(directory, runs, toolchain, *, require_ac_power=False):
+def collect(
+    directory,
+    runs,
+    toolchain,
+    *,
+    require_ac_power=False,
+    require_low_power_mode_off=False,
+):
     if platform.system() != "Darwin":
         raise ValueError("the boundary benchmark requires macOS system JavaScriptCore")
     if not valid_run_count(runs):
@@ -1048,9 +1092,12 @@ def collect(directory, runs, toolchain, *, require_ac_power=False):
             raise ValueError("output inside the repository must be Git-ignored")
     directory.mkdir(parents=True, exist_ok=False)
     try:
-        if require_ac_power:
-            require_ac_power_snapshot = host_environment()
-            ensure_ac_power(require_ac_power_snapshot)
+        if require_ac_power or require_low_power_mode_off:
+            pre_build_host = host_environment()
+            if require_ac_power:
+                ensure_ac_power(pre_build_host)
+            if require_low_power_mode_off:
+                ensure_low_power_mode_off(pre_build_host)
         stamp = source_stamp()
         build_environment = compiler_environment(toolchain)
         build = [
@@ -1069,6 +1116,8 @@ def collect(directory, runs, toolchain, *, require_ac_power=False):
         host = host_environment()
         if require_ac_power:
             ensure_ac_power(host)
+        if require_low_power_mode_off:
+            ensure_low_power_mode_off(host)
         metadata = {
             "schema": SCHEMA,
             "benchmark": "boundary",
@@ -1089,7 +1138,9 @@ def collect(directory, runs, toolchain, *, require_ac_power=False):
             "scalar_ordering": SCALAR_ORDERING,
             "started_utc": datetime.datetime.now(datetime.UTC).isoformat(),
             "source": stamp,
-            "collection_preconditions": collection_preconditions(require_ac_power),
+            "collection_preconditions": collection_preconditions(
+                require_ac_power, require_low_power_mode_off
+            ),
             "build_command": build,
             "compiler_selection": "explicit",
             "compiler_paths": {
@@ -1173,6 +1224,11 @@ def main():
         action="store_true",
         help="reject collection unless AC power is confirmed before build and process launch",
     )
+    run.add_argument(
+        "--require-low-power-mode-off",
+        action="store_true",
+        help="reject collection unless low-power mode is off before build and process launch",
+    )
     report = commands.add_parser("report", help="recompute statistics from saved raw stdout")
     report.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -1183,6 +1239,7 @@ def main():
                 args.runs,
                 args.toolchain,
                 require_ac_power=args.require_ac_power,
+                require_low_power_mode_off=args.require_low_power_mode_off,
             )
             if args.action == "run"
             else read_report(args.directory)
