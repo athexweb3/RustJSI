@@ -12,7 +12,7 @@ use rustjsi_host::{
     DrainPoster, Host, RuntimeIdentity, ScheduledWork, ScheduledWorkAcquire,
     ScheduledWorkFinishError, ScheduledWorkMailbox, ScheduledWorkPostError, WorkDispatchError,
 };
-use rustjsi_runtime::DrainAfter;
+use rustjsi_runtime::{DrainAfter, TerminalAcquireError};
 use rustjsi_testkit::ModelHost;
 
 #[test]
@@ -215,6 +215,26 @@ impl DrainPoster for RecordingPoster {
     }
 }
 
+struct TerminalAttemptPoster<'mailbox> {
+    mailbox: &'mailbox ScheduledWorkMailbox<u32>,
+    posts: Cell<usize>,
+    terminal_blocked: Cell<bool>,
+}
+
+impl DrainPoster for TerminalAttemptPoster<'_> {
+    type Error = Infallible;
+
+    fn post_drain(&self, _attachment: rustjsi_host::AttachmentId) -> Result<(), Self::Error> {
+        self.posts.set(self.posts.get() + 1);
+        let _ = self.mailbox.begin_close();
+        self.terminal_blocked.set(matches!(
+            self.mailbox.try_begin_terminal_drain(),
+            Err(TerminalAcquireError::NormalDrainReservationsRemain(count)) if count.get() == 1
+        ));
+        Ok(())
+    }
+}
+
 #[test]
 fn mailbox_posts_once_for_a_coalesced_drain() {
     let host = ModelHost::new().unwrap();
@@ -229,6 +249,26 @@ fn mailbox_posts_once_for_a_coalesced_drain() {
 
     assert_eq!(poster.posts.get(), 1);
     assert_eq!(poster.last_attachment.get(), Some(attachment));
+}
+
+#[test]
+fn retry_post_holds_normal_admission_until_host_acceptance() {
+    let host = ModelHost::new().unwrap();
+    let mailbox = ScheduledWorkMailbox::new(host.attachment_id(), NonZeroUsize::new(1).unwrap());
+    let poster = TerminalAttemptPoster {
+        mailbox: &mailbox,
+        posts: Cell::new(0),
+        terminal_blocked: Cell::new(false),
+    };
+    let _ = mailbox.enqueue(7_u32).unwrap();
+
+    assert!(mailbox.post_pending(&poster).unwrap());
+    assert_eq!(poster.posts.get(), 1);
+    assert!(poster.terminal_blocked.get());
+
+    let terminal = mailbox.try_begin_terminal_drain().unwrap();
+    assert_eq!(terminal.pop().unwrap().into_payload(), 7);
+    terminal.finish().unwrap();
 }
 
 #[derive(Debug)]

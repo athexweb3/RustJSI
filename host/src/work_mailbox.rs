@@ -152,21 +152,20 @@ impl<T> ScheduledWorkMailbox<T> {
             })
     }
 
-    /// Posts a retry only while the mailbox still has a pending normal drain.
+    /// Attempts a retry post while a pending normal drain is still protected.
     ///
     /// # Errors
     ///
     /// Returns the host poster's error while preserving the pending mailbox.
+    /// If terminal ownership began before this retry acquired normal admission,
+    /// returns `Ok(false)` without invoking the poster. If this retry acquired
+    /// first, terminal ownership cannot start until the poster returns.
     pub fn post_pending<P>(&self, poster: &P) -> Result<bool, P::Error>
     where
         P: DrainPoster,
     {
-        if self.mailbox.is_drain_pending() {
-            poster.post_drain(self.attachment)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.mailbox
+            .post_pending_with(|| poster.post_drain(self.attachment))
     }
 
     /// Stops later producer admission without waiting for earlier publishers.
