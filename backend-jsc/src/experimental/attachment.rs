@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::local_roots::LocalRoots;
-use super::{ActiveEntryFrame, CallLimits, Context, RootLimits, RuntimeError, Shared, sys};
+use super::{
+    ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, RootLimits, RuntimeError, Shared,
+    sys,
+};
 use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -95,11 +98,42 @@ impl Attachment {
         root_limits: RootLimits,
         call_limits: CallLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_external_buffer_limits(
+            identity,
+            final_entry_policy,
+            root_limits,
+            call_limits,
+            ExternalBufferLimits::default(),
+        )
+    }
+
+    /// Creates attachment state with root, call-data, and external-buffer limits.
+    ///
+    /// External-buffer limits cover live Rust-owned byte slices accepted by this
+    /// attachment. They are released only when JSC invokes the backing-store
+    /// deallocator, and do not represent a JavaScript or process heap limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error if the issuer cannot allocate another epoch.
+    pub fn new_with_external_buffer_limits(
+        identity: &mut RuntimeIdentity,
+        final_entry_policy: FinalEntryPolicy,
+        root_limits: RootLimits,
+        call_limits: CallLimits,
+        external_buffer_limits: ExternalBufferLimits,
+    ) -> Result<Self, RuntimeError> {
         let id = identity
             .next_attachment()
             .map_err(|_| RuntimeError::IdentityExhausted)?;
         Ok(Self {
-            shared: Shared::new(id, final_entry_policy, root_limits, call_limits),
+            shared: Shared::new(
+                id,
+                final_entry_policy,
+                root_limits,
+                call_limits,
+                external_buffer_limits,
+            ),
         })
     }
 
@@ -486,6 +520,36 @@ mod tests {
                         JsError::Runtime(RuntimeError::CallArgumentLimitReached)
                     );
                     assert_eq!(calls.get(), 0);
+                })
+                .unwrap();
+            let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
+        }
+    }
+
+    #[test]
+    fn foreign_attachment_applies_external_buffer_limits() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new_with_external_buffer_limits(
+            &mut identity,
+            FinalEntryPolicy::Guaranteed,
+            RootLimits::default(),
+            CallLimits::default(),
+            ExternalBufferLimits {
+                allocations: 0,
+                bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+
+        unsafe {
+            attachment
+                .with_context(owner.as_raw(), |cx| {
+                    assert_eq!(
+                        cx.install_external_buffer("foreignLimited", Box::from([1_u8, 2, 3]))
+                            .unwrap_err(),
+                        JsError::Runtime(RuntimeError::ExternalBufferAllocationLimitReached)
+                    );
                 })
                 .unwrap();
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();

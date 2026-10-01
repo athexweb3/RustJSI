@@ -5,10 +5,12 @@
 #![cfg(all(feature = "experimental-jsc", target_os = "macos"))]
 
 use rustjsi_backend::{
-    BackendError, BackendFamily, BackendScope, OwnedExternalBufferScope, RootBackend, RootScope,
-    ValueKind,
+    BackendBase, BackendError, BackendFamily, BackendScope, OwnedExternalBufferScope,
+    OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
-use rustjsi_backend_jsc::{CallLimits, JscBackendFamily, RootLimits, Runtime, RuntimeError};
+use rustjsi_backend_jsc::{
+    CallLimits, ExternalBufferLimits, JscBackendFamily, RootLimits, Runtime, RuntimeError,
+};
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
     ModelBackend, ModelBackendFamily, create_number_root, verify_base_values,
@@ -86,6 +88,70 @@ fn public_call_limit_configuration_is_available_to_owned_hosts() {
     )
     .unwrap();
     runtime.invalidate().unwrap();
+}
+
+#[test]
+fn public_external_buffer_limits_reject_before_ownership_transfer() {
+    let mut runtime = Runtime::new_with_external_buffer_limits(
+        RootLimits::default(),
+        CallLimits::default(),
+        ExternalBufferLimits {
+            allocations: 0,
+            bytes: usize::MAX,
+        },
+    )
+    .unwrap();
+    runtime
+        .with_backend(|backend| {
+            let scope = backend.open_scope().unwrap();
+            let owner = vec![9_u8, 8, 7].into_boxed_slice();
+            let pointer = owner.as_ptr();
+            match scope.externalize(owner) {
+                Err(OwnershipTransferError::Rejected { owner, error }) => {
+                    assert_eq!(owner.as_ptr(), pointer);
+                    assert_eq!(&*owner, &[9, 8, 7]);
+                    assert_eq!(
+                        error,
+                        BackendError::Failure("external-buffer allocation limit reached")
+                    );
+                }
+                other => panic!("unexpected transfer result: {other:?}"),
+            }
+            scope.string("scope remains usable").unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+fn public_external_buffer_byte_limit_rejects_before_ownership_transfer() {
+    let mut runtime = Runtime::new_with_external_buffer_limits(
+        RootLimits::default(),
+        CallLimits::default(),
+        ExternalBufferLimits {
+            allocations: 1,
+            bytes: 0,
+        },
+    )
+    .unwrap();
+    runtime
+        .with_backend(|backend| {
+            let scope = backend.open_scope().unwrap();
+            let owner = vec![9_u8, 8, 7].into_boxed_slice();
+            let pointer = owner.as_ptr();
+            match scope.externalize(owner) {
+                Err(OwnershipTransferError::Rejected { owner, error }) => {
+                    assert_eq!(owner.as_ptr(), pointer);
+                    assert_eq!(&*owner, &[9, 8, 7]);
+                    assert_eq!(
+                        error,
+                        BackendError::Failure("external-buffer byte limit reached")
+                    );
+                }
+                other => panic!("unexpected transfer result: {other:?}"),
+            }
+            scope.string("scope remains usable").unwrap();
+        })
+        .unwrap();
 }
 
 #[test]

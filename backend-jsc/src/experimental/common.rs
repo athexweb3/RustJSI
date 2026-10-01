@@ -495,7 +495,7 @@ impl OwnedExternalBufferScope for JscScope<'_, '_> {
         };
         if let Err(error) = self.backend.shared.external_buffers.reserve(owner.len()) {
             return Err(OwnershipTransferError::Rejected {
-                error: map_js_error(error),
+                error: map_runtime_error(error),
                 owner,
             });
         }
@@ -702,6 +702,12 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         }
         RuntimeError::CallStringDataLimitReached => {
             BackendError::Failure("call string data limit reached")
+        }
+        RuntimeError::ExternalBufferAllocationLimitReached => {
+            BackendError::Failure("external-buffer allocation limit reached")
+        }
+        RuntimeError::ExternalBufferByteLimitReached => {
+            BackendError::Failure("external-buffer byte limit reached")
         }
         RuntimeError::HostFunctionLimitReached => {
             BackendError::Failure("host function registration limit reached")

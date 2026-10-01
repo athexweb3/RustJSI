@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{Context, JsError, JsString, Shared, exception_to_owned};
+use super::{
+    Context, ExternalBufferLimits, JsError, JsString, RuntimeError, Shared, exception_to_owned,
+};
 use crate::sys;
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, ThreadId};
-
-const MAX_EXTERNAL_ALLOCATIONS: usize = 4_096;
-const MAX_EXTERNAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// An observation handle for Rust-owned bytes transferred to `JavaScriptCore`.
 ///
@@ -24,6 +23,7 @@ pub(super) struct ExternalLedger {
     live_allocations: AtomicUsize,
     live_bytes: AtomicUsize,
     deallocations: AtomicUsize,
+    limits: ExternalBufferLimits,
 }
 
 struct ExternalOwner {
@@ -95,31 +95,32 @@ impl ExternalBuffer {
 }
 
 impl ExternalLedger {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: ExternalBufferLimits) -> Self {
         Self {
             live_allocations: AtomicUsize::new(0),
             live_bytes: AtomicUsize::new(0),
             deallocations: AtomicUsize::new(0),
+            limits,
         }
     }
 
-    pub(super) fn reserve(&self, byte_len: usize) -> Result<(), JsError> {
+    pub(super) fn reserve(&self, byte_len: usize) -> Result<(), RuntimeError> {
         self.live_allocations
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                (live < MAX_EXTERNAL_ALLOCATIONS).then_some(live + 1)
+                (live < self.limits.allocations).then_some(live + 1)
             })
-            .map_err(|_| JsError::Backend("external-buffer allocation quota exceeded"))?;
+            .map_err(|_| RuntimeError::ExternalBufferAllocationLimitReached)?;
 
         if self
             .live_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 live.checked_add(byte_len)
-                    .filter(|total| *total <= MAX_EXTERNAL_BYTES)
+                    .filter(|total| *total <= self.limits.bytes)
             })
             .is_err()
         {
             self.live_allocations.fetch_sub(1, Ordering::AcqRel);
-            return Err(JsError::Backend("external-buffer byte quota exceeded"));
+            return Err(RuntimeError::ExternalBufferByteLimitReached);
         }
         Ok(())
     }
@@ -176,7 +177,10 @@ impl Context<'_> {
     ) -> Result<ExternalBuffer, JsError> {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
         let property = JsString::new(name)?;
-        self.shared.external_buffers.reserve(bytes.len())?;
+        self.shared
+            .external_buffers
+            .reserve(bytes.len())
+            .map_err(JsError::Runtime)?;
 
         let byte_len = bytes.len();
         let observation = new_observation();
@@ -356,39 +360,76 @@ mod tests {
 
     #[test]
     fn external_quota_rejection_refunds_reserved_local_capacity() {
-        use crate::{RootLimits, Runtime};
+        use crate::{CallLimits, RootLimits, Runtime};
         use rustjsi_backend::{
-            BackendBase, BackendScope, OwnedExternalBufferScope, OwnershipTransferError,
+            BackendBase, BackendError, BackendScope, OwnedExternalBufferScope,
+            OwnershipTransferError,
         };
-        let mut runtime = Runtime::new_with_root_limits(RootLimits {
-            local_roots: 1,
-            ..RootLimits::default()
-        })
+        let mut runtime = Runtime::new_with_external_buffer_limits(
+            RootLimits {
+                local_roots: 1,
+                ..RootLimits::default()
+            },
+            CallLimits::default(),
+            ExternalBufferLimits {
+                allocations: 0,
+                bytes: usize::MAX,
+            },
+        )
         .unwrap();
         let ledger = Arc::clone(&runtime.shared.external_buffers);
-        // Synthetic ledger saturation, not engine allocations.
-        for _ in 0..MAX_EXTERNAL_ALLOCATIONS {
-            ledger.reserve(0).unwrap();
-        }
         runtime
             .with_backend(|backend| {
                 let scope = backend.open_scope().unwrap();
-                assert!(matches!(
-                    scope.externalize(vec![1].into_boxed_slice()),
-                    Err(OwnershipTransferError::Rejected { .. })
-                ));
+                let owner = vec![1, 2, 3].into_boxed_slice();
+                let pointer = owner.as_ptr();
+                match scope.externalize(owner) {
+                    Err(OwnershipTransferError::Rejected { owner, error }) => {
+                        assert_eq!(owner.as_ptr(), pointer);
+                        assert_eq!(&*owner, &[1, 2, 3]);
+                        assert_eq!(
+                            error,
+                            BackendError::Failure("external-buffer allocation limit reached")
+                        );
+                    }
+                    other => panic!("unexpected transfer result: {other:?}"),
+                }
                 scope.string("local reservation refunded").unwrap();
             })
             .unwrap();
-        for _ in 0..MAX_EXTERNAL_ALLOCATIONS {
-            ledger.release(0);
-        }
         assert_eq!(ledger.live_allocations(), 0);
+        assert_eq!(ledger.live_bytes(), 0);
+    }
+
+    #[test]
+    fn direct_external_buffer_byte_limit_is_a_typed_runtime_error() {
+        use crate::{CallLimits, RootLimits, Runtime};
+
+        let mut runtime = Runtime::new_with_external_buffer_limits(
+            RootLimits::default(),
+            CallLimits::default(),
+            ExternalBufferLimits {
+                allocations: 1,
+                bytes: 0,
+            },
+        )
+        .unwrap();
+        runtime
+            .with_context(|cx| {
+                assert_eq!(
+                    cx.install_external_buffer("limited", Box::from([1_u8]))
+                        .unwrap_err(),
+                    JsError::Runtime(RuntimeError::ExternalBufferByteLimitReached)
+                );
+                let value = cx.eval("40 + 2", "after-rejection.js").unwrap();
+                assert_eq!(cx.number(&value).unwrap().to_bits(), 42.0_f64.to_bits());
+            })
+            .unwrap();
     }
 
     #[test]
     fn external_owner_can_be_released_off_thread() {
-        let ledger = Arc::new(ExternalLedger::new());
+        let ledger = Arc::new(ExternalLedger::new(ExternalBufferLimits::default()));
         ledger.reserve(4).unwrap();
         let observation = Arc::new(ExternalObservation {
             deallocations: AtomicUsize::new(0),
@@ -426,8 +467,15 @@ mod tests {
 
     #[test]
     fn byte_quota_rejection_rolls_back_allocation_reservation() {
-        let ledger = ExternalLedger::new();
-        assert!(ledger.reserve(MAX_EXTERNAL_BYTES + 1).is_err());
+        let limits = ExternalBufferLimits {
+            allocations: 1,
+            bytes: 4,
+        };
+        let ledger = ExternalLedger::new(limits);
+        assert_eq!(
+            ledger.reserve(limits.bytes + 1),
+            Err(RuntimeError::ExternalBufferByteLimitReached)
+        );
         assert_eq!(ledger.live_allocations(), 0);
         assert_eq!(ledger.live_bytes(), 0);
     }
