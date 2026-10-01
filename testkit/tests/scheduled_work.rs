@@ -9,9 +9,10 @@ use std::fmt;
 use std::num::NonZeroUsize;
 
 use rustjsi_host::{
-    DrainPoster, Host, RuntimeIdentity, ScheduledWork, ScheduledWorkAcquire, ScheduledWorkMailbox,
-    ScheduledWorkPostError, WorkDispatchError,
+    DrainPoster, Host, RuntimeIdentity, ScheduledWork, ScheduledWorkAcquire,
+    ScheduledWorkFinishError, ScheduledWorkMailbox, ScheduledWorkPostError, WorkDispatchError,
 };
+use rustjsi_runtime::DrainAfter;
 use rustjsi_testkit::ModelHost;
 
 #[test]
@@ -286,4 +287,77 @@ fn failed_post_preserves_pending_work_for_explicit_retry() {
     assert_eq!(drain.pop().unwrap().into_payload(), 2);
     let _ = drain.finish();
     assert!(!mailbox.post_pending(&poster).unwrap());
+}
+
+#[test]
+fn finishing_a_pending_drain_posts_the_bound_successor() {
+    let host = ModelHost::new().unwrap();
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(2).unwrap());
+    let poster = RecordingPoster::default();
+
+    let _ = mailbox.enqueue_and_post(&poster, 1_u32).unwrap();
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("initial work must acquire a normal drain");
+    };
+    assert_eq!(drain.pop().unwrap().into_payload(), 1);
+    assert!(matches!(
+        mailbox.enqueue(2_u32),
+        Ok(rustjsi_runtime::MailboxEnqueue::Coalesced)
+    ));
+
+    assert_eq!(drain.finish_and_post(&poster).unwrap(), DrainAfter::Pending);
+    assert_eq!(poster.posts.get(), 2);
+    assert_eq!(poster.last_attachment.get(), Some(attachment));
+
+    let ScheduledWorkAcquire::Acquired(successor) = mailbox.acquire() else {
+        panic!("pending finish must retain a successor drain");
+    };
+    assert_eq!(successor.pop().unwrap().into_payload(), 2);
+    assert_eq!(
+        successor.finish_and_post(&poster).unwrap(),
+        DrainAfter::Idle
+    );
+    assert_eq!(poster.posts.get(), 2);
+}
+
+#[test]
+fn failed_successor_post_keeps_mailbox_pending_for_retry() {
+    let host = ModelHost::new().unwrap();
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(2).unwrap());
+    let poster = FailOncePoster {
+        posts: Cell::new(0),
+        reject_next: Cell::new(true),
+    };
+
+    let _ = mailbox.enqueue(1_u32).unwrap();
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("initial work must acquire a normal drain");
+    };
+    assert_eq!(drain.pop().unwrap().into_payload(), 1);
+    assert!(matches!(
+        mailbox.enqueue(2_u32),
+        Ok(rustjsi_runtime::MailboxEnqueue::Coalesced)
+    ));
+
+    let error = drain
+        .finish_and_post(&poster)
+        .expect_err("first successor post must fail");
+    assert!(matches!(
+        error,
+        ScheduledWorkFinishError::Post {
+            attachment: error_attachment,
+            ..
+        } if error_attachment == attachment
+    ));
+    assert_eq!(poster.posts.get(), 1);
+
+    assert!(mailbox.post_pending(&poster).unwrap());
+    assert_eq!(poster.posts.get(), 2);
+    let ScheduledWorkAcquire::Acquired(retry) = mailbox.acquire() else {
+        panic!("failed successor post must leave work drainable after retry");
+    };
+    assert_eq!(retry.pop().unwrap().into_payload(), 2);
+    assert_eq!(retry.finish(), DrainAfter::Idle);
 }

@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use rustjsi_backend::BackendFamily;
 use rustjsi_runtime::{
     ClosableMailbox, ClosableMailboxAcquire, ClosableMailboxDrain, ClosableMailboxEnqueueError,
-    IngressClose, MailboxEnqueue, TerminalAcquireError, TerminalDrainFinishError,
+    DrainAfter, IngressClose, MailboxEnqueue, TerminalAcquireError, TerminalDrainFinishError,
     TerminalMailboxDrain,
 };
 
@@ -44,6 +44,19 @@ pub enum ScheduledWorkPostError<T, E> {
     },
 }
 
+/// Failure to post the successor required after a normal work drain finishes.
+#[derive(Debug)]
+#[must_use]
+pub enum ScheduledWorkFinishError<E> {
+    /// Work remains pending after the drain, but the host rejected its post.
+    Post {
+        /// Immutable mailbox attachment requested for the successor drain.
+        attachment: AttachmentId,
+        /// Host-specific posting failure.
+        error: E,
+    },
+}
+
 /// Result of acquiring normal scheduled work.
 #[derive(Debug)]
 #[must_use]
@@ -62,6 +75,7 @@ pub enum ScheduledWorkAcquire<'mailbox, T> {
 #[derive(Debug)]
 #[must_use]
 pub struct ScheduledWorkDrain<'mailbox, T> {
+    attachment: AttachmentId,
     drain: ClosableMailboxDrain<'mailbox, ScheduledWork<T>>,
 }
 
@@ -163,7 +177,10 @@ impl<T> ScheduledWorkMailbox<T> {
             ClosableMailboxAcquire::Busy => ScheduledWorkAcquire::Busy,
             ClosableMailboxAcquire::Unavailable(_) => ScheduledWorkAcquire::Unavailable,
             ClosableMailboxAcquire::Acquired(drain) => {
-                ScheduledWorkAcquire::Acquired(ScheduledWorkDrain { drain })
+                ScheduledWorkAcquire::Acquired(ScheduledWorkDrain {
+                    attachment: self.attachment,
+                    drain,
+                })
             }
         }
     }
@@ -216,8 +233,37 @@ impl<T> ScheduledWorkDrain<'_, T> {
     }
 
     /// Finishes normal draining and reports the successor-post obligation.
-    pub fn finish(self) -> rustjsi_runtime::DrainAfter {
+    pub fn finish(self) -> DrainAfter {
         self.drain.finish()
+    }
+
+    /// Finishes normal draining and posts one successor when work arrived during it.
+    ///
+    /// A successor post is attempted only after [`DrainAfter::Pending`]. Its
+    /// attachment is the immutable identity captured when the mailbox was
+    /// created. `Idle` and `Closed` finish outcomes do not call the poster.
+    ///
+    /// # Errors
+    ///
+    /// A post failure leaves the mailbox pending. The caller can use
+    /// [`ScheduledWorkMailbox::post_pending`] for an explicit retry.
+    pub fn finish_and_post<P>(
+        self,
+        poster: &P,
+    ) -> Result<DrainAfter, ScheduledWorkFinishError<P::Error>>
+    where
+        P: DrainPoster,
+    {
+        let after = self.drain.finish();
+        if after == DrainAfter::Pending {
+            poster
+                .post_drain(self.attachment)
+                .map_err(|error| ScheduledWorkFinishError::Post {
+                    attachment: self.attachment,
+                    error,
+                })?;
+        }
+        Ok(after)
     }
 }
 
