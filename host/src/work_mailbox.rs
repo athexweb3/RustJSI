@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+use rustjsi_backend::BackendFamily;
 use rustjsi_runtime::{
     ClosableMailbox, ClosableMailboxAcquire, ClosableMailboxDrain, ClosableMailboxEnqueueError,
     IngressClose, MailboxEnqueue, TerminalAcquireError, TerminalDrainFinishError,
@@ -9,7 +10,7 @@ use rustjsi_runtime::{
 };
 
 use crate::DrainPoster;
-use crate::{AttachmentId, ScheduledWork};
+use crate::{AttachmentId, Host, ScheduledWork, WorkDispatchError};
 
 /// Attachment-bound host work retained in a close-aware bounded mailbox.
 #[derive(Debug)]
@@ -180,6 +181,32 @@ impl<T> ScheduledWorkDrain<'_, T> {
     #[must_use]
     pub fn pop(&self) -> Option<ScheduledWork<T>> {
         self.drain.pop()
+    }
+
+    /// Dispatches at most one queued record through one legal host entry.
+    ///
+    /// A successful call with retained work enters the host exactly once and
+    /// returns that operation's result. An empty drain does not enter the host.
+    /// Rejected work remains in the returned error for caller-owned retry or
+    /// terminal policy; this helper does not silently requeue, discard, or
+    /// execute another record.
+    ///
+    /// # Errors
+    ///
+    /// Returns attachment or host-entry rejection with the consumed queue
+    /// record still owned by the caller.
+    pub fn dispatch_next<H, R>(
+        &self,
+        host: &mut H,
+        operation: impl for<'entry> FnOnce(&mut <H::Family as BackendFamily>::Backend<'entry>, T) -> R,
+    ) -> Result<Option<R>, WorkDispatchError<T, H::Error>>
+    where
+        H: Host,
+    {
+        let Some(work) = self.pop() else {
+            return Ok(None);
+        };
+        work.dispatch(host, operation).map(Some)
     }
 
     /// Finishes normal draining and reports the successor-post obligation.
