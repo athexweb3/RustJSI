@@ -440,7 +440,7 @@ pub(super) fn borrowed_global_context(
 mod tests {
     use super::*;
     use crate::experimental::Runtime;
-    use crate::{JsError, Value, sys};
+    use crate::{JsError, NativeStateInstallError, NativeStateLimits, Value, sys};
     use std::cell::Cell;
 
     struct ForeignContext(NonNull<sys::OpaqueContext>);
@@ -625,6 +625,39 @@ mod tests {
                             .unwrap_err(),
                         JsError::Runtime(RuntimeError::ExternalBufferAllocationLimitReached)
                     );
+                })
+                .unwrap();
+            let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
+        }
+    }
+
+    #[test]
+    fn foreign_attachment_applies_native_state_limits() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new_with_jsc_limits(
+            &mut identity,
+            FinalEntryPolicy::Guaranteed,
+            JscRuntimeLimits {
+                native_states: NativeStateLimits { registrations: 0 },
+                ..JscRuntimeLimits::default()
+            },
+        )
+        .unwrap();
+
+        unsafe {
+            attachment
+                .with_context(owner.as_raw(), |cx| {
+                    let state = String::from("foreign");
+                    let address = state.as_ptr();
+                    match cx.try_install_native_state("foreignLimitedState", state) {
+                        Err(NativeStateInstallError::Rejected { state, error }) => {
+                            assert_eq!(error, RuntimeError::NativeStateRegistrationLimitReached);
+                            assert_eq!(state.as_ptr(), address);
+                            assert_eq!(state, "foreign");
+                        }
+                        result => panic!("expected native-state admission refusal: {result:?}"),
+                    }
                 })
                 .unwrap();
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();

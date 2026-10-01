@@ -10,7 +10,7 @@ use rustjsi_backend::{
 };
 use rustjsi_backend_jsc::{
     CallLimits, ExternalBufferLimits, InboundCallbackLimits, JscBackendFamily, JscRuntimeLimits,
-    NativeStateInstallError, RootLimits, Runtime, RuntimeError, Value,
+    NativeStateInstallError, NativeStateLimits, RootLimits, Runtime, RuntimeError, Value,
 };
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
@@ -141,6 +141,30 @@ fn public_native_state_recovery_api_installs_and_leases_state() {
                 }
             };
             assert_eq!(cx.with_native_state(&state, Clone::clone).unwrap(), "state");
+        })
+        .unwrap();
+}
+
+#[test]
+fn public_native_state_limit_returns_the_unaccepted_owner() {
+    let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+        native_states: NativeStateLimits { registrations: 0 },
+        ..JscRuntimeLimits::default()
+    })
+    .unwrap();
+
+    runtime
+        .with_context(|cx| {
+            let owner = String::from("state");
+            let address = owner.as_ptr();
+            match cx.try_install_native_state("publicLimitedState", owner) {
+                Err(NativeStateInstallError::Rejected { state, error }) => {
+                    assert_eq!(error, RuntimeError::NativeStateRegistrationLimitReached);
+                    assert_eq!(state.as_ptr(), address);
+                    assert_eq!(state, "state");
+                }
+                result => panic!("expected native-state admission refusal: {result:?}"),
+            }
         })
         .unwrap();
 }
