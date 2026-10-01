@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{JsError, RootLimits, Runtime, RuntimeError, Shared, Value};
+use super::{
+    HostFunctionLimits, JsError, JscRuntimeLimits, RootLimits, Runtime, RuntimeError, Shared, Value,
+};
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
 
@@ -25,7 +27,14 @@ impl Drop for DropProbe {
 
 #[test]
 fn full_callback_registry_rejects_before_publication() {
-    let mut runtime = Runtime::new().unwrap();
+    const LIMIT: usize = 2;
+    let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+        host_functions: HostFunctionLimits {
+            registrations: LIMIT,
+        },
+        ..JscRuntimeLimits::default()
+    })
+    .unwrap();
     let shared = Rc::clone(&runtime.shared);
     let drops = Rc::new(Cell::new(0));
     runtime
@@ -35,7 +44,7 @@ fn full_callback_registry_rejects_before_publication() {
                 "setter.js",
             )
             .unwrap();
-            for _ in 0..4096 {
+            for _ in 0..LIMIT {
                 let probe = DropProbe {
                     shared: Rc::downgrade(&shared),
                     drops: Rc::clone(&drops),
@@ -59,7 +68,7 @@ fn full_callback_registry_rejects_before_publication() {
                 Err(JsError::Runtime(RuntimeError::HostFunctionLimitReached))
             ));
             assert_eq!(drops.get(), 1);
-            assert_eq!(shared.host_functions.borrow().len(), 4096);
+            assert_eq!(shared.host_functions.borrow().len(), LIMIT);
             let untouched = cx.eval("published === 0", "check.js").unwrap();
             assert!(cx.boolean(&untouched).unwrap());
         })
@@ -87,13 +96,20 @@ fn full_callback_registry_rejects_before_publication() {
         })
         .unwrap();
     runtime.invalidate().unwrap();
-    assert_eq!(drops.get(), 4097);
+    assert_eq!(drops.get(), LIMIT + 1);
     assert!(shared.host_functions.borrow().is_empty());
 }
 
 #[test]
 fn failed_publication_returns_callback_capacity() {
-    let mut runtime = Runtime::new().unwrap();
+    const LIMIT: usize = 2;
+    let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+        host_functions: HostFunctionLimits {
+            registrations: LIMIT,
+        },
+        ..JscRuntimeLimits::default()
+    })
+    .unwrap();
     let shared = Rc::clone(&runtime.shared);
     let drops = Rc::new(Cell::new(0));
     runtime.with_context(|cx| {
@@ -101,7 +117,7 @@ fn failed_publication_returns_callback_capacity() {
             "Object.defineProperty(globalThis, 'reject', { set(value) { globalThis.saved = value; throw new Error('rejected'); } });",
             "setter.js",
         ).unwrap();
-        for _ in 0..4095 {
+        for _ in 0..LIMIT - 1 {
             cx.install_host_function("retained", |_| Ok(Value::Undefined)).unwrap();
         }
         for _ in 0..100 {
@@ -113,11 +129,11 @@ fn failed_publication_returns_callback_capacity() {
                 let _ = &probe;
                 Ok(Value::Undefined)
             }), Err(JsError::Exception(_))));
-            assert_eq!(shared.host_functions.borrow().len(), 4095);
+            assert_eq!(shared.host_functions.borrow().len(), LIMIT - 1);
         }
         assert_eq!(drops.get(), 100);
         cx.install_host_function("last", |_| Ok(Value::Undefined)).unwrap();
-        assert_eq!(shared.host_functions.borrow().len(), 4096);
+        assert_eq!(shared.host_functions.borrow().len(), LIMIT);
         let stale = cx.eval("saved()", "stale.js").unwrap_err();
         assert!(stale.to_string().contains("registration is stale"));
         assert!(matches!(

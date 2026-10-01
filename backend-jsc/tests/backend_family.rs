@@ -9,8 +9,9 @@ use rustjsi_backend::{
     OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use rustjsi_backend_jsc::{
-    CallLimits, ExternalBufferLimits, InboundCallbackLimits, JscBackendFamily, JscRuntimeLimits,
-    NativeStateInstallError, NativeStateLimits, RootLimits, Runtime, RuntimeError, Value,
+    CallLimits, ExternalBufferLimits, HostFunctionLimits, InboundCallbackLimits, JscBackendFamily,
+    JscRuntimeLimits, NativeStateInstallError, NativeStateLimits, RootLimits, Runtime,
+    RuntimeError, Value,
 };
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
@@ -165,6 +166,32 @@ fn public_native_state_limit_returns_the_unaccepted_owner() {
                 }
                 result => panic!("expected native-state admission refusal: {result:?}"),
             }
+        })
+        .unwrap();
+}
+
+#[test]
+fn public_host_function_limit_rejects_before_callback_capture() {
+    let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+        host_functions: HostFunctionLimits { registrations: 0 },
+        ..JscRuntimeLimits::default()
+    })
+    .unwrap();
+    let capture = std::rc::Rc::new(());
+
+    runtime
+        .with_context(|cx| {
+            let captured = std::rc::Rc::clone(&capture);
+            assert!(matches!(
+                cx.install_host_function("publicLimitedCallback", move |_| {
+                    std::hint::black_box(&captured);
+                    Ok(Value::Undefined)
+                }),
+                Err(rustjsi_backend_jsc::JsError::Runtime(
+                    RuntimeError::HostFunctionLimitReached
+                ))
+            ));
+            assert_eq!(std::rc::Rc::strong_count(&capture), 1);
         })
         .unwrap();
 }
