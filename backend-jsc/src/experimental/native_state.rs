@@ -625,6 +625,7 @@ mod tests {
             // helper. Each node is removed from the list before it is dropped.
             let boxed = unsafe { Box::from_raw(current.as_ptr()) };
             token = boxed.next.load(Ordering::Relaxed);
+            boxed.queue.settle_pending();
             drop(boxed);
             count += 1;
         }
@@ -687,7 +688,22 @@ mod tests {
 
         assert_eq!(reclaimed, PRODUCERS * TOKENS_PER_PRODUCER);
         assert!(queue.take().is_null());
+        assert_eq!(queue.pending_count(), 0);
         assert_eq!(Arc::strong_count(&queue), 1);
+    }
+
+    #[test]
+    fn finalizer_queue_counts_detached_signals_until_settled() {
+        let queue = Arc::new(FinalizerQueue::new());
+        // SAFETY: This test transfers one uniquely-owned token to the queue.
+        unsafe { queue.push(test_finalizer_token(&queue, 0)) };
+        assert_eq!(queue.pending_count(), 1);
+
+        let detached = queue.take();
+        assert_eq!(queue.pending_count(), 1);
+        // SAFETY: `take` transferred sole ownership of this token list.
+        assert_eq!(unsafe { drop_test_finalizer_tokens(detached) }, 1);
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
@@ -719,6 +735,7 @@ mod tests {
 
             assert!(queue.take().is_null());
             assert!(queue.close().is_null());
+            assert_eq!(queue.pending_count(), 0, "round {slot}");
             assert_eq!(Arc::strong_count(&queue), 1, "round {slot}");
         }
     }
@@ -1032,7 +1049,21 @@ mod tests {
                     })
                     .join()
                     .unwrap();
+                    assert_eq!(
+                        shared
+                            .resource_snapshot()
+                            .unwrap()
+                            .pending_native_finalizers(),
+                        1
+                    );
                     shared.drain_native_finalizers();
+                    assert_eq!(
+                        shared
+                            .resource_snapshot()
+                            .unwrap()
+                            .pending_native_finalizers(),
+                        0
+                    );
                     assert_eq!(shared.native_states.borrow().live, 0);
                     assert_eq!(drops.get(), 0);
                     assert_eq!(state.value, 42);
