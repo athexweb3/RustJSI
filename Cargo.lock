@@ -51,6 +51,7 @@ name = "rustjsi-host"
 version = "0.0.0"
 dependencies = [
  "rustjsi-backend",
+ "rustjsi-runtime",
 ]
 
 [[package]]
@@ -74,4 +75,5 @@ version = "0.0.0"
 dependencies = [
  "rustjsi-backend",
  "rustjsi-host",
+ "rustjsi-runtime",
 ]
