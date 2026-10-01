@@ -395,4 +395,44 @@ mod tests {
         assert_eq!(gate.in_flight_reservations(), 0);
         assert_eq!(gate.try_seal(), Ok(IngressState::Sealed));
     }
+
+    #[test]
+    fn reserve_and_close_race_has_one_explicit_admission_boundary() {
+        const ROUNDS: usize = 256;
+
+        for _ in 0..ROUNDS {
+            let gate = Arc::new(IngressGate::new());
+            let start = Arc::new(Barrier::new(3));
+
+            let producer_gate = Arc::clone(&gate);
+            let producer_start = Arc::clone(&start);
+            let producer = thread::spawn(move || {
+                producer_start.wait();
+                producer_gate.reserve().map(|permit| {
+                    permit.settle();
+                })
+            });
+
+            let close_gate = Arc::clone(&gate);
+            let close_start = Arc::clone(&start);
+            let closer = thread::spawn(move || {
+                close_start.wait();
+                let _ = close_gate.begin_close();
+            });
+
+            start.wait();
+            let outcome = producer.join().expect("producer must not panic");
+            closer.join().expect("close owner must not panic");
+
+            assert!(matches!(
+                outcome,
+                Ok(()) | Err(IngressReserveError::NotOpen(IngressState::Closing))
+            ));
+            assert_eq!(gate.try_seal(), Ok(IngressState::Sealed));
+            assert!(matches!(
+                gate.reserve(),
+                Err(IngressReserveError::NotOpen(IngressState::Sealed))
+            ));
+        }
+    }
 }
