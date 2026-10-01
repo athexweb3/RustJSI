@@ -3,6 +3,7 @@
 use super::{Context, JsError, JsString, RuntimeError, Shared};
 use crate::sys;
 use std::any::{Any, TypeId};
+use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
@@ -26,17 +27,35 @@ pub struct NativeObject<T> {
     _affine: PhantomData<Rc<()>>,
 }
 
+/// An installation outcome that preserves state rejected before backend ownership.
+///
+/// [`Self::Rejected`] returns the original state because no registry insertion or
+/// JavaScript operation accepted it. [`Self::Js`] means registry acceptance
+/// already transferred ownership to the backend; any later failure rolled the
+/// state back through the backend's contained destruction path.
+pub enum NativeStateInstallError<T> {
+    /// Installation was refused before state ownership transferred.
+    Rejected {
+        /// The exact state supplied by the caller.
+        state: T,
+        /// The runtime or registration-admission reason.
+        error: RuntimeError,
+    },
+    /// Installation failed after backend ownership transferred.
+    Js(JsError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeId {
     slot: usize,
     generation: u64,
 }
 
-#[derive(Default)]
 pub(super) struct NativeRegistry {
     slots: Vec<NativeSlot>,
     free: Vec<usize>,
     live: usize,
+    limit: usize,
 }
 
 struct NativeSlot {
@@ -99,6 +118,39 @@ impl<T> fmt::Debug for NativeObject<T> {
     }
 }
 
+impl<T> fmt::Debug for NativeStateInstallError<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { error, .. } => formatter
+                .debug_struct("NativeStateInstallError::Rejected")
+                .field("error", error)
+                .finish_non_exhaustive(),
+            Self::Js(error) => formatter
+                .debug_tuple("NativeStateInstallError::Js")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+impl<T> fmt::Display for NativeStateInstallError<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { error, .. } => error.fmt(formatter),
+            Self::Js(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<T> Error for NativeStateInstallError<T> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rejected { error, .. } => Some(error),
+            Self::Js(error) => Some(error),
+        }
+    }
+}
+
 impl FinalizerQueue {
     pub(super) fn new() -> Self {
         Self {
@@ -156,8 +208,17 @@ impl FinalizerQueue {
 }
 
 impl NativeRegistry {
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+            live: 0,
+            limit,
+        }
+    }
+
     fn insert<T: 'static>(&mut self, value: T) -> Result<NativeId, T> {
-        if self.live == MAX_NATIVE_STATES {
+        if self.live >= self.limit {
             return Err(value);
         }
         self.live += 1;
@@ -224,18 +285,65 @@ impl NativeRegistry {
     }
 }
 
+impl Default for NativeRegistry {
+    fn default() -> Self {
+        Self::new(MAX_NATIVE_STATES)
+    }
+}
+
 impl Context<'_> {
     /// Installs Rust state behind an ordinary global JavaScript wrapper object.
     ///
+    /// Consumes `state` on every result, including admission refusal. Use
+    /// [`Self::try_install_native_state`] when a caller needs a state rejected
+    /// before backend ownership to be returned.
+    ///
     /// # Errors
     ///
-    /// Returns a lifecycle, allocation, publication, or JavaScript exception error.
+    /// Returns a lifecycle, registration-admission, allocation, publication, or
+    /// JavaScript exception error.
     pub fn install_native_state<T: 'static>(
         &mut self,
         name: &str,
         state: T,
     ) -> Result<NativeObject<T>, JsError> {
-        self.shared.ensure_active().map_err(JsError::Runtime)?;
+        match self.try_install_native_state(name, state) {
+            Ok(object) => Ok(object),
+            Err(NativeStateInstallError::Rejected { state, error }) => {
+                drop_state(self.shared, Some(Rc::new(state)));
+                if error == RuntimeError::NativeStateRegistrationLimitReached {
+                    Err(JsError::Backend("native-state capacity exceeded"))
+                } else {
+                    Err(JsError::Runtime(error))
+                }
+            }
+            Err(NativeStateInstallError::Js(error)) => Err(error),
+        }
+    }
+
+    /// Installs Rust state while returning it if admission rejects ownership.
+    ///
+    /// A [`NativeStateInstallError::Rejected`] result means no JSC string
+    /// conversion, class or wrapper creation, property publication, setter
+    /// invocation, finalizer token, or internal destruction occurred. After
+    /// registry acceptance, ownership transfers to this backend. A later
+    /// [`NativeStateInstallError::Js`] result has already rolled state back and
+    /// contained its destruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeStateInstallError::Rejected`] with `state` before the
+    /// backend accepts ownership for a runtime lifecycle or registration-limit
+    /// refusal. Returns [`NativeStateInstallError::Js`] after ownership
+    /// transfer for allocation, publication, or JavaScript exception failures.
+    pub fn try_install_native_state<T: 'static>(
+        &mut self,
+        name: &str,
+        state: T,
+    ) -> Result<NativeObject<T>, NativeStateInstallError<T>> {
+        if let Err(error) = self.shared.ensure_active() {
+            return Err(NativeStateInstallError::Rejected { state, error });
+        }
         let inserted = {
             let mut states = self.shared.native_states.borrow_mut();
             states.insert(state)
@@ -243,8 +351,10 @@ impl Context<'_> {
         let id = match inserted {
             Ok(id) => id,
             Err(state) => {
-                drop_state(self.shared, Some(Rc::new(state)));
-                return Err(JsError::Backend("native-state capacity exceeded"));
+                return Err(NativeStateInstallError::Rejected {
+                    state,
+                    error: RuntimeError::NativeStateRegistrationLimitReached,
+                });
             }
         };
         let token = Box::new(FinalizerToken {
@@ -265,7 +375,9 @@ impl Context<'_> {
             drop(unsafe { Box::from_raw(token) });
             let state = self.shared.native_states.borrow_mut().remove(id);
             drop_state(self.shared, state);
-            return Err(JsError::Backend("JavaScriptCore class creation failed"));
+            return Err(NativeStateInstallError::Js(JsError::Backend(
+                "JavaScriptCore class creation failed",
+            )));
         };
 
         // SAFETY: The class and context are live. On success JSC owns the private token
@@ -278,7 +390,9 @@ impl Context<'_> {
             drop(unsafe { Box::from_raw(token) });
             let state = self.shared.native_states.borrow_mut().remove(id);
             drop_state(self.shared, state);
-            return Err(JsError::Backend("JavaScriptCore object creation failed"));
+            return Err(NativeStateInstallError::Js(JsError::Backend(
+                "JavaScriptCore object creation failed",
+            )));
         };
         let _publication_root = PublicationRoot::new(self.raw, object);
 
@@ -286,16 +400,16 @@ impl Context<'_> {
             Ok(property) => property,
             Err(error) => {
                 self.rollback_native_object(object, token, id);
-                return Err(error);
+                return Err(NativeStateInstallError::Js(error));
             }
         };
         // SAFETY: The active context always has a global object.
         let global = unsafe { sys::context_get_global_object(self.raw.as_ptr()) };
         let Some(global) = NonNull::new(global) else {
             self.rollback_native_object(object, token, id);
-            return Err(JsError::Backend(
+            return Err(NativeStateInstallError::Js(JsError::Backend(
                 "JavaScriptCore returned a null global object",
-            ));
+            )));
         };
         let mut exception = ptr::null();
         // SAFETY: The object and property belong to this active context. The exception
@@ -313,7 +427,7 @@ impl Context<'_> {
         if !exception.is_null() {
             let exception = super::exception_to_owned(self.raw, exception);
             self.rollback_native_object(object, token, id);
-            return Err(JsError::Exception(exception));
+            return Err(NativeStateInstallError::Js(JsError::Exception(exception)));
         }
 
         Ok(NativeObject {
@@ -593,6 +707,106 @@ mod tests {
     }
 
     #[test]
+    fn rejected_install_returns_state_before_javascript_publication() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        shared.native_states.replace(NativeRegistry::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        runtime
+            .with_context(|cx| {
+                cx.eval(
+                    "globalThis.nativeStateSetterRuns = 0; Object.defineProperty(globalThis, 'capacityState', { set(_) { globalThis.nativeStateSetterRuns += 1; } })",
+                    "native-state-capacity-setter.js",
+                )
+                .unwrap();
+
+                let rejected = cx
+                    .try_install_native_state(
+                        "capacityState",
+                        DropProbe {
+                            value: 42,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .expect_err("zero-capacity registry must reject before publication");
+                let NativeStateInstallError::Rejected { state, error } = rejected else {
+                    panic!("expected pre-transfer rejection");
+                };
+
+                assert_eq!(error, RuntimeError::NativeStateRegistrationLimitReached);
+                assert_eq!(state.value, 42);
+                assert_eq!(drops.get(), 0);
+                let runs = cx.eval("nativeStateSetterRuns", "read-setter-runs.js").unwrap();
+                assert!((cx.number(&runs).unwrap() - 0.0).abs() < f64::EPSILON);
+                assert_eq!(shared.native_states.borrow().live, 0);
+
+                drop(state);
+                assert_eq!(drops.get(), 1);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn legacy_install_consumes_a_rejected_state() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        shared.native_states.replace(NativeRegistry::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        runtime
+            .with_context(|cx| {
+                assert!(matches!(
+                    cx.install_native_state(
+                        "legacyCapacityState",
+                        DropProbe {
+                            value: 42,
+                            drops: Rc::clone(&drops),
+                        },
+                    ),
+                    Err(JsError::Backend("native-state capacity exceeded"))
+                ));
+                assert_eq!(drops.get(), 1);
+                assert_eq!(shared.native_states.borrow().live, 0);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
+    fn rejected_install_returns_state_when_runtime_is_draining() {
+        let mut runtime = Runtime::new().unwrap();
+        let shared = Rc::clone(&runtime.shared);
+        let drops = Rc::new(Cell::new(0));
+
+        runtime
+            .with_context(|cx| {
+                shared.gate.request_drain();
+                let rejected = cx
+                    .try_install_native_state(
+                        "drainingState",
+                        DropProbe {
+                            value: 42,
+                            drops: Rc::clone(&drops),
+                        },
+                    )
+                    .expect_err("draining runtime must reject before transfer");
+                let NativeStateInstallError::Rejected { state, error } = rejected else {
+                    panic!("expected pre-transfer rejection");
+                };
+
+                assert_eq!(error, RuntimeError::Invalidated);
+                assert_eq!(state.value, 42);
+                assert_eq!(drops.get(), 0);
+                drop(state);
+                assert_eq!(drops.get(), 1);
+            })
+            .unwrap();
+        runtime.invalidate().unwrap();
+    }
+
+    #[test]
     fn active_operation_keeps_retired_state_alive_after_slot_reuse() {
         let mut runtime = Runtime::new().unwrap();
         let shared = Rc::clone(&runtime.shared);
@@ -649,10 +863,13 @@ mod tests {
                 Ok(super::super::Value::Boolean(observed_drops.get() != 0))
             }).unwrap();
             cx.eval("Object.defineProperty(globalThis, 'rejectState', { set(value) { globalThis.savedRejectedState = value; throw { toString() { return stateWasDropped() ? 'changed after cleanup' : 'publication failed'; } }; } })", "native-setter.js").unwrap();
-            let error = cx.install_native_state("rejectState", DropProbe {
+            let error = cx.try_install_native_state("rejectState", DropProbe {
                 value: 42,
                 drops: Rc::clone(&drops),
             }).unwrap_err();
+            let NativeStateInstallError::Js(error) = error else {
+                panic!("publication failure must occur after ownership transfer");
+            };
             assert!(matches!(error, JsError::Exception(ref error) if error.message().contains("publication failed")), "{error}");
             assert_eq!(drops.get(), 1);
             assert_eq!(shared.native_states.borrow().live, 0);

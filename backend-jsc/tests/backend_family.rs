@@ -10,7 +10,7 @@ use rustjsi_backend::{
 };
 use rustjsi_backend_jsc::{
     CallLimits, ExternalBufferLimits, InboundCallbackLimits, JscBackendFamily, JscRuntimeLimits,
-    RootLimits, Runtime, RuntimeError, Value,
+    NativeStateInstallError, RootLimits, Runtime, RuntimeError, Value,
 };
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
@@ -122,6 +122,25 @@ fn public_inbound_callback_configuration_rejects_before_string_escapes() {
                     .contains("inbound callback string data limit reached")
             );
             assert!(observed.borrow().is_empty());
+        })
+        .unwrap();
+}
+
+#[test]
+fn public_native_state_recovery_api_installs_and_leases_state() {
+    let mut runtime = Runtime::new().unwrap();
+    runtime
+        .with_context(|cx| {
+            let state = match cx.try_install_native_state("publicState", String::from("state")) {
+                Ok(state) => state,
+                Err(NativeStateInstallError::Rejected { error, .. }) => {
+                    panic!("active runtime unexpectedly rejected state: {error}")
+                }
+                Err(NativeStateInstallError::Js(error)) => {
+                    panic!("state publication unexpectedly failed: {error}")
+                }
+            };
+            assert_eq!(cx.with_native_state(&state, Clone::clone).unwrap(), "state");
         })
         .unwrap();
 }
