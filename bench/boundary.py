@@ -116,7 +116,7 @@ SCALAR_ORDER_METRICS = {
     "direct": "direct_jsc_scalar",
     "common": "rustjsi_common_scalar",
 }
-SCHEMA = 17
+SCHEMA = 18
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
@@ -1056,6 +1056,12 @@ def read_report(directory):
         or not metadata.get("binary_sha256")
     ):
         raise ValueError("source or binary changed during collection")
+    final_host = completion.get("host_environment")
+    if (
+        not valid_host_environment(final_host)
+        or not valid_collection_preconditions(preconditions, final_host)
+    ):
+        raise ValueError("unsupported benchmark completion metadata")
     samples = [
         parse_sample(
             (directory / f"run-{index:03}.stdout").read_text(encoding="utf-8")
@@ -1068,6 +1074,7 @@ def read_report(directory):
     report = summarize(samples)
     report["compiler_selection"] = metadata.get("compiler_selection", "unverified")
     report["host_environment"] = metadata["host_environment"]
+    report["final_host_environment"] = final_host
     return report
 
 
@@ -1188,6 +1195,11 @@ def collect(
             )
             samples.append(parse_sample(timing + allocations))
             print(f"boundary run {index + 1}/{runs}", file=sys.stderr)
+        final_host = host_environment()
+        if require_ac_power:
+            ensure_ac_power(final_host)
+        if require_low_power_mode_off:
+            ensure_low_power_mode_off(final_host)
         final_stamp = source_stamp()
         if final_stamp != stamp:
             raise RuntimeError("source state changed during collection; results are incomplete")
@@ -1200,11 +1212,13 @@ def collect(
         report = summarize(samples)
         report["compiler_selection"] = "explicit"
         report["host_environment"] = metadata["host_environment"]
+        report["final_host_environment"] = final_host
         write_json(directory / "summary.json", report)
         write_json(directory / "complete.json", {
             "source": final_stamp,
             "binary_sha256": final_hashes,
             "completed_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+            "host_environment": final_host,
         })
         return report
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
