@@ -158,7 +158,7 @@ mod tests {
     use rustjsi_backend::{BackendBase, BackendError, BackendFamily, BackendScope, RootScope};
     use rustjsi_host::{
         AttachmentWorkOwner, AttachmentWorkResolution, DrainPoster, FinalEntryOutcome,
-        FinalEntryPolicy, RuntimeIdentity, ScheduledWorkAcquire,
+        FinalEntryPolicy, RuntimeIdentity, ScheduledWorkAcquire, WorkDispatchError,
     };
     use rustjsi_testkit::{DrainPostAcquire, DrainPostQueue};
     use std::cell::Cell;
@@ -372,6 +372,60 @@ mod tests {
         assert_eq!(
             host.detach_with_entry().unwrap().final_entry(),
             FinalEntryOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn attached_host_rejection_retains_current_mailbox_work() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let attachment_id = attachment.attachment_id();
+        let mut source = ForeignOwner::new(attachment_id);
+        source.admit = false;
+        let work_owner =
+            AttachmentWorkOwner::new(attachment_id, std::num::NonZeroUsize::new(1).unwrap());
+        let posts = DrainPostQueue::new(std::num::NonZeroUsize::new(1).unwrap());
+
+        let sender = work_owner.sender();
+        assert!(sender.enqueue_and_post(&posts, 41_u32).is_ok());
+        let DrainPostAcquire::Acquired(post_drain) = posts.acquire() else {
+            panic!("accepted work must retain its attachment-only post");
+        };
+        assert_eq!(post_drain.pop(), Some(attachment_id));
+
+        let AttachmentWorkResolution::Current(mailbox) =
+            work_owner.resolve_drain_task(attachment_id)
+        else {
+            panic!("current attachment task must lend its current mailbox");
+        };
+        let ScheduledWorkAcquire::Acquired(work_drain) = mailbox.acquire() else {
+            panic!("current attachment mailbox must retain its queued work");
+        };
+        let mut host = JscAttachedHost::new(&mut attachment, &mut source);
+        let error = work_drain
+            .dispatch_next(&mut host, |_, _| {
+                panic!("rejected source entry must not invoke queued work")
+            })
+            .expect_err("source rejection must retain current attachment work");
+
+        match error {
+            WorkDispatchError::Entry {
+                work,
+                error: JscHostError::Entry(EntryDenied::Unavailable),
+            } => {
+                assert_eq!(work.attachment_id(), attachment_id);
+                assert_eq!(work.into_payload(), 41);
+            }
+            other => panic!("expected source-entry rejection, got {other:?}"),
+        }
+        let _ = work_drain.finish();
+        let _ = post_drain.finish();
+        assert_eq!(host.source.entries, 0);
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        assert_eq!(
+            host.detach_without_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Unavailable
         );
     }
 
