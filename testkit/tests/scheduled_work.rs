@@ -144,6 +144,33 @@ fn mailbox_drain_returns_stale_work_without_host_entry() {
 }
 
 #[test]
+fn mailbox_drain_returns_work_when_host_entry_is_rejected() {
+    let mut host = ModelHost::new().unwrap();
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
+    let _ = mailbox
+        .enqueue(attachment, vec![1_u8, 2, 3])
+        .expect("active host attachment must enqueue");
+    host.request_drain();
+
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("queued work must acquire a normal drain");
+    };
+    let error = drain
+        .dispatch_next(&mut host, |_, _| panic!("draining host must not invoke work"))
+        .expect_err("draining host must reject queued work");
+    match error {
+        WorkDispatchError::Entry { error, work } => {
+            assert!(error.to_string().contains("not active"));
+            assert_eq!(work.attachment_id(), attachment);
+            assert_eq!(work.into_payload(), vec![1, 2, 3]);
+        }
+        other => panic!("expected host entry rejection, got {other:?}"),
+    }
+    assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+}
+
+#[test]
 fn terminal_mailbox_drain_retains_stale_attachment_for_caller_policy() {
     let mut identity = RuntimeIdentity::allocate().unwrap();
     let stale = identity.next_attachment().unwrap();
