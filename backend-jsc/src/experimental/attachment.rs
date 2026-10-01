@@ -2,8 +2,8 @@
 
 use super::local_roots::LocalRoots;
 use super::{
-    ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, JscRuntimeLimits, RootLimits,
-    RuntimeError, Shared, sys,
+    ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, JscResourceSnapshot,
+    JscRuntimeLimits, RootLimits, RuntimeError, Shared, sys,
 };
 use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
 use std::ffi::c_void;
@@ -309,6 +309,18 @@ impl Attachment {
         self.shared.gate.state()
     }
 
+    /// Returns RustJSI-tracked long-lived resources for this attachment.
+    ///
+    /// This observation remains available after detach so callers can inspect
+    /// teardown effects. It does not establish foreign-engine entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an affinity error when called from a different thread.
+    pub fn resource_snapshot(&self) -> Result<JscResourceSnapshot, RuntimeError> {
+        self.shared.resource_snapshot()
+    }
+
     fn empty_report(&self) -> DetachReport {
         self.report(
             self.shared
@@ -547,6 +559,8 @@ mod tests {
                     assert_eq!(calls.get(), 0);
                 })
                 .unwrap();
+            let snapshot = attachment.resource_snapshot().unwrap();
+            assert_eq!(snapshot.host_function_registrations(), 1);
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
         }
     }
@@ -599,6 +613,8 @@ mod tests {
                     assert_eq!(cx.string(&accepted).unwrap(), "🦀");
                 })
                 .unwrap();
+            let snapshot = attachment.resource_snapshot().unwrap();
+            assert_eq!(snapshot.host_function_registrations(), 1);
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
         }
     }
@@ -691,6 +707,8 @@ mod tests {
                     ));
                 })
                 .unwrap();
+            let snapshot = attachment.resource_snapshot().unwrap();
+            assert_eq!(snapshot.host_function_registrations(), 0);
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
         }
     }
@@ -724,6 +742,11 @@ mod tests {
         assert_eq!(report.unresolved_host_functions(), 0);
         assert_eq!(report.retired_native_states(), 1);
         assert_eq!(first.state(), HostState::Destroyed);
+        let snapshot = first.resource_snapshot().unwrap();
+        assert_eq!(snapshot.persistent_roots(), 0);
+        assert_eq!(snapshot.pending_persistent_releases(), 0);
+        assert_eq!(snapshot.host_function_registrations(), 0);
+        assert_eq!(snapshot.native_state_registrations(), 0);
         drop(handles);
 
         let mut replacement = Attachment::new(&mut identity, FinalEntryPolicy::Guaranteed).unwrap();
