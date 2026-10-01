@@ -44,6 +44,11 @@ pub enum DrainPostAcquire<'queue> {
 
 /// Affine ownership of one active [`DrainPostQueue`] drain.
 ///
+/// If an unfinished drain is dropped with retained attachment posts, the queue
+/// preserves a pending recovery drain. A deterministic driver can inspect
+/// [`DrainPostQueue::is_drain_pending`] after unwind and acquire that recovery
+/// drain; no platform wake-up is created by this fixture.
+///
 /// ```compile_fail
 /// use rustjsi_testkit::DrainPostDrain;
 /// fn require_send<T: Send>() {}
@@ -196,6 +201,29 @@ mod tests {
         assert_eq!(successor.pop(), Some(second));
         assert_eq!(successor.finish(), DrainAfter::Idle);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn dropped_drain_preserves_retained_posts_for_driver_recovery() {
+        let first = ModelHost::new().unwrap().attachment_id();
+        let second = ModelHost::new().unwrap().attachment_id();
+        let queue = DrainPostQueue::new(NonZeroUsize::new(2).unwrap());
+
+        queue.post_drain(first).unwrap();
+        queue.post_drain(second).unwrap();
+
+        let DrainPostAcquire::Acquired(drain) = queue.acquire() else {
+            panic!("accepted posts must acquire an active drain");
+        };
+        assert_eq!(drain.pop(), Some(first));
+        drop(drain);
+
+        assert!(queue.is_drain_pending());
+        let DrainPostAcquire::Acquired(recovery) = queue.acquire() else {
+            panic!("dropped drain must preserve a recoverable successor");
+        };
+        assert_eq!(recovery.pop(), Some(second));
+        assert_eq!(recovery.finish(), DrainAfter::Idle);
     }
 
     #[test]
