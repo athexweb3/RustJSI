@@ -157,7 +157,9 @@ fn mailbox_drain_returns_work_when_host_entry_is_rejected() {
         panic!("queued work must acquire a normal drain");
     };
     let error = drain
-        .dispatch_next(&mut host, |_, _| panic!("draining host must not invoke work"))
+        .dispatch_next(&mut host, |_, _| {
+            panic!("draining host must not invoke work")
+        })
         .expect_err("draining host must reject queued work");
     match error {
         WorkDispatchError::Entry { error, work } => {
