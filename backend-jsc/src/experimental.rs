@@ -4,7 +4,8 @@
 
 use crate::sys;
 use rustjsi_host::{
-    AttachmentId, EntryGate, EntryGuard, FinalEntryPolicy, GateError, HostState, RuntimeIdentity,
+    AttachmentId, EntryGate, EntryGuard, FinalEntryPolicy, GateError, HostState, ResourceLedger,
+    RuntimeIdentity,
 };
 mod argument_roots;
 #[cfg(test)]
@@ -247,6 +248,23 @@ pub struct JscResourceSnapshot {
 }
 
 impl JscResourceSnapshot {
+    /// Returns the shared typed ledger for resources represented by this snapshot.
+    ///
+    /// Pending releases, finalizer signals, and contained panic counters are
+    /// separate diagnostic observations and are not included in this ledger.
+    /// The external-buffer counters are independently sampled atomics, so their
+    /// pair can describe adjacent instants while JSC deallocation is concurrent.
+    #[must_use]
+    pub const fn resources(&self) -> ResourceLedger {
+        ResourceLedger::new(
+            self.persistent_roots,
+            self.host_function_registrations,
+            self.native_state_registrations,
+            self.external_buffer_allocations,
+            self.external_buffer_bytes,
+        )
+    }
+
     /// Returns live persistent JSC protections, including pending releases.
     #[must_use]
     pub const fn persistent_roots(&self) -> usize {

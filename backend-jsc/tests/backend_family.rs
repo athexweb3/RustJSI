@@ -13,7 +13,7 @@ use rustjsi_backend_jsc::{
     JscRuntimeLimits, NativeStateInstallError, NativeStateLimits, RootLimits, Runtime,
     RuntimeError, Value,
 };
-use rustjsi_host::{Host, HostState};
+use rustjsi_host::{Host, HostState, ResourceLedger};
 use rustjsi_testkit::{
     ModelBackend, ModelBackendFamily, create_number_root, verify_base_values,
     verify_number_root_and_release,
@@ -209,6 +209,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(initial.external_buffer_bytes(), 0);
     assert_eq!(initial.callback_drop_panics(), 0);
     assert_eq!(initial.native_state_drop_panics(), 0);
+    assert_eq!(initial.resources(), ResourceLedger::default());
 
     let root = runtime
         .with_context(|cx| {
@@ -234,12 +235,14 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(retained.pending_native_finalizers(), 0);
     assert_eq!(retained.external_buffer_allocations(), 1);
     assert_eq!(retained.external_buffer_bytes(), 3);
+    assert_eq!(retained.resources(), ResourceLedger::new(1, 1, 1, 1, 3));
 
     drop(root);
     let pending = runtime.resource_snapshot().unwrap();
     assert_eq!(pending.persistent_roots(), 1);
     assert_eq!(pending.pending_persistent_releases(), 1);
     assert_eq!(pending.pending_native_finalizers(), 0);
+    assert_eq!(pending.resources(), ResourceLedger::new(1, 1, 1, 1, 3));
 
     runtime.with_context(|_| {}).unwrap();
     let released = runtime.resource_snapshot().unwrap();
@@ -250,6 +253,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(released.pending_native_finalizers(), 0);
     assert_eq!(released.external_buffer_allocations(), 1);
     assert_eq!(released.external_buffer_bytes(), 3);
+    assert_eq!(released.resources(), ResourceLedger::new(0, 1, 1, 1, 3));
 }
 
 #[test]
