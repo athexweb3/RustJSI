@@ -32,6 +32,6 @@ pub use model::{
 pub use model_entry::{ModelBackendFamily, ModelEntry, ModelEntryScope};
 pub use model_host::ModelHost;
 pub use work_queue::{
-    AbandonError, CloseError, CloseOutcome, DrainError, DrainLease, PublishError, ReserveError,
-    SubmitReservation, WorkQueueModel, WorkQueueState,
+    AbandonError, DrainError, DrainLease, PublishError, ReserveError, SubmitReservation,
+    TerminalDrainError, TerminalDrainLease, WorkQueueModel, WorkQueueState,
 };
