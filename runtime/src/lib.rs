@@ -5,10 +5,14 @@
 #![forbid(unsafe_code)]
 
 mod drain;
+mod ingress;
 mod mailbox;
 
 pub use drain::{
     DrainAcquire, DrainAfter, DrainClose, DrainPermit, DrainRequest, DrainSignal, DrainState,
+};
+pub use ingress::{
+    IngressClose, IngressGate, IngressPermit, IngressReserveError, IngressSealError, IngressState,
 };
 pub use mailbox::{
     BoundedMailbox, MailboxAcquire, MailboxDrain, MailboxEnqueue, MailboxEnqueueError,
