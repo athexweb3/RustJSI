@@ -184,12 +184,32 @@ impl Default for NativeStateLimits {
     }
 }
 
+/// Registration-admission limits for JSC host functions.
+///
+/// This bounds retained callback registrations, not closure-capture size, JSC
+/// heap use, JavaScript function wrappers, callback execution time, or total
+/// process memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostFunctionLimits {
+    /// Maximum retained host-function registrations.
+    pub registrations: usize,
+}
+
+impl Default for HostFunctionLimits {
+    fn default() -> Self {
+        Self {
+            registrations: 4096,
+        }
+    }
+}
+
 /// Aggregate creation-time limits for an experimental JSC runtime or attachment.
 ///
 /// Each field governs a distinct resource direction or lifetime. In particular,
 /// [`Self::outbound_call`] does not govern values read by a Rust host callback;
 /// [`Self::inbound_callback`] governs that separate JavaScript-to-Rust path,
-/// while [`Self::native_states`] only governs registry identity admission.
+/// while [`Self::native_states`] and [`Self::host_functions`] govern separate
+/// registration identities.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JscRuntimeLimits {
     /// Persistent and scoped JSC root admission limits.
@@ -202,6 +222,8 @@ pub struct JscRuntimeLimits {
     pub inbound_callback: InboundCallbackLimits,
     /// Live native-state registration identity limits.
     pub native_states: NativeStateLimits,
+    /// Retained host-function registration limits.
+    pub host_functions: HostFunctionLimits,
 }
 
 impl Default for ExternalBufferLimits {
@@ -225,7 +247,6 @@ thread_local! {
 }
 
 const INLINE_ARGUMENTS: usize = 8;
-const MAX_HOST_FUNCTIONS: usize = 4096;
 const ENTRY_LIMIT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 
 /// A standalone `JavaScriptCore` runtime owned by the current thread.
@@ -417,6 +438,7 @@ struct Shared {
     local_budget: LocalBudget,
     call_limits: CallLimits,
     inbound_callback_limits: InboundCallbackLimits,
+    host_function_limit: usize,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
@@ -855,7 +877,7 @@ impl<'cx> Context<'cx> {
         F: for<'call> Fn(Call<'call>) -> Result<Value, HostError> + 'static,
     {
         self.shared.ensure_active().map_err(JsError::Runtime)?;
-        if self.shared.host_functions.borrow().len() >= MAX_HOST_FUNCTIONS {
+        if self.shared.host_functions.borrow().len() >= self.shared.host_function_limit {
             return Err(JsError::Runtime(RuntimeError::HostFunctionLimitReached));
         }
         let name = JsString::new(name)?;
@@ -1387,6 +1409,7 @@ impl Shared {
             local_budget: LocalBudget::new(limits.roots.local_roots),
             call_limits: limits.outbound_call,
             inbound_callback_limits: limits.inbound_callback,
+            host_function_limit: limits.host_functions.registrations,
             host_functions: RefCell::new(HashMap::new()),
             native_states: RefCell::new(native_state::NativeRegistry::new(
                 limits.native_states.registrations,
