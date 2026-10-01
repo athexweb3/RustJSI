@@ -52,6 +52,11 @@ harness = false
 required-features = ["experimental-jsc"]
 
 [[bench]]
+name = "external_buffer_profile_allocations"
+harness = false
+required-features = ["experimental-jsc"]
+
+[[bench]]
 name = "js_calls"
 harness = false
 required-features = ["experimental-jsc"]

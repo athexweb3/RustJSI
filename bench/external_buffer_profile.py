@@ -16,6 +16,7 @@ import boundary
 
 
 BENCHMARK = "external_buffer_profile"
+ALLOCATION_BENCHMARK = "external_buffer_profile_allocations"
 SIZES = (0, 1, 4 * 1024, 64 * 1024)
 ORDERS = ("direct,rustjsi", "rustjsi,direct")
 DEFAULT_RUNS = 12
@@ -29,6 +30,18 @@ RATIO_LINE = re.compile(
     r"rustjsi_external_buffer_over_direct: (?P<ratio>[0-9]+\.[0-9]+)x "
     rf"\((?P<blocks>{MEASURED_BLOCKS}) blocks\)"
 )
+ALLOCATION_LINE = re.compile(
+    r"external_buffer_profile_allocations: payload_bytes=(?P<bytes>[0-9]+) "
+    rf"block_size={BLOCK_SIZE} cleanup=property-clear,runtime-teardown "
+    r"direct_allocations=(?P<direct_allocations>[0-9]+) "
+    r"direct_allocated_bytes=(?P<direct_allocated_bytes>[0-9]+) "
+    r"direct_deallocations=(?P<direct_deallocations>[0-9]+) "
+    r"direct_deallocated_bytes=(?P<direct_deallocated_bytes>[0-9]+) "
+    r"rustjsi_allocations=(?P<rustjsi_allocations>[0-9]+) "
+    r"rustjsi_allocated_bytes=(?P<rustjsi_allocated_bytes>[0-9]+) "
+    r"rustjsi_deallocations=(?P<rustjsi_deallocations>[0-9]+) "
+    r"rustjsi_deallocated_bytes=(?P<rustjsi_deallocated_bytes>[0-9]+)"
+)
 
 
 def even_run_count(value):
@@ -38,13 +51,13 @@ def even_run_count(value):
     return parsed
 
 
-def executable_from_cargo(output):
+def executable_from_cargo(output, target=BENCHMARK):
     executable = None
     for line in output.splitlines():
         message = json.loads(line)
         if (
             message.get("reason") == "compiler-artifact"
-            and message.get("target", {}).get("name") == BENCHMARK
+            and message.get("target", {}).get("name") == target
             and "bench" in message.get("target", {}).get("kind", [])
             and message.get("executable")
         ):
@@ -119,6 +132,19 @@ def parse_profile(output, expected_bytes, expected_order):
     return record
 
 
+def parse_allocation_probe(output, expected_bytes):
+    lines = [line for line in output.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise ValueError("external-buffer allocation probe must emit exactly one line")
+    match = ALLOCATION_LINE.fullmatch(lines[0])
+    if not match:
+        raise ValueError("invalid external-buffer allocation probe output")
+    values = match.groupdict()
+    if int(values.pop("bytes")) != expected_bytes:
+        raise ValueError("allocation probe reported the wrong payload size")
+    return {key: int(value) for key, value in values.items()}
+
+
 def require_ignored_output(directory):
     if not directory.is_relative_to(boundary.ROOT):
         return
@@ -160,8 +186,38 @@ def collect(directory, toolchain, runs):
         raise RuntimeError(f"build exited with {built.returncode}; see saved stderr")
     executable = executable_from_cargo(built.stdout)
     binary_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+    allocation_build = [*build]
+    allocation_build[allocation_build.index("--bench") + 1] = ALLOCATION_BENCHMARK
+    allocation_built = subprocess.run(
+        allocation_build, cwd=boundary.ROOT, capture_output=True, text=True, check=False,
+        timeout=300, env=environment,
+    )
+    save_process(allocation_built, directory, "allocation-build")
+    if allocation_built.returncode:
+        raise RuntimeError(
+            f"allocation build exited with {allocation_built.returncode}; see saved stderr"
+        )
+    allocation_executable = executable_from_cargo(
+        allocation_built.stdout, ALLOCATION_BENCHMARK
+    )
+    allocation_binary_hash = hashlib.sha256(allocation_executable.read_bytes()).hexdigest()
     records = []
+    allocation_records = []
     for payload_bytes in SIZES:
+        allocation_environment = os.environ.copy()
+        allocation_environment["RUSTJSI_EXTERNAL_BUFFER_PROFILE_BYTES"] = str(payload_bytes)
+        allocation_completed = subprocess.run(
+            [str(allocation_executable)], cwd=boundary.ROOT, capture_output=True, text=True,
+            check=False, timeout=300, env=allocation_environment,
+        )
+        allocation_name = f"allocation-payload-{payload_bytes}"
+        save_process(allocation_completed, directory, allocation_name)
+        if allocation_completed.returncode:
+            raise RuntimeError(f"allocation payload {payload_bytes} exited with {allocation_completed.returncode}")
+        allocation_records.append({
+            "payload_bytes": payload_bytes,
+            **parse_allocation_probe(allocation_completed.stdout, payload_bytes),
+        })
         for run in range(runs):
             order = ORDERS[run % len(ORDERS)]
             run_environment = os.environ.copy()
@@ -185,12 +241,14 @@ def collect(directory, toolchain, runs):
         raise RuntimeError("source state changed during collection")
     if hashlib.sha256(executable.read_bytes()).hexdigest() != binary_hash:
         raise RuntimeError("external-buffer profile executable changed during collection")
+    if hashlib.sha256(allocation_executable.read_bytes()).hexdigest() != allocation_binary_hash:
+        raise RuntimeError("external-buffer allocation executable changed during collection")
     metadata = {
         "schema": 1,
         "benchmark": BENCHMARK,
         "started_utc": started_utc,
         "source": stamp,
-        "build_command": build,
+        "build_commands": {"timing": build, "allocation": allocation_build},
         "compiler_selection": "explicit",
         "compiler_paths": {key: environment[key] for key in ("RUSTC", "RUSTDOC")},
         "compiler_wrappers": "disabled",
@@ -198,7 +256,7 @@ def collect(directory, toolchain, runs):
         "os": boundary.command(["sw_vers"]),
         "architecture": platform.machine(),
         "sdk": boundary.command(["xcrun", "--sdk", "macosx", "--show-sdk-version"]),
-        "binary_sha256": binary_hash,
+        "binary_sha256": {"timing": binary_hash, "allocation": allocation_binary_hash},
         "payload_sizes": list(SIZES),
         "runs_per_payload": runs,
         "ordering": {"design": "alternating-pair", "sequence": [
@@ -212,9 +270,10 @@ def collect(directory, toolchain, runs):
     }
     boundary.write_json(directory / "metadata.json", metadata)
     boundary.write_json(directory / "records.json", records)
+    boundary.write_json(directory / "allocation-records.json", allocation_records)
     boundary.write_json(directory / "complete.json", {
         "source": stamp,
-        "binary_sha256": binary_hash,
+        "binary_sha256": {"timing": binary_hash, "allocation": allocation_binary_hash},
         "completed_utc": datetime.datetime.now(datetime.UTC).isoformat(),
     })
     return records

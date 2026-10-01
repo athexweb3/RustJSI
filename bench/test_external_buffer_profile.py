@@ -27,6 +27,17 @@ def valid_output(order="direct,rustjsi", payload_bytes=4096):
     ))
 
 
+def valid_allocation_output(payload_bytes=4096):
+    return (
+        f"external_buffer_profile_allocations: payload_bytes={payload_bytes} "
+        "block_size=8 cleanup=property-clear,runtime-teardown "
+        "direct_allocations=32 direct_allocated_bytes=1648 "
+        "direct_deallocations=24 direct_deallocated_bytes=1456 "
+        "rustjsi_allocations=40 rustjsi_allocated_bytes=2032 "
+        "rustjsi_deallocations=24 rustjsi_deallocated_bytes=1456"
+    )
+
+
 class ExternalBufferProfileTests(unittest.TestCase):
     def test_even_run_count_bounds(self):
         self.assertEqual(profile.even_run_count("12"), 12)
@@ -60,6 +71,20 @@ class ExternalBufferProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "samples"):
             profile.parse_profile(incomplete, 4096, "direct,rustjsi")
 
+    def test_parse_allocation_probe(self):
+        self.assertEqual(profile.parse_allocation_probe(valid_allocation_output(), 4096), {
+            "direct_allocations": 32,
+            "direct_allocated_bytes": 1648,
+            "direct_deallocations": 24,
+            "direct_deallocated_bytes": 1456,
+            "rustjsi_allocations": 40,
+            "rustjsi_allocated_bytes": 2032,
+            "rustjsi_deallocations": 24,
+            "rustjsi_deallocated_bytes": 1456,
+        })
+        with self.assertRaisesRegex(ValueError, "wrong payload size"):
+            profile.parse_allocation_probe(valid_allocation_output(1), 4096)
+
     def test_cargo_executable_selection(self):
         artifact = json.dumps({
             "reason": "compiler-artifact",
@@ -92,8 +117,25 @@ class ExternalBufferProfileTests(unittest.TestCase):
 
             def run(arguments, **kwargs):
                 if arguments[0] == "rustup":
+                    target = arguments[arguments.index("--bench") + 1]
+                    executable = root / target
+                    executable.write_bytes(b"profile executable")
+                    artifact = json.dumps({
+                        "reason": "compiler-artifact",
+                        "target": {"name": target, "kind": ["bench"]},
+                        "executable": str(executable),
+                    })
                     return subprocess.CompletedProcess(arguments, 0, artifact, "")
                 environment = kwargs["env"]
+                if arguments[0].endswith(profile.ALLOCATION_BENCHMARK):
+                    return subprocess.CompletedProcess(
+                        arguments,
+                        0,
+                        valid_allocation_output(
+                            int(environment["RUSTJSI_EXTERNAL_BUFFER_PROFILE_BYTES"])
+                        ),
+                        "",
+                    )
                 return subprocess.CompletedProcess(
                     arguments,
                     0,
@@ -119,6 +161,7 @@ class ExternalBufferProfileTests(unittest.TestCase):
             metadata = json.loads((output / "metadata.json").read_text())
             self.assertEqual(len(records), len(profile.SIZES) * 2)
             self.assertEqual(metadata["ordering"]["sequence"], list(profile.ORDERS))
+            self.assertTrue((output / "allocation-records.json").is_file())
             self.assertTrue((output / "complete.json").is_file())
 
     def test_collect_rejects_non_macos_before_writing(self):
