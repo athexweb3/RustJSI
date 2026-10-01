@@ -44,6 +44,11 @@ work reject another runtime or an earlier attachment. This allocator is shared
 within one linked `rustjsi-host` domain; an eventual binary Host ABI must define
 its own single identity authority.
 
+`ScheduledWork<T>` is an identity-bound envelope for future host-owned queues.
+It captures an `AttachmentId`, validates it immediately before host entry, and
+returns the original record on stale-attachment or entry rejection. It does not
+create a queue, scheduler, close protocol, retry policy, or engine task.
+
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
 or perform cleanup itself. The source-linked `Host` contract is not the stable C

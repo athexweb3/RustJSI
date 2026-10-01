@@ -7,9 +7,11 @@
 mod contract;
 mod entry;
 mod identity;
+mod work;
 
 pub use contract::Host;
 pub use entry::{
     CleanupGuard, EntryGate, EntryGuard, FinalEntryOutcome, FinalEntryPolicy, GateError, HostState,
 };
 pub use identity::{AttachmentEpoch, AttachmentId, IdentityError, RuntimeId, RuntimeIdentity};
+pub use work::{ScheduledWork, WorkDispatchError};

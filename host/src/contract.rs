@@ -52,7 +52,8 @@ pub trait Host {
     /// # Errors
     ///
     /// Returns before running `operation` when legal engine entry cannot be
-    /// established.
+    /// established. If an implementation invokes `operation`, it must return
+    /// its result in [`Ok`]; an [`Err`] means `operation` did not run.
     fn with_backend<R>(
         &mut self,
         operation: impl for<'entry> FnOnce(&mut <Self::Family as BackendFamily>::Backend<'entry>) -> R,
