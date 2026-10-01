@@ -187,16 +187,16 @@ impl<T> ClosableMailbox<T> {
                 IngressReserveError::NotOpen(_) | IngressReserveError::ReservationSpaceExhausted,
             ) => return Err(ClosableMailboxEnqueueError::Closed(value)),
         };
-        let result = self
-            .queue
+        self.queue
             .push(value)
-            .map_err(ClosableMailboxEnqueueError::Full);
-        drop(admission);
-        result.map(|()| match self.signal.request() {
+            .map_err(ClosableMailboxEnqueueError::Full)?;
+        let outcome = match self.signal.request() {
             DrainRequest::Scheduled => crate::MailboxEnqueue::Scheduled,
             DrainRequest::Coalesced => crate::MailboxEnqueue::Coalesced,
-            DrainRequest::Closed => unreachable!("normal drain admission prevents this race"),
-        })
+            DrainRequest::Closed => unreachable!("producer admission prevents this race"),
+        };
+        drop(admission);
+        Ok(outcome)
     }
 
     /// Stops admitting new producers without waiting for earlier ones.
@@ -518,5 +518,50 @@ mod tests {
         let retry = mailbox.try_begin_terminal_drain().unwrap();
         assert_eq!(retry.pop(), Some(7));
         retry.finish().unwrap();
+    }
+
+    #[test]
+    fn producer_publication_keeps_normal_signal_open_during_terminal_close() {
+        for _ in 0..128 {
+            let mailbox = Arc::new(ClosableMailbox::new(capacity(1)));
+            let start = Arc::new(Barrier::new(2));
+
+            let producer_mailbox = Arc::clone(&mailbox);
+            let producer_start = Arc::clone(&start);
+            let producer = thread::spawn(move || {
+                producer_start.wait();
+                producer_mailbox.enqueue(7)
+            });
+
+            start.wait();
+            let _ = mailbox.begin_close();
+            let terminal = loop {
+                match mailbox.try_begin_terminal_drain() {
+                    Ok(drain) => break drain,
+                    Err(TerminalAcquireError::ProducerReservationsRemain(_)) => {
+                        thread::yield_now();
+                    }
+                    Err(error) => {
+                        panic!("producer-close race must remain terminally drainable: {error:?}")
+                    }
+                }
+            };
+
+            match producer.join().expect("producer must not panic") {
+                Ok(MailboxEnqueue::Scheduled) => assert_eq!(terminal.pop(), Some(7)),
+                Ok(MailboxEnqueue::Coalesced) => {
+                    panic!("empty mailbox cannot coalesce its first publication")
+                }
+                Err(ClosableMailboxEnqueueError::Closed(7)) => assert_eq!(terminal.pop(), None),
+                Err(ClosableMailboxEnqueueError::Full(value)) => {
+                    panic!("empty mailbox cannot be full: {value}")
+                }
+                Err(ClosableMailboxEnqueueError::Closed(value)) => {
+                    panic!("producer payload must be preserved: {value}")
+                }
+            }
+            assert_eq!(terminal.pop(), None);
+            terminal.finish().unwrap();
+        }
     }
 }
