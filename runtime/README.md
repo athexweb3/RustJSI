@@ -19,4 +19,5 @@ payloads through an affine terminal drain. It does not schedule retries, enter
 a runtime, validate a host attachment, or execute engine/resource cleanup.
 Its normal drain can settle signal state while keeping normal admission until a
 small caller action completes, which permits a host to post a successor before
-terminal close can take ownership.
+terminal close can take ownership. Its initial enqueue-and-post path likewise
+keeps producer admission through post acceptance.
