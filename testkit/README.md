@@ -42,6 +42,11 @@ closing, retired, unregistered, and foreign tasks before any host entry. It
 does not provide a scheduler, backend attachment, wake-up mechanism, or
 platform integration.
 
+The replacement conformance path closes and terminally drains an old mailbox
+before changing registrations. A later old post resolves as retired, while a
+new post routes only to the replacement mailbox. The fixture does not infer a
+platform task loop or choose a policy for terminal payloads.
+
 `tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
 steps over three runtimes against an independent reference model. Sequences
 replace engines with new epochs, abandon issued epochs before activation, keep
