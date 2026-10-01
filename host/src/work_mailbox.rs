@@ -15,6 +15,7 @@ use crate::{AttachmentId, Host, ScheduledWork, WorkDispatchError};
 /// Attachment-bound host work retained in a close-aware bounded mailbox.
 #[derive(Debug)]
 pub struct ScheduledWorkMailbox<T> {
+    attachment: AttachmentId,
     mailbox: ClosableMailbox<ScheduledWork<T>>,
 }
 
@@ -72,27 +73,30 @@ pub struct TerminalScheduledWorkDrain<'mailbox, T> {
 }
 
 impl<T> ScheduledWorkMailbox<T> {
-    /// Creates a fixed-capacity attachment-bound work mailbox.
+    /// Creates a fixed-capacity mailbox for exactly one attachment epoch.
     #[must_use]
-    pub fn new(capacity: NonZeroUsize) -> Self {
+    pub fn new(attachment: AttachmentId, capacity: NonZeroUsize) -> Self {
         Self {
+            attachment,
             mailbox: ClosableMailbox::new(capacity),
         }
     }
 
-    /// Enqueues payload captured for one attachment epoch.
+    /// Returns the immutable attachment this mailbox targets.
+    #[must_use]
+    pub const fn attachment_id(&self) -> AttachmentId {
+        self.attachment
+    }
+
+    /// Enqueues payload captured for this mailbox's attachment epoch.
     ///
     /// # Errors
     ///
     /// Returns the complete attachment-bound work record when the mailbox is
     /// full or producer close has started.
-    pub fn enqueue(
-        &self,
-        attachment: AttachmentId,
-        payload: T,
-    ) -> Result<MailboxEnqueue, ScheduledWorkEnqueueError<T>> {
+    pub fn enqueue(&self, payload: T) -> Result<MailboxEnqueue, ScheduledWorkEnqueueError<T>> {
         self.mailbox
-            .enqueue(ScheduledWork::new(attachment, payload))
+            .enqueue(ScheduledWork::new(self.attachment, payload))
             .map_err(|error| match error {
                 ClosableMailboxEnqueueError::Full(work) => ScheduledWorkEnqueueError::Full(work),
                 ClosableMailboxEnqueueError::Closed(work) => {
@@ -111,19 +115,21 @@ impl<T> ScheduledWorkMailbox<T> {
     pub fn enqueue_and_post<P>(
         &self,
         poster: &P,
-        attachment: AttachmentId,
         payload: T,
     ) -> Result<MailboxEnqueue, ScheduledWorkPostError<T, P::Error>>
     where
         P: DrainPoster,
     {
         let outcome = self
-            .enqueue(attachment, payload)
+            .enqueue(payload)
             .map_err(ScheduledWorkPostError::Enqueue)?;
         if outcome == MailboxEnqueue::Scheduled {
             poster
-                .post_drain(attachment)
-                .map_err(|error| ScheduledWorkPostError::Post { attachment, error })?;
+                .post_drain(self.attachment)
+                .map_err(|error| ScheduledWorkPostError::Post {
+                    attachment: self.attachment,
+                    error,
+                })?;
         }
         Ok(outcome)
     }
@@ -133,12 +139,12 @@ impl<T> ScheduledWorkMailbox<T> {
     /// # Errors
     ///
     /// Returns the host poster's error while preserving the pending mailbox.
-    pub fn post_pending<P>(&self, poster: &P, attachment: AttachmentId) -> Result<bool, P::Error>
+    pub fn post_pending<P>(&self, poster: &P) -> Result<bool, P::Error>
     where
         P: DrainPoster,
     {
         if self.mailbox.is_drain_pending() {
-            poster.post_drain(attachment)?;
+            poster.post_drain(self.attachment)?;
             Ok(true)
         } else {
             Ok(false)
