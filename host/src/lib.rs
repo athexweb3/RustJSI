@@ -8,6 +8,7 @@ mod contract;
 mod entry;
 mod identity;
 mod work;
+mod work_mailbox;
 
 pub use contract::Host;
 pub use entry::{
@@ -15,3 +16,7 @@ pub use entry::{
 };
 pub use identity::{AttachmentEpoch, AttachmentId, IdentityError, RuntimeId, RuntimeIdentity};
 pub use work::{ScheduledWork, WorkDispatchError};
+pub use work_mailbox::{
+    ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkMailbox,
+    TerminalScheduledWorkDrain,
+};

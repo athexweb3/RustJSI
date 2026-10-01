@@ -12,6 +12,7 @@ publish.workspace = true
 
 [dependencies]
 rustjsi-backend = { path = "../backend", version = "=0.0.0" }
+rustjsi-runtime = { path = "../runtime", version = "=0.0.0" }
 
 [lints]
 workspace = true
