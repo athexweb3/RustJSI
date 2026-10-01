@@ -8,6 +8,7 @@ use rustjsi_runtime::{
     TerminalMailboxDrain,
 };
 
+use crate::DrainPoster;
 use crate::{AttachmentId, ScheduledWork};
 
 /// Attachment-bound host work retained in a close-aware bounded mailbox.
@@ -24,6 +25,21 @@ pub enum ScheduledWorkEnqueueError<T> {
     Full(ScheduledWork<T>),
     /// Close has stopped producer admission.
     Closed(ScheduledWork<T>),
+}
+
+/// Failure to enqueue and post attachment-bound work.
+#[derive(Debug)]
+#[must_use]
+pub enum ScheduledWorkPostError<T, E> {
+    /// Queue admission rejected and returned the original work record.
+    Enqueue(ScheduledWorkEnqueueError<T>),
+    /// Posting failed after work was retained in the pending mailbox.
+    Post {
+        /// Attachment requested for the future drain.
+        attachment: AttachmentId,
+        /// Host-specific posting failure.
+        error: E,
+    },
 }
 
 /// Result of acquiring normal scheduled work.
@@ -82,6 +98,50 @@ impl<T> ScheduledWorkMailbox<T> {
                     ScheduledWorkEnqueueError::Closed(work)
                 }
             })
+    }
+
+    /// Enqueues work and posts only when the mailbox creates a new drain obligation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduledWorkPostError::Enqueue`] with the original work on
+    /// admission failure. A post failure retains the work in this mailbox; the
+    /// caller must use [`Self::post_pending`] or another explicit retry policy.
+    pub fn enqueue_and_post<P>(
+        &self,
+        poster: &P,
+        attachment: AttachmentId,
+        payload: T,
+    ) -> Result<MailboxEnqueue, ScheduledWorkPostError<T, P::Error>>
+    where
+        P: DrainPoster,
+    {
+        let outcome = self
+            .enqueue(attachment, payload)
+            .map_err(ScheduledWorkPostError::Enqueue)?;
+        if outcome == MailboxEnqueue::Scheduled {
+            poster
+                .post_drain(attachment)
+                .map_err(|error| ScheduledWorkPostError::Post { attachment, error })?;
+        }
+        Ok(outcome)
+    }
+
+    /// Posts a retry only while the mailbox still has a pending normal drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host poster's error while preserving the pending mailbox.
+    pub fn post_pending<P>(&self, poster: &P, attachment: AttachmentId) -> Result<bool, P::Error>
+    where
+        P: DrainPoster,
+    {
+        if self.mailbox.is_drain_pending() {
+            poster.post_drain(attachment)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Stops later producer admission without waiting for earlier publishers.

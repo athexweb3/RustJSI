@@ -7,6 +7,7 @@
 mod contract;
 mod entry;
 mod identity;
+mod post;
 mod work;
 mod work_mailbox;
 
@@ -15,8 +16,9 @@ pub use entry::{
     CleanupGuard, EntryGate, EntryGuard, FinalEntryOutcome, FinalEntryPolicy, GateError, HostState,
 };
 pub use identity::{AttachmentEpoch, AttachmentId, IdentityError, RuntimeId, RuntimeIdentity};
+pub use post::DrainPoster;
 pub use work::{ScheduledWork, WorkDispatchError};
 pub use work_mailbox::{
     ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkMailbox,
-    TerminalScheduledWorkDrain,
+    ScheduledWorkPostError, TerminalScheduledWorkDrain,
 };

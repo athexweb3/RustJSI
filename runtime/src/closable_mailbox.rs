@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use crossbeam_queue::ArrayQueue;
 
 use crate::{
-    DrainAcquire, DrainAfter, DrainPermit, DrainRequest, DrainSignal, IngressClose, IngressGate,
-    IngressPermit, IngressReserveError, IngressSealError, IngressState,
+    DrainAcquire, DrainAfter, DrainPermit, DrainRequest, DrainSignal, DrainState, IngressClose,
+    IngressGate, IngressPermit, IngressReserveError, IngressSealError, IngressState,
 };
 
 const NORMAL: u8 = 0;
@@ -145,6 +145,15 @@ impl<T> ClosableMailbox<T> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// Returns whether one normal drain remains pending for host posting.
+    ///
+    /// This is a concurrent snapshot. A host uses it after a reported post
+    /// failure to decide whether a retry remains useful.
+    #[must_use]
+    pub fn is_drain_pending(&self) -> bool {
+        self.signal.state() == DrainState::Pending
     }
 
     /// Returns the current mailbox lifecycle snapshot.
