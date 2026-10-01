@@ -72,6 +72,12 @@ The two scoped JavaScript call workloads alternate order across that mirrored
 twelve-process block. Each callback permutation is paired once with each call
 order. This balances first and second position for the call pair, but does not
 remove thermal, scheduler, cache or frequency effects.
+The three entry workloads follow their own mirrored complete six-permutation
+schedule, and the direct/common scalar pair alternates across the same
+twelve-process block. `entry_position_effects` and `scalar_position_effects`
+report the mean by observed position for those workloads. The allocator probe
+receives the selected entry order too and writes it separately; the collector
+rejects a process when its allocation and timing entry orders disagree.
 Callback, scoped-call and scalar results are checked against `42` before and
 after each timed workload. These checks do not validate every timed iteration.
 The direct functions have explicit roots outside the timer; RAII releases each
@@ -83,7 +89,8 @@ records the four-decimal mean of every 1,000-operation batch. A separate
 executable with a counting global allocator snapshots successful Rust
 allocation, reallocation and deallocation activity around the equivalent
 1,000,000 operations. It runs the callback and scoped-call workloads in the
-same selected order as the timing executable.
+same selected order as the timing executable, and runs the entry workloads in
+the matching selected entry order.
 Keeping the probe separate prevents its atomics from changing the timed
 workloads. The counter covers Rust allocations made by the probe and linked
 Rust code in that region. It does not observe JavaScriptCore, Objective-C,
@@ -120,8 +127,9 @@ quantiles. They are not confidence intervals for the pooled block quantile and
 are not individual-call or individual-entry tail intervals.
 
 `js_call_batch_latency` applies the same block-mean model to the direct and
-common scoped-call pair. `js_call_position_effects` reports each workload in
-first and second position. Neither section is an individual-call tail model.
+common scoped-call pair. `js_call_position_effects`,
+`entry_position_effects`, and `scalar_position_effects` report each workload
+by observed position. Neither section is an individual-call tail model.
 
 `measurement_calibration` reports the timer-pair and empty-batch distributions,
 plus the timer-pair cost amortized over one 1,000-operation measured block.
@@ -148,11 +156,11 @@ distribution exists here, so `individual_call_p99` remains absent. JavaScriptCor
 allocation, payload-copy, and regression-gate work also remains open.
 
 Separate processes do not isolate CPU frequency, thermal state, OS scheduling,
-shared caches or background work. Callback workload order is counterbalanced;
-entry and scalar workloads still run in a fixed order after the callback group.
-Their order bias is unmeasured. Use an otherwise idle machine and record
-power/thermal conditions separately. Do not run collection alongside builds or
-test suites.
+shared caches or background work. Callback, scoped-call, entry and scalar
+workload order is counterbalanced, but that does not remove nonlinear thermal,
+scheduler, cache or between-process effects. Use an otherwise idle machine and
+record power/thermal conditions separately. Do not run collection alongside
+builds or test suites.
 
 Metadata records selected compiler/profile/JSC environment overrides, not the
 entire environment. It also records the available macOS hardware model, memory
