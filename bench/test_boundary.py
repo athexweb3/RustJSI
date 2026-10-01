@@ -876,7 +876,7 @@ class ArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 10,
+                "schema": boundary.SCHEMA - 1,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},
