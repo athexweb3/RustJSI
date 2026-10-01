@@ -241,7 +241,9 @@ impl<T> ScheduledWorkDrain<'_, T> {
     ///
     /// A successor post is attempted only after [`DrainAfter::Pending`]. Its
     /// attachment is the immutable identity captured when the mailbox was
-    /// created. `Idle` and `Closed` finish outcomes do not call the poster.
+    /// created. The post runs before normal drain admission releases, so
+    /// terminal close cannot race between the pending transition and post.
+    /// `Idle` and `Closed` finish outcomes do not call the poster.
     ///
     /// # Errors
     ///
@@ -254,16 +256,15 @@ impl<T> ScheduledWorkDrain<'_, T> {
     where
         P: DrainPoster,
     {
-        let after = self.drain.finish();
-        if after == DrainAfter::Pending {
-            poster
-                .post_drain(self.attachment)
-                .map_err(|error| ScheduledWorkFinishError::Post {
-                    attachment: self.attachment,
-                    error,
-                })?;
-        }
-        Ok(after)
+        let attachment = self.attachment;
+        self.drain.finish_with(|after| {
+            if after == DrainAfter::Pending {
+                poster
+                    .post_drain(attachment)
+                    .map_err(|error| ScheduledWorkFinishError::Post { attachment, error })?;
+            }
+            Ok(after)
+        })
     }
 }
 

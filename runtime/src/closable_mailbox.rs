@@ -295,12 +295,22 @@ impl<T> ClosableMailboxDrain<'_, T> {
         self.queue.pop()
     }
 
-    /// Finishes normal draining and releases its admission.
-    pub fn finish(mut self) -> DrainAfter {
+    /// Finishes normal draining and invokes `operation` before releasing admission.
+    ///
+    /// The drain signal has settled before `operation` runs, but terminal
+    /// ownership remains blocked until it returns. This lets a host post a
+    /// required successor without a close transition winning between finishing
+    /// the normal drain and accepting that post.
+    pub fn finish_with<R>(mut self, operation: impl FnOnce(DrainAfter) -> R) -> R {
         self.preserve_retained_payloads();
         let after = self.permit.finish_in_place();
         self.finished = true;
-        after
+        operation(after)
+    }
+
+    /// Finishes normal draining and releases its admission.
+    pub fn finish(self) -> DrainAfter {
+        self.finish_with(|after| after)
     }
 
     fn preserve_retained_payloads(&self) {
@@ -449,6 +459,30 @@ mod tests {
         assert_eq!(terminal.pop(), None);
         terminal.finish().unwrap();
         assert_eq!(mailbox.state(), ClosableMailboxState::Closed);
+    }
+
+    #[test]
+    fn finish_callback_runs_before_terminal_admission_releases() {
+        let mailbox = ClosableMailbox::new(capacity(1));
+        assert_eq!(mailbox.enqueue(7), Ok(MailboxEnqueue::Scheduled));
+        let ClosableMailboxAcquire::Acquired(drain) = mailbox.acquire() else {
+            panic!("scheduled work must acquire a normal drain");
+        };
+        assert_eq!(drain.pop(), Some(7));
+        let _ = mailbox.begin_close();
+
+        let terminal_attempt = drain.finish_with(|after| {
+            assert_eq!(after, DrainAfter::Idle);
+            mailbox.try_begin_terminal_drain()
+        });
+        assert!(matches!(
+            terminal_attempt,
+            Err(TerminalAcquireError::NormalDrainReservationsRemain(count)) if count.get() == 1
+        ));
+
+        let terminal = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(terminal.pop(), None);
+        terminal.finish().unwrap();
     }
 
     #[test]
