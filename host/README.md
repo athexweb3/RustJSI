@@ -47,9 +47,10 @@ its own single identity authority.
 `ScheduledWork<T>` is an identity-bound envelope for host-owned queues. It
 captures an `AttachmentId`, validates it immediately before host entry, and
 returns the original record on stale-attachment or entry rejection.
-`ScheduledWorkMailbox<T>` adds fixed-capacity, close-aware retention and a
-single normal drain lease. A drain can dispatch one record through the host at
-a time; it does not create a scheduler, retry policy, or engine task.
+`ScheduledWorkMailbox<T>` is created for one immutable attachment epoch. It
+adds fixed-capacity, close-aware retention and a single normal drain lease. A
+drain can dispatch one record through the host at a time; it does not create a
+scheduler, retry policy, or engine task.
 
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access

@@ -96,8 +96,8 @@ fn draining_host_rejects_matching_work_without_consuming_payload() {
 #[test]
 fn mailbox_drain_dispatches_one_record_through_the_host() {
     let mut host = ModelHost::new().unwrap();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
-    let _ = mailbox.enqueue(host.attachment_id(), 41_u32).unwrap();
+    let mailbox = ScheduledWorkMailbox::new(host.attachment_id(), NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(41_u32).unwrap();
 
     let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
         panic!("queued work must acquire a normal drain");
@@ -125,8 +125,8 @@ fn mailbox_drain_returns_stale_work_without_host_entry() {
     let mut identity = RuntimeIdentity::allocate().unwrap();
     let stale = identity.next_attachment().unwrap();
     let current = identity.next_attachment().unwrap();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
-    let _ = mailbox.enqueue(stale, String::from("stale")).unwrap();
+    let mailbox = ScheduledWorkMailbox::new(stale, NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(String::from("stale")).unwrap();
     let mut host = ModelHost::for_attachment(current);
 
     let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
@@ -147,9 +147,9 @@ fn mailbox_drain_returns_stale_work_without_host_entry() {
 fn mailbox_drain_returns_work_when_host_entry_is_rejected() {
     let mut host = ModelHost::new().unwrap();
     let attachment = host.attachment_id();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(1).unwrap());
     let _ = mailbox
-        .enqueue(attachment, vec![1_u8, 2, 3])
+        .enqueue(vec![1_u8, 2, 3])
         .expect("active host attachment must enqueue");
     host.request_drain();
 
@@ -177,8 +177,8 @@ fn terminal_mailbox_drain_retains_stale_attachment_for_caller_policy() {
     let mut identity = RuntimeIdentity::allocate().unwrap();
     let stale = identity.next_attachment().unwrap();
     let current = identity.next_attachment().unwrap();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
-    let _ = mailbox.enqueue(stale, String::from("stale")).unwrap();
+    let mailbox = ScheduledWorkMailbox::new(stale, NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(String::from("stale")).unwrap();
     let _ = mailbox.begin_close();
 
     let terminal = mailbox.try_begin_terminal_drain().unwrap();
@@ -201,13 +201,15 @@ fn terminal_mailbox_drain_retains_stale_attachment_for_caller_policy() {
 #[derive(Default)]
 struct RecordingPoster {
     posts: Cell<usize>,
+    last_attachment: Cell<Option<rustjsi_host::AttachmentId>>,
 }
 
 impl DrainPoster for RecordingPoster {
     type Error = Infallible;
 
-    fn post_drain(&self, _attachment: rustjsi_host::AttachmentId) -> Result<(), Self::Error> {
+    fn post_drain(&self, attachment: rustjsi_host::AttachmentId) -> Result<(), Self::Error> {
         self.posts.set(self.posts.get() + 1);
+        self.last_attachment.set(Some(attachment));
         Ok(())
     }
 }
@@ -215,17 +217,17 @@ impl DrainPoster for RecordingPoster {
 #[test]
 fn mailbox_posts_once_for_a_coalesced_drain() {
     let host = ModelHost::new().unwrap();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(2).unwrap());
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(2).unwrap());
     let poster = RecordingPoster::default();
 
-    let _ = mailbox
-        .enqueue_and_post(&poster, host.attachment_id(), 1_u32)
-        .unwrap();
-    let _ = mailbox
-        .enqueue_and_post(&poster, host.attachment_id(), 2_u32)
-        .unwrap();
+    assert_eq!(mailbox.attachment_id(), attachment);
+
+    let _ = mailbox.enqueue_and_post(&poster, 1_u32).unwrap();
+    let _ = mailbox.enqueue_and_post(&poster, 2_u32).unwrap();
 
     assert_eq!(poster.posts.get(), 1);
+    assert_eq!(poster.last_attachment.get(), Some(attachment));
 }
 
 #[derive(Debug)]
@@ -260,23 +262,21 @@ impl DrainPoster for FailOncePoster {
 #[test]
 fn failed_post_preserves_pending_work_for_explicit_retry() {
     let host = ModelHost::new().unwrap();
-    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(2).unwrap());
+    let mailbox = ScheduledWorkMailbox::new(host.attachment_id(), NonZeroUsize::new(2).unwrap());
     let poster = FailOncePoster {
         posts: Cell::new(0),
         reject_next: Cell::new(true),
     };
 
     let error = mailbox
-        .enqueue_and_post(&poster, host.attachment_id(), 1_u32)
+        .enqueue_and_post(&poster, 1_u32)
         .expect_err("first post must fail");
     assert!(matches!(error, ScheduledWorkPostError::Post { .. }));
     assert_eq!(poster.posts.get(), 1);
 
-    let _ = mailbox
-        .enqueue_and_post(&poster, host.attachment_id(), 2_u32)
-        .unwrap();
+    let _ = mailbox.enqueue_and_post(&poster, 2_u32).unwrap();
     assert_eq!(poster.posts.get(), 1);
-    assert!(mailbox.post_pending(&poster, host.attachment_id()).unwrap());
+    assert!(mailbox.post_pending(&poster).unwrap());
     assert_eq!(poster.posts.get(), 2);
 
     let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
@@ -285,5 +285,5 @@ fn failed_post_preserves_pending_work_for_explicit_retry() {
     assert_eq!(drain.pop().unwrap().into_payload(), 1);
     assert_eq!(drain.pop().unwrap().into_payload(), 2);
     let _ = drain.finish();
-    assert!(!mailbox.post_pending(&poster, host.attachment_id()).unwrap());
+    assert!(!mailbox.post_pending(&poster).unwrap());
 }
