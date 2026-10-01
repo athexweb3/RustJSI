@@ -71,6 +71,10 @@ uses drain leases rather than a snapshot to coordinate payload transfer. The
 `is_terminally_closed` predicate makes the terminal condition explicit for a
 later replacement coordinator without creating one here.
 
+When `T: Send`, producer threads may share `ScheduledWorkMailbox<T>` and retain
+one coalesced attachment-only post. Its acquired `ScheduledWorkDrain` remains
+thread-affine, so accepting work does not transfer runtime-consumer authority.
+
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
 or perform cleanup itself. The source-linked `Host` contract is not the stable C

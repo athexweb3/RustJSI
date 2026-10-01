@@ -72,6 +72,25 @@ pub enum ScheduledWorkAcquire<'mailbox, T> {
 }
 
 /// Normal-drain ownership for [`ScheduledWorkMailbox`].
+///
+/// The mailbox may be shared by producer threads, but an acquired drain is
+/// thread-affine and cannot transfer runtime-consumer authority elsewhere.
+///
+/// ```compile_fail
+/// use rustjsi_host::ScheduledWorkDrain;
+///
+/// fn requires_send<T: Send>() {}
+///
+/// requires_send::<ScheduledWorkDrain<'static, ()>>();
+/// ```
+///
+/// ```compile_fail
+/// use rustjsi_host::ScheduledWorkDrain;
+///
+/// fn requires_sync<T: Sync>() {}
+///
+/// requires_sync::<ScheduledWorkDrain<'static, ()>>();
+/// ```
 #[derive(Debug)]
 #[must_use]
 pub struct ScheduledWorkDrain<'mailbox, T> {
