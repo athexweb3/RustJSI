@@ -8,7 +8,7 @@ use rustjsi_backend::{
     BackendError, BackendFamily, BackendScope, OwnedExternalBufferScope, RootBackend, RootScope,
     ValueKind,
 };
-use rustjsi_backend_jsc::{JscBackendFamily, Runtime, RuntimeError};
+use rustjsi_backend_jsc::{CallLimits, JscBackendFamily, RootLimits, Runtime, RuntimeError};
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
     ModelBackend, ModelBackendFamily, create_number_root, verify_base_values,
@@ -73,6 +73,19 @@ fn both_families_use_the_same_capability_consumers() {
         .with_backend(|backend| check::<JscBackendFamily, _>(backend, root))
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn public_call_limit_configuration_is_available_to_owned_hosts() {
+    let mut runtime = Runtime::new_with_limits(
+        RootLimits::default(),
+        CallLimits {
+            arguments: 0,
+            string_utf8_bytes: 0,
+        },
+    )
+    .unwrap();
+    runtime.invalidate().unwrap();
 }
 
 #[test]
