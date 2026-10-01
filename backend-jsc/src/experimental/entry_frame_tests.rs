@@ -86,6 +86,52 @@ fn shared_context_group_defers_owned_teardown_until_outer_exit() {
 }
 
 #[test]
+fn outer_exit_drains_a_burst_of_deferred_owned_runtimes() {
+    const DEFERRED_DROPS: usize = 32;
+
+    assert!(take_deferred_owned_drop_drain_observations().is_empty());
+    let group = TestContextGroup::new();
+    let mut outer = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let inners = (0..DEFERRED_DROPS)
+        .map(|_| Runtime::new_in_context_group_for_test(group.0).unwrap())
+        .collect::<Vec<_>>();
+    let inner_shared = inners
+        .iter()
+        .map(|runtime| Rc::clone(&runtime.shared))
+        .collect::<Vec<_>>();
+    let observed_shared = inner_shared.clone();
+
+    outer
+        .with_context(move |_| {
+            for inner in inners {
+                drop(inner);
+            }
+            assert_eq!(
+                DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()),
+                DEFERRED_DROPS
+            );
+            for shared in &observed_shared {
+                assert_eq!(shared.gate.state(), HostState::Active);
+                assert_eq!(shared.gate.active_entries(), 0);
+            }
+        })
+        .unwrap();
+
+    for shared in inner_shared {
+        assert_eq!(shared.gate.state(), HostState::Destroyed);
+    }
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+    assert_eq!(
+        take_deferred_owned_drop_drain_observations(),
+        vec![DeferredOwnedDropDrainObservation {
+            outer_active_entries: 0,
+            active_runtime_present: false,
+            active_context_present: false,
+        }]
+    );
+}
+
+#[test]
 fn dropping_independent_owned_runtime_tears_it_down_before_outer_exit() {
     let mut outer = Runtime::new().unwrap();
     let inner = Runtime::new().unwrap();
