@@ -10,7 +10,6 @@
 
 mod conformance;
 mod drain_post_queue;
-mod drain_registration;
 mod lifecycle;
 mod model;
 mod model_entry;
@@ -24,10 +23,6 @@ pub use conformance::{
     verify_owned_external_buffer, verify_strong_root_round_trip,
 };
 pub use drain_post_queue::{DrainPostAcquire, DrainPostDrain, DrainPostQueue, DrainPostQueueFull};
-pub use drain_registration::{
-    DrainRegistrationModel, DrainRegistrationReplaceError, DrainRegistrationState,
-    DrainTaskResolution,
-};
 pub use lifecycle::{
     AttachmentId, Entry, Epoch, LifecycleError, LifecycleEvent, LifecycleModel, RuntimeId,
     RuntimeState,
