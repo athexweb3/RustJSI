@@ -77,7 +77,7 @@ where
 
     /// Returns the attachment's tracked `RustJSI` resource observation.
     ///
-    /// This does not ask the foreign host for a JavaScriptCore entry and does
+    /// This does not ask the foreign host for a `JavaScriptCore` entry and does
     /// not require the source to hold a VM lock.
     ///
     /// # Errors
