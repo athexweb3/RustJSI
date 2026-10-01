@@ -139,10 +139,16 @@ impl<T> AttachmentWorkOwner<T> {
     /// # Errors
     ///
     /// Returns the poster's failure while preserving the pending mailbox.
+    /// Once owner close begins, this returns `Ok(false)` without invoking the
+    /// poster: the current attachment no longer admits task dispatch, and
+    /// terminal drain ownership transfers the retained work instead.
     pub fn post_pending<P>(&self, poster: &P) -> Result<bool, P::Error>
     where
         P: DrainPoster,
     {
+        if self.registration.state() != DrainRegistrationState::Active {
+            return Ok(false);
+        }
         self.mailbox.post_pending(poster)
     }
 
@@ -240,7 +246,10 @@ impl Error for AttachmentWorkReplaceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::convert::Infallible;
+    use std::error::Error;
+    use std::fmt;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -262,6 +271,31 @@ mod tests {
         fn post_drain(&self, _attachment: AttachmentId) -> Result<(), Self::Error> {
             self.posts.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectedPost;
+
+    impl fmt::Display for RejectedPost {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("post rejected")
+        }
+    }
+
+    impl Error for RejectedPost {}
+
+    #[derive(Default)]
+    struct RejectingPoster {
+        attempts: Cell<usize>,
+    }
+
+    impl DrainPoster for RejectingPoster {
+        type Error = RejectedPost;
+
+        fn post_drain(&self, _attachment: AttachmentId) -> Result<(), Self::Error> {
+            self.attempts.set(self.attempts.get() + 1);
+            Err(RejectedPost)
         }
     }
 
@@ -328,6 +362,52 @@ mod tests {
         };
         assert_eq!(drain.pop().unwrap().into_payload(), 41);
         assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+    }
+
+    #[test]
+    fn close_transfers_failed_post_work_without_retrying_a_closing_attachment() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let attachment = identity.next_attachment().unwrap();
+        let replacement = identity.next_attachment().unwrap();
+        let mut owner = AttachmentWorkOwner::new(attachment, NonZeroUsize::new(1).unwrap());
+        let sender = owner.sender();
+        let poster = RejectingPoster::default();
+
+        let error = sender
+            .enqueue_and_post(&poster, 7_u8)
+            .expect_err("the initial post must be reported to the caller");
+        assert!(matches!(
+            error,
+            ScheduledWorkPostError::Post {
+                attachment: error_attachment,
+                error: RejectedPost,
+            } if error_attachment == attachment
+        ));
+        assert_eq!(poster.attempts.get(), 1);
+
+        let _ = owner.begin_close();
+        assert!(matches!(
+            owner.resolve_drain_task(attachment),
+            AttachmentWorkResolution::Closing
+        ));
+        assert!(!owner.post_pending(&poster).unwrap());
+        assert_eq!(poster.attempts.get(), 1);
+
+        let terminal = owner.try_begin_terminal_drain().unwrap();
+        let work = terminal
+            .pop()
+            .expect("failed-post payload must transfer to terminal ownership");
+        assert_eq!(work.attachment_id(), attachment);
+        assert_eq!(work.into_payload(), 7);
+        terminal.finish().unwrap();
+
+        owner
+            .replace(replacement, NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert!(matches!(
+            owner.resolve_drain_task(attachment),
+            AttachmentWorkResolution::Retired
+        ));
     }
 
     #[test]
