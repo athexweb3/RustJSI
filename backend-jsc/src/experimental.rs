@@ -543,6 +543,8 @@ struct RootRegistry {
     slots: Vec<RootSlot>,
     free: Vec<usize>,
     pending_head: Option<usize>,
+    live: usize,
+    pending: usize,
     limit: usize,
 }
 
@@ -1665,6 +1667,8 @@ impl RootRegistry {
             slots: Vec::new(),
             free: Vec::new(),
             pending_head: None,
+            live: 0,
+            pending: 0,
             limit,
         }
     }
@@ -1673,6 +1677,7 @@ impl RootRegistry {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot];
             entry.value = Some(value);
+            self.live += 1;
             return Ok(RootId {
                 slot,
                 generation: entry.generation,
@@ -1688,6 +1693,7 @@ impl RootRegistry {
             value: Some(value),
             release: RootRelease::Live,
         });
+        self.live += 1;
         Ok(RootId {
             slot,
             generation: 1,
@@ -1707,6 +1713,7 @@ impl RootRegistry {
             return None;
         }
         let value = slot.value.take()?;
+        self.live -= 1;
         slot.generation = slot.generation.saturating_add(1);
         if slot.generation != u64::MAX {
             self.free.push(id.slot);
@@ -1728,6 +1735,7 @@ impl RootRegistry {
             next: self.pending_head,
         };
         self.pending_head = Some(id.slot);
+        self.pending += 1;
     }
 
     fn take_pending(&mut self) -> Option<NonNull<sys::OpaqueValue>> {
@@ -1738,6 +1746,7 @@ impl RootRegistry {
         };
         self.pending_head = next;
         slot.release = RootRelease::Live;
+        self.pending -= 1;
         let id = RootId {
             slot: index,
             generation: slot.generation,
@@ -1749,6 +1758,8 @@ impl RootRegistry {
         let mut values = Vec::new();
         self.free.clear();
         self.pending_head = None;
+        self.live = 0;
+        self.pending = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             slot.release = RootRelease::Live;
             if let Some(value) = slot.value.take() {
@@ -1763,12 +1774,7 @@ impl RootRegistry {
     }
 
     fn counts(&self) -> (usize, usize) {
-        self.slots.iter().fold((0, 0), |(live, pending), slot| {
-            let live = live + usize::from(slot.value.is_some());
-            let pending =
-                pending + usize::from(matches!(slot.release, RootRelease::Pending { .. }));
-            (live, pending)
-        })
+        (self.live, self.pending)
     }
 }
 
