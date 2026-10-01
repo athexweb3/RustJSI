@@ -34,6 +34,14 @@ If a driver unwinds with an unfinished drain, retained post records remain
 pending for a later deterministic recovery drain. The fixture exposes that
 state but does not create a platform wake-up or retry policy.
 
+`DrainRegistrationModel` represents the host owner's decision about an
+attachment-only drain task for one logical runtime. Its current attachment is
+either active or closing. Replacement requires closing state, the same runtime
+ID, and a strictly newer attachment epoch. Resolution distinguishes current,
+closing, retired, unregistered, and foreign tasks before any host entry. It
+does not provide a scheduler, backend attachment, wake-up mechanism, or
+platform integration.
+
 `tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
 steps over three runtimes against an independent reference model. Sequences
 replace engines with new epochs, abandon issued epochs before activation, keep
