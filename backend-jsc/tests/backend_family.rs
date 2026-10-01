@@ -9,7 +9,8 @@ use rustjsi_backend::{
     OwnershipTransferError, RootBackend, RootScope, ValueKind,
 };
 use rustjsi_backend_jsc::{
-    CallLimits, ExternalBufferLimits, JscBackendFamily, RootLimits, Runtime, RuntimeError,
+    CallLimits, ExternalBufferLimits, InboundCallbackLimits, JscBackendFamily, JscRuntimeLimits,
+    RootLimits, Runtime, RuntimeError, Value,
 };
 use rustjsi_host::{Host, HostState};
 use rustjsi_testkit::{
@@ -88,6 +89,41 @@ fn public_call_limit_configuration_is_available_to_owned_hosts() {
     )
     .unwrap();
     runtime.invalidate().unwrap();
+}
+
+#[test]
+fn public_inbound_callback_configuration_rejects_before_string_escapes() {
+    let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+        inbound_callback: InboundCallbackLimits {
+            arguments: 1,
+            string_utf8_bytes: 4,
+        },
+        ..JscRuntimeLimits::default()
+    })
+    .unwrap();
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+    runtime
+        .with_context(|cx| {
+            let callback_observed = std::rc::Rc::clone(&observed);
+            cx.install_host_function("publicInbound", move |call| {
+                let value = call.string(0)?;
+                callback_observed.borrow_mut().push(value.clone());
+                Ok(Value::String(value))
+            })
+            .unwrap();
+
+            let error = cx
+                .eval("publicInbound('🦀x')", "public-inbound-limit.js")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("inbound callback string data limit reached")
+            );
+            assert!(observed.borrow().is_empty());
+        })
+        .unwrap();
 }
 
 #[test]
