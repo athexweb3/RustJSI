@@ -13,6 +13,7 @@ mod lifecycle;
 mod model;
 mod model_entry;
 mod model_host;
+mod work_queue;
 
 pub use conformance::{
     create_number_root, verify_base_values, verify_borrowed_buffer_stability,
@@ -30,3 +31,7 @@ pub use model::{
 };
 pub use model_entry::{ModelBackendFamily, ModelEntry, ModelEntryScope};
 pub use model_host::ModelHost;
+pub use work_queue::{
+    AbandonError, CloseError, CloseOutcome, DrainError, DrainLease, PublishError, ReserveError,
+    SubmitReservation, WorkQueueModel, WorkQueueState,
+};

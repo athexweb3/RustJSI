@@ -6,8 +6,10 @@ Status: experimental, `0.0.0`, and unpublished.
 
 The current model provides scoped primitive values, programmed evaluation
 outcomes, generational strong roots, exact-owner external buffers, and a pure
-host-lifecycle state machine. It is designed for reproducible failure and
-ordering tests.
+host-lifecycle state machine. It also models bounded work-queue close ordering:
+pre-close reservations settle before terminal close, and residual payloads
+transfer to the close owner exactly once. It is designed for reproducible
+failure and ordering tests.
 
 Lifecycle fixtures consume the same owner-issued `AttachmentId` as real
 backends. Replacement cycles preserve their logical runtime ID while advancing
