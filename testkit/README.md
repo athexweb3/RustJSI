@@ -30,6 +30,10 @@ inert attachment identity. Its acquired drain remains thread-affine and is not
 an engine entry capability; a driver must finish it on its chosen consumer
 thread before separately validating attachment and host entry.
 
+If a driver unwinds with an unfinished drain, retained post records remain
+pending for a later deterministic recovery drain. The fixture exposes that
+state but does not create a platform wake-up or retry policy.
+
 `tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
 steps over three runtimes against an independent reference model. Sequences
 replace engines with new epochs, abandon issued epochs before activation, keep
