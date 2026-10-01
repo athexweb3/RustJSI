@@ -11,6 +11,7 @@ mod identity;
 mod post;
 mod work;
 mod work_mailbox;
+mod work_owner;
 
 pub use contract::Host;
 pub use drain_registration::{
@@ -25,4 +26,7 @@ pub use work::{ScheduledWork, WorkDispatchError};
 pub use work_mailbox::{
     ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkFinishError,
     ScheduledWorkMailbox, ScheduledWorkPostError, TerminalScheduledWorkDrain,
+};
+pub use work_owner::{
+    AttachmentWorkOwner, AttachmentWorkReplaceError, AttachmentWorkResolution, ScheduledWorkSender,
 };

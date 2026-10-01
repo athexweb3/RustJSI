@@ -75,6 +75,16 @@ When `T: Send`, producer threads may share `ScheduledWorkMailbox<T>` and retain
 one coalesced attachment-only post. Its acquired `ScheduledWorkDrain` remains
 thread-affine, so accepting work does not transfer runtime-consumer authority.
 
+`AttachmentWorkOwner<T>` composes exactly one thread-affine
+`DrainRegistration` with that current attachment's `ScheduledWorkMailbox<T>`.
+Its cloneable `ScheduledWorkSender<T>` retains only immutable mailbox enqueue
+and initial-post capabilities; it cannot resolve tasks, enter a backend, close
+ingress, transfer terminal work, or replace the attachment. Closing first makes
+the registration non-dispatchable, then stops mailbox admission. Replacement is
+allowed only after the old mailbox reaches terminal `Closed`, at which point a
+fresh mailbox and sender set target the newer attachment. Resolving a delivered
+task may lend the active mailbox, but never grants host entry or scheduling.
+
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
 or perform cleanup itself. The source-linked `Host` contract is not the stable C
