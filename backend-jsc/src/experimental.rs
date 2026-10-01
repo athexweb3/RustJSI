@@ -226,6 +226,75 @@ pub struct JscRuntimeLimits {
     pub host_functions: HostFunctionLimits,
 }
 
+/// A best-effort observation of `RustJSI` resources retained by one JSC attachment.
+///
+/// This describes resources directly tracked by the experimental JSC backend. It
+/// is not a JavaScript heap measurement, total-process memory measurement, or
+/// count of JavaScript wrappers and views. The external-buffer allocation and
+/// byte counters are independently sampled atomics, so a concurrent JSC
+/// deallocation can make their pair describe adjacent instants.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JscResourceSnapshot {
+    persistent_roots: usize,
+    pending_persistent_releases: usize,
+    host_function_registrations: usize,
+    native_state_registrations: usize,
+    external_buffer_allocations: usize,
+    external_buffer_bytes: usize,
+    callback_drop_panics: usize,
+    native_state_drop_panics: usize,
+}
+
+impl JscResourceSnapshot {
+    /// Returns live persistent JSC protections, including pending releases.
+    #[must_use]
+    pub const fn persistent_roots(&self) -> usize {
+        self.persistent_roots
+    }
+
+    /// Returns persistent protections queued for release at the next legal entry.
+    #[must_use]
+    pub const fn pending_persistent_releases(&self) -> usize {
+        self.pending_persistent_releases
+    }
+
+    /// Returns retained Rust host-callback registrations.
+    #[must_use]
+    pub const fn host_function_registrations(&self) -> usize {
+        self.host_function_registrations
+    }
+
+    /// Returns live Rust native-state registration identities.
+    #[must_use]
+    pub const fn native_state_registrations(&self) -> usize {
+        self.native_state_registrations
+    }
+
+    /// Returns live Rust-owned external-buffer allocations transferred to JSC.
+    #[must_use]
+    pub const fn external_buffer_allocations(&self) -> usize {
+        self.external_buffer_allocations
+    }
+
+    /// Returns live Rust-owned external-buffer bytes transferred to JSC.
+    #[must_use]
+    pub const fn external_buffer_bytes(&self) -> usize {
+        self.external_buffer_bytes
+    }
+
+    /// Returns callback-capture destructor panics contained by this attachment.
+    #[must_use]
+    pub const fn callback_drop_panics(&self) -> usize {
+        self.callback_drop_panics
+    }
+
+    /// Returns native-state destructor panics contained by this attachment.
+    #[must_use]
+    pub const fn native_state_drop_panics(&self) -> usize {
+        self.native_state_drop_panics
+    }
+}
+
 impl Default for ExternalBufferLimits {
     fn default() -> Self {
         Self {
@@ -630,6 +699,18 @@ impl Runtime {
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
         Self::from_owned_context(id, limits, context)
+    }
+
+    /// Returns RustJSI-tracked long-lived resources for this runtime.
+    ///
+    /// This observation remains available after invalidation so callers can
+    /// inspect teardown effects. It requires the runtime's owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an affinity error when called from a different thread.
+    pub fn resource_snapshot(&self) -> Result<JscResourceSnapshot, RuntimeError> {
+        self.shared.resource_snapshot()
     }
 
     #[cfg(test)]
@@ -1453,6 +1534,21 @@ impl Shared {
         }
     }
 
+    fn resource_snapshot(&self) -> Result<JscResourceSnapshot, RuntimeError> {
+        self.ensure_thread()?;
+        let (persistent_roots, pending_persistent_releases) = self.roots.borrow().counts();
+        Ok(JscResourceSnapshot {
+            persistent_roots,
+            pending_persistent_releases,
+            host_function_registrations: self.host_functions.borrow().len(),
+            native_state_registrations: self.native_states.borrow().live_count(),
+            external_buffer_allocations: self.external_buffers.live_allocations(),
+            external_buffer_bytes: self.external_buffers.live_bytes(),
+            callback_drop_panics: self.callback_drop_panics.get(),
+            native_state_drop_panics: self.native_drop_panics.get(),
+        })
+    }
+
     fn ensure_entry_compatible(
         &self,
         context: NonNull<sys::OpaqueContext>,
@@ -1664,6 +1760,15 @@ impl RootRegistry {
             }
         }
         values
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        self.slots.iter().fold((0, 0), |(live, pending), slot| {
+            let live = live + usize::from(slot.value.is_some());
+            let pending =
+                pending + usize::from(matches!(slot.release, RootRelease::Pending { .. }));
+            (live, pending)
+        })
     }
 }
 

@@ -14,7 +14,8 @@ mod sys;
 pub use experimental::{
     Attachment, Call, CallLimits, Context, DetachReport, ExternalBuffer, ExternalBufferLimits,
     HostError, HostFunction, HostFunctionLimits, InboundCallbackLimits, JsError, JsException,
-    JscAttachedHost, JscBackend, JscBackendFamily, JscEntrySource, JscHostError, JscRoot,
-    JscRuntimeLimits, JscScope, JscValue, Local, NativeObject, NativeStateInstallError,
-    NativeStateLimits, Persistent, RootLimits, Runtime, RuntimeError, Value,
+    JscAttachedHost, JscBackend, JscBackendFamily, JscEntrySource, JscHostError,
+    JscResourceSnapshot, JscRoot, JscRuntimeLimits, JscScope, JscValue, Local, NativeObject,
+    NativeStateInstallError, NativeStateLimits, Persistent, RootLimits, Runtime, RuntimeError,
+    Value,
 };

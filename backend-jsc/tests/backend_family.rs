@@ -197,6 +197,58 @@ fn public_host_function_limit_rejects_before_callback_capture() {
 }
 
 #[test]
+fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
+    let mut runtime = Runtime::new().unwrap();
+    let initial = runtime.resource_snapshot().unwrap();
+    assert_eq!(initial.persistent_roots(), 0);
+    assert_eq!(initial.pending_persistent_releases(), 0);
+    assert_eq!(initial.host_function_registrations(), 0);
+    assert_eq!(initial.native_state_registrations(), 0);
+    assert_eq!(initial.external_buffer_allocations(), 0);
+    assert_eq!(initial.external_buffer_bytes(), 0);
+    assert_eq!(initial.callback_drop_panics(), 0);
+    assert_eq!(initial.native_state_drop_panics(), 0);
+
+    let root = runtime
+        .with_context(|cx| {
+            let local = cx
+                .eval("({ marker: 'snapshot' })", "snapshot-root.js")
+                .unwrap();
+            let root = cx.persist(&local).unwrap();
+            cx.install_host_function("snapshotCallback", |_| Ok(Value::Undefined))
+                .unwrap();
+            let _state = cx.install_native_state("snapshotState", 7_u8).unwrap();
+            let _buffer = cx
+                .install_external_buffer("snapshotBytes", vec![1_u8, 2, 3].into_boxed_slice())
+                .unwrap();
+            root
+        })
+        .unwrap();
+
+    let retained = runtime.resource_snapshot().unwrap();
+    assert_eq!(retained.persistent_roots(), 1);
+    assert_eq!(retained.pending_persistent_releases(), 0);
+    assert_eq!(retained.host_function_registrations(), 1);
+    assert_eq!(retained.native_state_registrations(), 1);
+    assert_eq!(retained.external_buffer_allocations(), 1);
+    assert_eq!(retained.external_buffer_bytes(), 3);
+
+    drop(root);
+    let pending = runtime.resource_snapshot().unwrap();
+    assert_eq!(pending.persistent_roots(), 1);
+    assert_eq!(pending.pending_persistent_releases(), 1);
+
+    runtime.with_context(|_| {}).unwrap();
+    let released = runtime.resource_snapshot().unwrap();
+    assert_eq!(released.persistent_roots(), 0);
+    assert_eq!(released.pending_persistent_releases(), 0);
+    assert_eq!(released.host_function_registrations(), 1);
+    assert_eq!(released.native_state_registrations(), 1);
+    assert_eq!(released.external_buffer_allocations(), 1);
+    assert_eq!(released.external_buffer_bytes(), 3);
+}
+
+#[test]
 fn public_external_buffer_limits_reject_before_ownership_transfer() {
     let mut runtime = Runtime::new_with_external_buffer_limits(
         RootLimits::default(),

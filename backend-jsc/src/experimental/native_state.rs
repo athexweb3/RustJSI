@@ -281,6 +281,10 @@ impl NativeRegistry {
         }
         values
     }
+
+    pub(super) const fn live_count(&self) -> usize {
+        self.live
+    }
 }
 
 impl Context<'_> {
