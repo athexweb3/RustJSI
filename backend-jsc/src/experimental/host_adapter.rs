@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{Attachment, DetachReport, JscBackendFamily, RuntimeError};
+use super::{Attachment, DetachReport, JscBackendFamily, JscResourceSnapshot, RuntimeError};
 use rustjsi_backend::BackendFamily;
 use rustjsi_host::{AttachmentId, Host, HostState};
 use std::error::Error;
@@ -73,6 +73,20 @@ where
     /// Borrows attachment state and its foreign host entry source.
     pub fn new(attachment: &'attachment mut Attachment, source: &'source mut S) -> Self {
         Self { attachment, source }
+    }
+
+    /// Returns the attachment's tracked `RustJSI` resource observation.
+    ///
+    /// This does not ask the foreign host for a JavaScriptCore entry and does
+    /// not require the source to hold a VM lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an attachment affinity error when called from a different thread.
+    pub fn resource_snapshot(&self) -> Result<JscResourceSnapshot, JscHostError<S::Error>> {
+        self.attachment
+            .resource_snapshot()
+            .map_err(JscHostError::Runtime)
     }
 
     /// Runs final entry-dependent cleanup without retaining or releasing the
@@ -270,6 +284,28 @@ mod tests {
         assert_eq!(
             host.detach_with_entry().unwrap().final_entry(),
             FinalEntryOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn adapter_snapshot_does_not_request_foreign_entry() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::BestEffort).unwrap();
+        let mut owner = ForeignOwner::new(attachment.attachment_id());
+        owner.admit = false;
+        let mut host = JscAttachedHost::new(&mut attachment, &mut owner);
+
+        let snapshot = host.resource_snapshot().unwrap();
+        assert_eq!(snapshot.persistent_roots(), 0);
+        assert_eq!(snapshot.host_function_registrations(), 0);
+        assert_eq!(snapshot.native_state_registrations(), 0);
+        assert_eq!(snapshot.external_buffer_allocations(), 0);
+        assert_eq!(host.source.entries, 0);
+        assert_eq!(host.source.active_entries.get(), 0);
+
+        assert_eq!(
+            host.detach_without_entry().unwrap().final_entry(),
+            FinalEntryOutcome::Unavailable
         );
     }
 
