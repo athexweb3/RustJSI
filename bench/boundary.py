@@ -85,7 +85,7 @@ JS_CALL_METRICS = {
     "direct": "direct_jsc_js_call",
     "common": "rustjsi_common_js_call",
 }
-SCHEMA = 13
+SCHEMA = 14
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
@@ -484,11 +484,11 @@ def summarize(samples):
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
             "metrics": {
-                name: describe_batches([
-                    value
-                    for sample in samples
-                    for value in sample["callback_batches"][name]
-                ], len(samples), "ns/call")
+                name: describe_batch_latency(
+                    [sample["callback_batches"][name] for sample in samples],
+                    "ns/call",
+                    f"callback_batch_latency/{name}",
+                )
                 for name in CALLBACK_BATCH_METRICS
             },
         },
@@ -496,11 +496,11 @@ def summarize(samples):
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
             "metrics": {
-                name: describe_batches([
-                    value
-                    for sample in samples
-                    for value in sample["js_call_batches"][name]
-                ], len(samples), "ns/call")
+                name: describe_batch_latency(
+                    [sample["js_call_batches"][name] for sample in samples],
+                    "ns/call",
+                    f"js_call_batch_latency/{name}",
+                )
                 for name in JS_CALL_BATCH_METRICS
             },
         },
@@ -508,11 +508,11 @@ def summarize(samples):
             "sample_kind": "contiguous_batch_mean",
             "operations_per_batch": ENTRY_BATCH_ITERATIONS,
             "metrics": {
-                name: describe_batches([
-                    value
-                    for sample in samples
-                    for value in sample["entry_batches"][name]
-                ], len(samples), "ns/entry")
+                name: describe_batch_latency(
+                    [sample["entry_batches"][name] for sample in samples],
+                    "ns/entry",
+                    f"entry_batch_latency/{name}",
+                )
                 for name in ENTRY_METRICS
             },
         },
@@ -627,6 +627,34 @@ def describe_batches(values, processes, unit):
         "p95": nearest_rank(values, 0.95),
         "p99": nearest_rank(values, 0.99),
     })
+    return result
+
+
+def describe_batch_latency(per_process_batches, unit, label):
+    """Add process-scoped summaries to pooled contiguous-batch latency data."""
+    if not per_process_batches or any(
+        len(batches) != ENTRY_BATCHES for batches in per_process_batches
+    ):
+        raise ValueError("need equal-sized batch observations for every process")
+    result = describe_batches(
+        [value for batches in per_process_batches for value in batches],
+        len(per_process_batches),
+        unit,
+    )
+    result["per_process_batch_quantiles"] = {
+        "sample_kind": "per_process_contiguous_batch_quantile",
+        "independent_unit": BOOTSTRAP_INDEPENDENT_UNIT,
+        "processes": len(per_process_batches),
+        "batches_per_process": ENTRY_BATCHES,
+        "unit": unit,
+        "quantiles": {
+            name: describe_processes(
+                [nearest_rank(batches, percentile) for batches in per_process_batches],
+                label=f"{label}/per_process_batch_quantiles/{name}",
+            )
+            for name, percentile in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
+        },
+    }
     return result
 
 
