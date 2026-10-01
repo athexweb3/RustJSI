@@ -628,4 +628,27 @@ mod tests {
         queue.finish_terminal_drain(second_terminal).unwrap();
         assert_eq!(queue.state(), WorkQueueState::Closed);
     }
+
+    #[test]
+    fn stale_terminal_leases_cannot_consume_or_release_residual_work() {
+        let mut queue = WorkQueueModel::new(capacity(1));
+        let reservation = queue.reserve().unwrap();
+        queue.publish(reservation, 9_u32).unwrap();
+        queue.begin_close();
+
+        let stale = queue.begin_terminal_drain().unwrap();
+        queue.release_terminal_drain(stale).unwrap();
+        assert_eq!(
+            queue.pop_terminal(stale),
+            Err(TerminalDrainError::StaleLease)
+        );
+        assert_eq!(
+            queue.finish_terminal_drain(stale),
+            Err(TerminalDrainError::StaleLease)
+        );
+
+        let current = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(current), Ok(Some(9)));
+        queue.finish_terminal_drain(current).unwrap();
+    }
 }
