@@ -2,9 +2,10 @@
 
 use super::{JsError, JsException, JsString};
 use crate::sys;
+use std::borrow::Cow;
 
-const MAX_MESSAGE_BYTES: usize = 4096;
-const TRUNCATION_SUFFIX: &str = "… [truncated]";
+pub(super) const MAX_MESSAGE_BYTES: usize = 4096;
+pub(super) const TRUNCATION_SUFFIX: &str = "… [truncated]";
 
 pub(super) fn copy(string: &JsString) -> Result<JsException, JsError> {
     // SAFETY: JsString owns this immutable string reference for all calls below.
@@ -36,14 +37,34 @@ pub(super) fn copy(string: &JsString) -> Result<JsException, JsError> {
     };
     let truncated = copied_units < original_units;
     if truncated {
-        let mut end = message
-            .len()
-            .min(MAX_MESSAGE_BYTES - TRUNCATION_SUFFIX.len());
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message.truncate(end);
-        message.push_str(TRUNCATION_SUFFIX);
+        truncate(&mut message);
     }
     Ok(JsException { message, truncated })
+}
+
+pub(super) fn truncate_for_engine(message: &str) -> Cow<'_, str> {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return Cow::Borrowed(message);
+    }
+
+    let mut truncated = String::with_capacity(MAX_MESSAGE_BYTES);
+    truncated.push_str(&message[..truncation_end(message)]);
+    truncated.push_str(TRUNCATION_SUFFIX);
+    Cow::Owned(truncated)
+}
+
+fn truncate(message: &mut String) {
+    let end = truncation_end(message);
+    message.truncate(end);
+    message.push_str(TRUNCATION_SUFFIX);
+}
+
+fn truncation_end(message: &str) -> usize {
+    let mut end = message
+        .len()
+        .min(MAX_MESSAGE_BYTES - TRUNCATION_SUFFIX.len());
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }

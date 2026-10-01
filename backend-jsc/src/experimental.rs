@@ -1674,7 +1674,8 @@ fn write_exception(context: sys::ContextRef, output: *mut sys::ValueRef, message
     if output.is_null() {
         return;
     }
-    let Ok(message_string) = JsString::new(message) else {
+    let message = exception_message::truncate_for_engine(message);
+    let Ok(message_string) = JsString::new(&message) else {
         return;
     };
 
