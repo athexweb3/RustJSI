@@ -164,11 +164,32 @@ impl Default for InboundCallbackLimits {
     }
 }
 
+/// Registration-admission limits for JSC native state.
+///
+/// The registry counts accepted Rust state identities until they retire from the
+/// registry. It does not account for the allocation size of `T`, JavaScript
+/// wrapper count, JSC heap use, registry vector capacity, or a state retained
+/// by an already-admitted operation lease after its registry identity retires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeStateLimits {
+    /// Maximum live native-state registration identities.
+    pub registrations: usize,
+}
+
+impl Default for NativeStateLimits {
+    fn default() -> Self {
+        Self {
+            registrations: 4096,
+        }
+    }
+}
+
 /// Aggregate creation-time limits for an experimental JSC runtime or attachment.
 ///
 /// Each field governs a distinct resource direction or lifetime. In particular,
 /// [`Self::outbound_call`] does not govern values read by a Rust host callback;
-/// [`Self::inbound_callback`] governs that separate JavaScript-to-Rust path.
+/// [`Self::inbound_callback`] governs that separate JavaScript-to-Rust path,
+/// while [`Self::native_states`] only governs registry identity admission.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JscRuntimeLimits {
     /// Persistent and scoped JSC root admission limits.
@@ -179,6 +200,8 @@ pub struct JscRuntimeLimits {
     pub external_buffers: ExternalBufferLimits,
     /// Per-callback JavaScript-to-Rust data limits.
     pub inbound_callback: InboundCallbackLimits,
+    /// Live native-state registration identity limits.
+    pub native_states: NativeStateLimits,
 }
 
 impl Default for ExternalBufferLimits {
@@ -364,7 +387,7 @@ pub enum RuntimeError {
     ExternalBufferByteLimitReached,
     /// The experimental limit of 4096 retained host functions was reached.
     HostFunctionLimitReached,
-    /// No native-state registration is available within the experimental limit.
+    /// No native-state registration is available within the configured limit.
     NativeStateRegistrationLimitReached,
 }
 
@@ -1365,7 +1388,9 @@ impl Shared {
             call_limits: limits.outbound_call,
             inbound_callback_limits: limits.inbound_callback,
             host_functions: RefCell::new(HashMap::new()),
-            native_states: RefCell::new(native_state::NativeRegistry::default()),
+            native_states: RefCell::new(native_state::NativeRegistry::new(
+                limits.native_states.registrations,
+            )),
             native_finalizers: Arc::new(native_state::FinalizerQueue::new()),
             native_drop_panics: Cell::new(0),
             callback_drop_panics: Cell::new(0),

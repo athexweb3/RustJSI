@@ -11,8 +11,6 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-const MAX_NATIVE_STATES: usize = 4_096;
-
 /// A typed handle to Rust state owned by a JavaScript wrapper.
 ///
 /// ```compile_fail
@@ -285,12 +283,6 @@ impl NativeRegistry {
     }
 }
 
-impl Default for NativeRegistry {
-    fn default() -> Self {
-        Self::new(MAX_NATIVE_STATES)
-    }
-}
-
 impl Context<'_> {
     /// Installs Rust state behind an ordinary global JavaScript wrapper object.
     ///
@@ -560,7 +552,7 @@ fn closed_sentinel() -> *mut FinalizerToken {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Runtime;
+    use super::super::{JscRuntimeLimits, NativeStateLimits, Runtime};
     use super::*;
     use std::cell::Cell;
     use std::mem::{align_of, size_of};
@@ -708,9 +700,12 @@ mod tests {
 
     #[test]
     fn rejected_install_returns_state_before_javascript_publication() {
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+            native_states: NativeStateLimits { registrations: 0 },
+            ..JscRuntimeLimits::default()
+        })
+        .unwrap();
         let shared = Rc::clone(&runtime.shared);
-        shared.native_states.replace(NativeRegistry::new(0));
         let drops = Rc::new(Cell::new(0));
 
         runtime
@@ -750,9 +745,12 @@ mod tests {
 
     #[test]
     fn legacy_install_consumes_a_rejected_state() {
-        let mut runtime = Runtime::new().unwrap();
+        let mut runtime = Runtime::new_with_jsc_limits(JscRuntimeLimits {
+            native_states: NativeStateLimits { registrations: 0 },
+            ..JscRuntimeLimits::default()
+        })
+        .unwrap();
         let shared = Rc::clone(&runtime.shared);
-        shared.native_states.replace(NativeRegistry::new(0));
         let drops = Rc::new(Cell::new(0));
 
         runtime
