@@ -44,6 +44,7 @@ pub struct Attachment {
 #[must_use]
 pub struct DetachReport {
     resources: TerminalResourceReport,
+    drained_native_finalizer_signals: usize,
     callback_drop_panics: usize,
     native_state_drop_panics: usize,
 }
@@ -229,7 +230,7 @@ impl Attachment {
             .gate
             .try_begin_cleanup()
             .map_err(RuntimeError::Host)?;
-        let (released_persistent_roots, released_host_functions, finalized_native_states) =
+        let (released_persistent_roots, released_host_functions, finalizer_drain) =
             self.shared.release_engine_resources(raw);
         cleanup.complete();
         let final_entry = self
@@ -237,7 +238,8 @@ impl Attachment {
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let retired_native_states = finalized_native_states + self.shared.retire_native_states();
+        let retired_native_states =
+            finalizer_drain.retired_native_states() + self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -253,6 +255,7 @@ impl Attachment {
                 0,
             ),
             ResourceLedger::default(),
+            finalizer_drain.signals(),
         ))
     }
 
@@ -278,9 +281,10 @@ impl Attachment {
             .gate
             .finish_drain()
             .map_err(RuntimeError::Host)?;
-        let (unresolved_persistent_roots, unresolved_host_functions, finalized_native_states) =
+        let (unresolved_persistent_roots, unresolved_host_functions, finalizer_drain) =
             self.shared.abandon_engine_resources();
-        let retired_native_states = finalized_native_states + self.shared.retire_native_states();
+        let retired_native_states =
+            finalizer_drain.retired_native_states() + self.shared.retire_native_states();
         self.shared
             .gate
             .mark_destroyed()
@@ -296,6 +300,7 @@ impl Attachment {
                 0,
                 0,
             ),
+            finalizer_drain.signals(),
         ))
     }
 
@@ -331,6 +336,7 @@ impl Attachment {
                 .unwrap_or(FinalEntryOutcome::Unavailable),
             ResourceLedger::default(),
             ResourceLedger::default(),
+            0,
         )
     }
 
@@ -339,6 +345,7 @@ impl Attachment {
         final_entry: FinalEntryOutcome,
         settled: ResourceLedger,
         unresolved: ResourceLedger,
+        drained_native_finalizer_signals: usize,
     ) -> DetachReport {
         DetachReport {
             resources: TerminalResourceReport::new(
@@ -353,6 +360,7 @@ impl Attachment {
                     self.shared.external_buffers.live_bytes(),
                 ),
             ),
+            drained_native_finalizer_signals,
             callback_drop_panics: self.shared.callback_drop_panics.get(),
             native_state_drop_panics: self.shared.native_drop_panics.get(),
         }
@@ -388,6 +396,17 @@ impl DetachReport {
     #[must_use]
     pub const fn resources(&self) -> TerminalResourceReport {
         self.resources
+    }
+
+    /// Returns opaque finalizer signals drained from this detach operation's
+    /// terminal queue-close batch.
+    ///
+    /// This does not count native states directly, every wrapper finalizer, or
+    /// a signal that races after queue close and is discarded by its producer.
+    /// It does not prove that the foreign engine has stopped finalizing.
+    #[must_use]
+    pub const fn drained_native_finalizer_signals(&self) -> usize {
+        self.drained_native_finalizer_signals
     }
 
     /// Returns whether host-authorized final engine cleanup completed.
@@ -460,6 +479,7 @@ pub(super) fn borrowed_global_context(
 
 #[cfg(test)]
 mod tests {
+    use super::super::native_state;
     use super::*;
     use crate::experimental::Runtime;
     use crate::{
@@ -780,7 +800,7 @@ mod tests {
         let owner = ForeignContext::new();
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let mut attachment = Attachment::new(&mut identity, FinalEntryPolicy::Unavailable).unwrap();
-        let handles = unsafe {
+        let (root, function, native, external) = unsafe {
             attachment.with_context(owner.as_raw(), |cx| {
                 let local = cx.eval("({})", "unresolved.js").unwrap();
                 let root = cx.persist(&local).unwrap();
@@ -799,6 +819,15 @@ mod tests {
         }
         .unwrap();
 
+        native_state::enqueue_finalizer_for_test(&attachment.shared, &native);
+        assert_eq!(
+            attachment
+                .resource_snapshot()
+                .unwrap()
+                .pending_native_finalizers(),
+            1
+        );
+
         let report = attachment.detach_without_context().unwrap();
         let resources = report.resources();
         assert_eq!(report.final_entry(), FinalEntryOutcome::Unavailable);
@@ -807,11 +836,12 @@ mod tests {
         assert_eq!(report.unresolved_persistent_roots(), 1);
         assert_eq!(report.unresolved_host_functions(), 1);
         assert_eq!(report.retired_native_states(), 1);
+        assert_eq!(report.drained_native_finalizer_signals(), 1);
         assert_eq!(resources.settled(), ResourceLedger::new(0, 0, 1, 0, 0));
         assert_eq!(resources.unresolved(), ResourceLedger::new(1, 1, 0, 0, 0));
         assert_eq!(resources.remaining(), ResourceLedger::new(0, 0, 0, 1, 4));
         assert_eq!(attachment.state(), HostState::Destroyed);
-        drop(handles);
+        drop((root, function, native, external));
     }
 
     #[test]

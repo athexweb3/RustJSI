@@ -4,7 +4,8 @@
 
 use crate::sys;
 use rustjsi_host::{
-    AttachmentId, EntryGate, EntryGuard, FinalEntryPolicy, GateError, HostState, RuntimeIdentity,
+    AttachmentId, EntryGate, EntryGuard, FinalEntryPolicy, GateError, HostState, ResourceLedger,
+    RuntimeIdentity,
 };
 mod argument_roots;
 #[cfg(test)]
@@ -247,6 +248,23 @@ pub struct JscResourceSnapshot {
 }
 
 impl JscResourceSnapshot {
+    /// Returns the shared typed ledger for resources represented by this snapshot.
+    ///
+    /// Pending releases, finalizer signals, and contained panic counters are
+    /// separate diagnostic observations and are not included in this ledger.
+    /// The external-buffer counters are independently sampled atomics, so their
+    /// pair can describe adjacent instants while JSC deallocation is concurrent.
+    #[must_use]
+    pub const fn resources(&self) -> ResourceLedger {
+        ResourceLedger::new(
+            self.persistent_roots,
+            self.host_function_registrations,
+            self.native_state_registrations,
+            self.external_buffer_allocations,
+            self.external_buffer_bytes,
+        )
+    }
+
     /// Returns live persistent JSC protections, including pending releases.
     #[must_use]
     pub const fn persistent_roots(&self) -> usize {
@@ -1589,9 +1607,9 @@ impl Shared {
         }
     }
 
-    fn drain_native_finalizers(&self) {
+    fn drain_native_finalizers(&self) -> native_state::FinalizerDrain {
         let finalized = self.native_finalizers.take();
-        native_state::reclaim_finalized(self, finalized);
+        native_state::reclaim_finalized(self, finalized)
     }
 
     fn drain_root_releases(&self, context: NonNull<sys::OpaqueContext>) {
@@ -1608,7 +1626,7 @@ impl Shared {
         }
     }
 
-    fn close_native_finalizers(&self) -> usize {
+    fn close_native_finalizers(&self) -> native_state::FinalizerDrain {
         let finalized = self.native_finalizers.close();
         native_state::reclaim_finalized(self, finalized)
     }
@@ -1616,7 +1634,7 @@ impl Shared {
     fn release_engine_resources(
         &self,
         context: NonNull<sys::OpaqueContext>,
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize, native_state::FinalizerDrain) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let root_count = roots.len();
@@ -1632,11 +1650,11 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        let finalized_native_states = self.close_native_finalizers();
-        (root_count, function_count, finalized_native_states)
+        let finalizer_drain = self.close_native_finalizers();
+        (root_count, function_count, finalizer_drain)
     }
 
-    fn abandon_engine_resources(&self) -> (usize, usize, usize) {
+    fn abandon_engine_resources(&self) -> (usize, usize, native_state::FinalizerDrain) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let counts = (roots.len(), functions.len());
@@ -1644,8 +1662,8 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        let finalized_native_states = self.close_native_finalizers();
-        (counts.0, counts.1, finalized_native_states)
+        let finalizer_drain = self.close_native_finalizers();
+        (counts.0, counts.1, finalizer_drain)
     }
 
     fn retire_native_states(&self) -> usize {

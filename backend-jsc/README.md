@@ -71,6 +71,15 @@ and bytes that remain owned by the foreign JSC context. Existing scalar report
 accessors expose the same values for compatibility. None of these counters are
 JSC heap, process allocator, payload-copy, or wrapper-count measurements.
 
+`JscResourceSnapshot::resources()` projects the same five typed resource units
+before detach. Pending root releases, pending finalizer signals, and contained
+destructor-panic counts remain separate observations because they have different
+lifetime and consistency semantics. `DetachReport::drained_native_finalizer_signals()`
+counts the opaque tokens detached by that explicit detach operation's terminal
+queue close. The count is exact for that detached batch, but does not include a
+later signal that observes a closed queue and discards itself; it therefore does
+not establish that the foreign engine has stopped finalizing.
+
 If the foreign owner destroys its context first, a permitted no-entry detach
 still retires RustJSI state without touching JSC. The report conservatively
 counts protections that RustJSI could not release itself; only the foreign owner

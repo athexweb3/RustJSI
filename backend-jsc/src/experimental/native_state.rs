@@ -111,6 +111,29 @@ pub(super) struct FinalizerToken {
     next: AtomicPtr<FinalizerToken>,
 }
 
+/// Exact accounting for one detached finalizer-token list.
+///
+/// This records only tokens handed to the runtime owner by one queue `take` or
+/// `close` operation. It does not include a producer that observes a closed
+/// queue later and discards its token itself.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct FinalizerDrain {
+    signals: usize,
+    retired_native_states: usize,
+}
+
+impl FinalizerDrain {
+    #[must_use]
+    pub(super) const fn signals(self) -> usize {
+        self.signals
+    }
+
+    #[must_use]
+    pub(super) const fn retired_native_states(self) -> usize {
+        self.retired_native_states
+    }
+}
+
 impl<T> fmt::Debug for NativeObject<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("NativeObject(..)")
@@ -541,8 +564,8 @@ impl Context<'_> {
     }
 }
 
-pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken) -> usize {
-    let mut retired = 0;
+pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken) -> FinalizerDrain {
+    let mut report = FinalizerDrain::default();
     while let Some(current) = NonNull::new(token) {
         // SAFETY: The queue transferred unique ownership of this detached list to the
         // runtime thread. `next` was initialized before publication.
@@ -551,10 +574,25 @@ pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken)
         let state = shared.native_states.borrow_mut().remove(boxed.id);
         boxed.queue.settle_pending();
         drop(boxed);
-        retired += usize::from(state.is_some());
+        report.signals = report.signals.saturating_add(1);
+        report.retired_native_states = report
+            .retired_native_states
+            .saturating_add(usize::from(state.is_some()));
         drop_state(shared, state);
     }
-    retired
+    report
+}
+
+#[cfg(test)]
+pub(super) fn enqueue_finalizer_for_test<T>(shared: &Shared, object: &NativeObject<T>) {
+    let token = Box::new(FinalizerToken {
+        queue: Arc::clone(&shared.native_finalizers),
+        id: object.id,
+        next: AtomicPtr::new(ptr::null_mut()),
+    });
+    // SAFETY: Tests transfer one token with the same queue/identity handoff as
+    // the JSC finalizer, without invoking JSC or application destructors here.
+    unsafe { shared.native_finalizers.push(Box::into_raw(token)) };
 }
 
 pub(super) fn drop_states(shared: &Shared, states: Vec<Rc<dyn Any>>) {
@@ -1056,7 +1094,9 @@ mod tests {
                             .pending_native_finalizers(),
                         1
                     );
-                    shared.drain_native_finalizers();
+                    let drained = shared.drain_native_finalizers();
+                    assert_eq!(drained.signals(), 1);
+                    assert_eq!(drained.retired_native_states(), 1);
                     assert_eq!(
                         shared
                             .resource_snapshot()
