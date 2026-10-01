@@ -367,6 +367,9 @@ impl<T> Drop for TerminalMailboxDrain<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::*;
     use crate::{DrainAfter, MailboxEnqueue};
@@ -463,5 +466,48 @@ mod tests {
         let resumed = mailbox.try_begin_terminal_drain().unwrap();
         assert_eq!(resumed.pop(), Some(2));
         resumed.finish().unwrap();
+    }
+
+    #[test]
+    fn concurrent_terminal_claims_grant_one_owner_and_preserve_retryable_work() {
+        let mailbox = Arc::new(ClosableMailbox::new(capacity(1)));
+        assert_eq!(mailbox.enqueue(7), Ok(MailboxEnqueue::Scheduled));
+        let _ = mailbox.begin_close();
+
+        let start = Arc::new(Barrier::new(3));
+        let release_owner = Arc::new(Barrier::new(2));
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let mailbox = Arc::clone(&mailbox);
+            let start = Arc::clone(&start);
+            let release_owner = Arc::clone(&release_owner);
+            let sender = sender.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let result = mailbox.try_begin_terminal_drain();
+                let granted = result.is_ok();
+                sender.send(granted).expect("coordinator must be available");
+                if let Ok(drain) = result {
+                    release_owner.wait();
+                    drop(drain);
+                }
+            }));
+        }
+        drop(sender);
+
+        start.wait();
+        let grants = receiver.iter().take(2).filter(|granted| *granted).count();
+        assert_eq!(grants, 1);
+        release_owner.wait();
+        for worker in workers {
+            worker.join().expect("terminal claimant must not panic");
+        }
+
+        assert_eq!(mailbox.state(), ClosableMailboxState::TerminalPending);
+        let retry = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(retry.pop(), Some(7));
+        retry.finish().unwrap();
     }
 }
