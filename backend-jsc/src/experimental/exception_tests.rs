@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{HostError, JsError, JsException, Runtime};
+use super::{HostError, HostErrorDisclosure, JsError, JsException, Runtime};
 use rustjsi_backend::{BackendBase, BackendError, BackendScope, ValueKind};
 
 fn thrown(runtime: &mut Runtime, source: &str) -> JsException {
@@ -154,6 +154,35 @@ fn outbound_host_errors_are_bounded_before_jsc_string_conversion() {
                 assert_eq!(exposed, expected);
                 assert!(!exposed.contains('\u{fffd}'));
             }
+        })
+        .unwrap();
+}
+
+#[test]
+fn redacted_host_errors_preserve_rust_diagnostics_without_exposing_them_to_javascript() {
+    let diagnostic = "credential=replace-me; tenant=internal";
+    let error = HostError::redacted(diagnostic);
+    assert_eq!(error.message(), diagnostic);
+    assert_eq!(error.to_string(), diagnostic);
+    assert_eq!(error.disclosure(), HostErrorDisclosure::Redacted);
+    assert_eq!(error.javascript_message(), "native host function failed");
+
+    let mut runtime = Runtime::new().unwrap();
+    runtime
+        .with_context(|cx| {
+            let error = error.clone();
+            cx.install_host_function("redacted", move |_| Err(error.clone()))
+                .unwrap();
+            let exposed = cx
+                .eval(
+                    "try { redacted(); } catch (error) { error.message; }",
+                    "redacted-host-error.js",
+                )
+                .unwrap();
+            let exposed = cx.string(&exposed).unwrap();
+            assert_eq!(exposed, "native host function failed");
+            assert!(!exposed.contains("credential"));
+            assert!(!exposed.contains("internal"));
         })
         .unwrap();
 }
