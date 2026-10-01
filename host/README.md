@@ -31,6 +31,16 @@ and unavailable hosts may finish without final entry, and the gate records that
 terminal outcome for diagnostics. The policy is fixed at gate construction;
 the outcome is observed per attachment during teardown.
 
+`TerminalResourceReport` provides fixed-size accounting for resources a backend
+can classify at detach. Its `settled` ledger covers resources released or
+retired by RustJSI, `unresolved` covers engine-dependent resources that could
+not be settled without legal final entry, and `remaining` covers externally
+owned buffers still live after detach. The ledger has explicit units for
+persistent roots, callback registrations, native-state registrations, external
+allocation count, and external bytes. It is neither an engine heap report nor a
+process allocation report; an empty ledger says nothing about JavaScript
+wrappers, temporary values, or other engine memory.
+
 The gate does not establish engine-entry permission, VM locking, or runtime
 identity. An enclosing host must do that before lending a backend, perform
 cleanup when the gate reports drain-ready, and then record invalidation and

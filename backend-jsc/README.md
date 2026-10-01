@@ -62,6 +62,15 @@ allocations, and contained destructor panics. Guaranteed policy rejects that
 path. `Attachment::drop` never enters JSC; callers that need cleanup evidence
 must detach explicitly and retain the report.
 
+`DetachReport::resources()` returns the shared `TerminalResourceReport` with
+three deliberately distinct ledgers. `settled` records persistent roots,
+callbacks, and native state released or retired by the detach operation.
+`unresolved` records JSC-dependent roots and callbacks that could not be
+released without final entry. `remaining` records external buffer allocations
+and bytes that remain owned by the foreign JSC context. Existing scalar report
+accessors expose the same values for compatibility. None of these counters are
+JSC heap, process allocator, payload-copy, or wrapper-count measurements.
+
 If the foreign owner destroys its context first, a permitted no-entry detach
 still retires RustJSI state without touching JSC. The report conservatively
 counts protections that RustJSI could not release itself; only the foreign owner
