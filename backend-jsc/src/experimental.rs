@@ -1607,9 +1607,9 @@ impl Shared {
         }
     }
 
-    fn drain_native_finalizers(&self) {
+    fn drain_native_finalizers(&self) -> native_state::FinalizerDrain {
         let finalized = self.native_finalizers.take();
-        native_state::reclaim_finalized(self, finalized);
+        native_state::reclaim_finalized(self, finalized)
     }
 
     fn drain_root_releases(&self, context: NonNull<sys::OpaqueContext>) {
@@ -1626,7 +1626,7 @@ impl Shared {
         }
     }
 
-    fn close_native_finalizers(&self) -> usize {
+    fn close_native_finalizers(&self) -> native_state::FinalizerDrain {
         let finalized = self.native_finalizers.close();
         native_state::reclaim_finalized(self, finalized)
     }
@@ -1634,7 +1634,7 @@ impl Shared {
     fn release_engine_resources(
         &self,
         context: NonNull<sys::OpaqueContext>,
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize, native_state::FinalizerDrain) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let root_count = roots.len();
@@ -1650,11 +1650,11 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        let finalized_native_states = self.close_native_finalizers();
-        (root_count, function_count, finalized_native_states)
+        let finalizer_drain = self.close_native_finalizers();
+        (root_count, function_count, finalizer_drain)
     }
 
-    fn abandon_engine_resources(&self) -> (usize, usize, usize) {
+    fn abandon_engine_resources(&self) -> (usize, usize, native_state::FinalizerDrain) {
         let roots = self.roots.borrow_mut().drain();
         let functions = std::mem::take(&mut *self.host_functions.borrow_mut());
         let counts = (roots.len(), functions.len());
@@ -1662,8 +1662,8 @@ impl Shared {
         for entry in functions.into_values() {
             self.drop_callback(entry);
         }
-        let finalized_native_states = self.close_native_finalizers();
-        (counts.0, counts.1, finalized_native_states)
+        let finalizer_drain = self.close_native_finalizers();
+        (counts.0, counts.1, finalizer_drain)
     }
 
     fn retire_native_states(&self) -> usize {
