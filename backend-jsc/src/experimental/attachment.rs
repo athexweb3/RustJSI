@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::local_roots::LocalRoots;
-use super::{ActiveEntryFrame, Context, RootLimits, RuntimeError, Shared, sys};
+use super::{ActiveEntryFrame, CallLimits, Context, RootLimits, RuntimeError, Shared, sys};
 use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -62,10 +62,16 @@ impl Attachment {
         identity: &mut RuntimeIdentity,
         final_entry_policy: FinalEntryPolicy,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_root_limits(identity, final_entry_policy, RootLimits::default())
+        Self::new_with_limits(
+            identity,
+            final_entry_policy,
+            RootLimits::default(),
+            CallLimits::default(),
+        )
     }
 
     /// Creates attachment state with independent persistent and local root budgets.
+    /// Per-call data limits remain at their defaults.
     ///
     /// # Errors
     ///
@@ -75,11 +81,25 @@ impl Attachment {
         final_entry_policy: FinalEntryPolicy,
         limits: RootLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_limits(identity, final_entry_policy, limits, CallLimits::default())
+    }
+
+    /// Creates attachment state with independent root and per-call data limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error if the issuer cannot allocate another epoch.
+    pub fn new_with_limits(
+        identity: &mut RuntimeIdentity,
+        final_entry_policy: FinalEntryPolicy,
+        root_limits: RootLimits,
+        call_limits: CallLimits,
+    ) -> Result<Self, RuntimeError> {
         let id = identity
             .next_attachment()
             .map_err(|_| RuntimeError::IdentityExhausted)?;
         Ok(Self {
-            shared: Shared::new(id, final_entry_policy, limits),
+            shared: Shared::new(id, final_entry_policy, root_limits, call_limits),
         })
     }
 
@@ -363,7 +383,7 @@ pub(super) fn borrowed_global_context(
 mod tests {
     use super::*;
     use crate::experimental::Runtime;
-    use crate::{Value, sys};
+    use crate::{JsError, Value, sys};
     use std::cell::Cell;
 
     struct ForeignContext(NonNull<sys::OpaqueContext>);
@@ -433,6 +453,43 @@ mod tests {
                 .final_entry(),
             FinalEntryOutcome::Completed
         );
+    }
+
+    #[test]
+    fn foreign_attachment_applies_call_data_limits() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new_with_limits(
+            &mut identity,
+            FinalEntryPolicy::Guaranteed,
+            RootLimits::default(),
+            CallLimits {
+                arguments: 0,
+                string_utf8_bytes: 0,
+            },
+        )
+        .unwrap();
+        let calls = Rc::new(Cell::new(0));
+
+        unsafe {
+            attachment
+                .with_context(owner.as_raw(), |cx| {
+                    let callback_calls = Rc::clone(&calls);
+                    let function = cx
+                        .install_host_function("attachmentLimited", move |_| {
+                            callback_calls.set(callback_calls.get() + 1);
+                            Ok(Value::Undefined)
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        cx.call(&function, &[Value::Number(42.0)]).unwrap_err(),
+                        JsError::Runtime(RuntimeError::CallArgumentLimitReached)
+                    );
+                    assert_eq!(calls.get(), 0);
+                })
+                .unwrap();
+            let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
+        }
     }
 
     #[test]

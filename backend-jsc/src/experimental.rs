@@ -73,6 +73,57 @@ impl Default for RootLimits {
     }
 }
 
+/// Per-call data admission limits for an experimental JSC attachment.
+///
+/// These limits are checked before string conversion, temporary argument-array
+/// allocation, local-root reservation, or target invocation. They bound one
+/// `Context::call` request; they do not account for caller-owned Rust inputs,
+/// JavaScript heap allocation, callback execution time, or exception capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallLimits {
+    /// Maximum argument count accepted by one [`Context::call`] invocation.
+    pub arguments: usize,
+    /// Maximum total UTF-8 bytes accepted from string arguments by one call.
+    ///
+    /// This conservatively bounds the later UTF-16 conversion input without a
+    /// second traversal of every string payload.
+    pub string_utf8_bytes: usize,
+}
+
+impl Default for CallLimits {
+    fn default() -> Self {
+        Self {
+            arguments: 4096,
+            string_utf8_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+impl CallLimits {
+    fn validate(self, arguments: &[Value]) -> Result<usize, RuntimeError> {
+        if arguments.len() > self.arguments {
+            return Err(RuntimeError::CallArgumentLimitReached);
+        }
+
+        let mut string_arguments = 0;
+        let mut string_utf8_bytes: usize = 0;
+        for argument in arguments {
+            let Value::String(string) = argument else {
+                continue;
+            };
+            string_arguments += 1;
+            string_utf8_bytes = string_utf8_bytes
+                .checked_add(string.len())
+                .ok_or(RuntimeError::CallStringDataLimitReached)?;
+        }
+        if string_utf8_bytes > self.string_utf8_bytes {
+            return Err(RuntimeError::CallStringDataLimitReached);
+        }
+
+        Ok(string_arguments)
+    }
+}
+
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
     static ACTIVE_CONTEXT: Cell<sys::ContextRef> = const { Cell::new(ptr::null()) };
@@ -236,6 +287,10 @@ pub enum RuntimeError {
     PersistentRootLimitReached,
     /// No local value reservation is available within the configured limit.
     LocalRootLimitReached,
+    /// A call has more arguments than its configured admission limit.
+    CallArgumentLimitReached,
+    /// A call exceeds its configured string conversion data limit.
+    CallStringDataLimitReached,
     /// The experimental limit of 4096 retained host functions was reached.
     HostFunctionLimitReached,
 }
@@ -264,6 +319,7 @@ struct Shared {
     gate: EntryGate,
     roots: RefCell<RootRegistry>,
     local_budget: LocalBudget,
+    call_limits: CallLimits,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
@@ -348,7 +404,7 @@ struct JsString(NonNull<sys::OpaqueString>);
 impl Runtime {
     /// Creates an isolated `JavaScriptCore` global context.
     ///
-    /// Uses limits of 4096 persistent registry slots and 4096 local root slots.
+    /// Uses default root and per-call data admission limits.
     ///
     /// # Errors
     ///
@@ -364,7 +420,7 @@ impl Runtime {
     /// disables new persistent roots; locals and JavaScript execution still work.
     /// The limit doesn't reserve memory or bound local roots, lease clones, native
     /// registrations or the JavaScript heap. It cannot change after creation.
-    /// The local root limit remains at its default of 4096.
+    /// The local root and per-call data limits remain at their defaults.
     ///
     /// # Errors
     ///
@@ -383,17 +439,35 @@ impl Runtime {
     /// if the result is scalar. Exceptions and unwind return unused reservations.
     /// Scope exit returns committed local slots. String arguments reserve slots
     /// for the call duration. These limits do not bound heap bytes, scalar
-    /// argument storage, callback registrations or exception metadata.
+    /// argument storage, callback registrations or exception metadata. Per-call
+    /// argument count and string conversion data remain at their defaults.
     ///
     /// # Errors
     ///
     /// Returns a creation or runtime-identity error if initialization fails.
     pub fn new_with_root_limits(limits: RootLimits) -> Result<Self, RuntimeError> {
+        Self::new_with_limits(limits, CallLimits::default())
+    }
+
+    /// Creates a runtime with independent root and per-call data limits.
+    ///
+    /// Call admission rejects excessive argument counts and string input data
+    /// before engine conversion, root reservation, allocation,
+    /// or target invocation. These limits do not bound caller-owned inputs,
+    /// JavaScript heap allocation, callback execution time, or exceptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a creation or runtime-identity error if initialization fails.
+    pub fn new_with_limits(
+        root_limits: RootLimits,
+        call_limits: CallLimits,
+    ) -> Result<Self, RuntimeError> {
         let id = Self::allocate_owned_attachment_id()?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
-        Self::from_owned_context(id, limits, context)
+        Self::from_owned_context(id, root_limits, call_limits, context)
     }
 
     #[cfg(test)]
@@ -405,7 +479,7 @@ impl Runtime {
         // each runtime it creates. A null class requests the default global class.
         let context =
             unsafe { sys::global_context_create_in_group(group.as_ptr(), ptr::null_mut()) };
-        Self::from_owned_context(id, RootLimits::default(), context)
+        Self::from_owned_context(id, RootLimits::default(), CallLimits::default(), context)
     }
 
     fn allocate_owned_attachment_id() -> Result<AttachmentId, RuntimeError> {
@@ -418,7 +492,8 @@ impl Runtime {
 
     fn from_owned_context(
         id: AttachmentId,
-        limits: RootLimits,
+        root_limits: RootLimits,
+        call_limits: CallLimits,
         context: sys::GlobalContextRef,
     ) -> Result<Self, RuntimeError> {
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
@@ -431,7 +506,7 @@ impl Runtime {
         };
 
         Ok(Self {
-            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, limits),
+            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, root_limits, call_limits),
             context: Some(context),
             context_group,
         })
@@ -744,15 +819,16 @@ impl<'cx> Context<'cx> {
             .map(|entry| entry.function)
             .ok_or(JsError::Runtime(RuntimeError::StaleHandle))?;
 
+        let string_arguments = self
+            .shared
+            .call_limits
+            .validate(arguments)
+            .map_err(JsError::Runtime)?;
         let reservation = self
             .shared
             .local_budget
             .reserve()
             .map_err(JsError::Runtime)?;
-        let string_arguments = arguments
-            .iter()
-            .filter(|value| matches!(value, Value::String(_)))
-            .count();
         let argument_reservation = self
             .shared
             .local_budget
@@ -1094,6 +1170,8 @@ impl fmt::Display for RuntimeError {
             Self::ScopeDepthExceeded => "Context scope depth limit exceeded",
             Self::PersistentRootLimitReached => "persistent root slot limit reached",
             Self::LocalRootLimitReached => "local result root limit reached",
+            Self::CallArgumentLimitReached => "call argument limit reached",
+            Self::CallStringDataLimitReached => "call string data limit reached",
             Self::HostFunctionLimitReached => "host function registration limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
@@ -1132,13 +1210,19 @@ impl Error for JsError {
 }
 
 impl Shared {
-    fn new(id: AttachmentId, final_entry_policy: FinalEntryPolicy, limits: RootLimits) -> Rc<Self> {
+    fn new(
+        id: AttachmentId,
+        final_entry_policy: FinalEntryPolicy,
+        root_limits: RootLimits,
+        call_limits: CallLimits,
+    ) -> Rc<Self> {
         Rc::new(Self {
             id,
             owner: thread::current().id(),
             gate: EntryGate::new(ENTRY_LIMIT, final_entry_policy),
-            roots: RefCell::new(RootRegistry::new(limits.persistent_slots)),
-            local_budget: LocalBudget::new(limits.local_roots),
+            roots: RefCell::new(RootRegistry::new(root_limits.persistent_slots)),
+            local_budget: LocalBudget::new(root_limits.local_roots),
+            call_limits,
             host_functions: RefCell::new(HashMap::new()),
             native_states: RefCell::new(native_state::NativeRegistry::default()),
             native_finalizers: Arc::new(native_state::FinalizerQueue::new()),

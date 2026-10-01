@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{HostError, JsError, RootLimits, Runtime, RuntimeError, Value};
+use super::{CallLimits, HostError, JsError, RootLimits, Runtime, RuntimeError, Value};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -91,6 +91,96 @@ fn argument_admission_is_atomic_and_refunds_the_result_slot() {
             assert_eq!(
                 cx.call(&function, &three).unwrap_err(),
                 JsError::Runtime(RuntimeError::LocalRootLimitReached)
+            );
+            assert_eq!(calls.get(), 1);
+            assert_eq!(shared.argument_roots.get(), 0);
+            assert_eq!(shared.local_budget.used(), 0);
+        })
+        .unwrap();
+}
+
+#[test]
+fn argument_count_limit_rejects_before_root_admission_or_target_invocation() {
+    let mut runtime = Runtime::new_with_limits(
+        RootLimits {
+            persistent_slots: 1,
+            local_roots: 1,
+        },
+        CallLimits {
+            arguments: 1,
+            string_utf8_bytes: usize::MAX,
+        },
+    )
+    .unwrap();
+    let calls = Rc::new(Cell::new(0));
+    let shared = Rc::clone(&runtime.shared);
+
+    runtime
+        .with_context(|cx| {
+            let callback_calls = Rc::clone(&calls);
+            let function = cx
+                .install_host_function("countLimited", move |_| {
+                    callback_calls.set(callback_calls.get() + 1);
+                    Ok(Value::Undefined)
+                })
+                .unwrap();
+
+            assert_eq!(
+                cx.call(&function, &[Value::Number(1.0), Value::Number(2.0)])
+                    .unwrap_err(),
+                JsError::Runtime(RuntimeError::CallArgumentLimitReached)
+            );
+            assert_eq!(calls.get(), 0);
+            assert_eq!(shared.argument_roots.get(), 0);
+            assert_eq!(shared.local_budget.used(), 0);
+
+            cx.call(&function, &[Value::Number(42.0)]).unwrap();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(shared.local_budget.used(), 0);
+        })
+        .unwrap();
+}
+
+#[test]
+fn string_data_limit_counts_utf8_bytes_across_arguments_before_conversion() {
+    let mut runtime = Runtime::new_with_limits(
+        RootLimits {
+            persistent_slots: 1,
+            local_roots: 3,
+        },
+        CallLimits {
+            arguments: 2,
+            string_utf8_bytes: 4,
+        },
+    )
+    .unwrap();
+    let calls = Rc::new(Cell::new(0));
+    let shared = Rc::clone(&runtime.shared);
+
+    runtime
+        .with_context(|cx| {
+            let callback_calls = Rc::clone(&calls);
+            let function = cx
+                .install_host_function("countStringData", move |call| {
+                    callback_calls.set(callback_calls.get() + 1);
+                    assert_eq!(call.len(), 1);
+                    Ok(Value::Number(42.0))
+                })
+                .unwrap();
+
+            let exact = cx.call(&function, &[Value::String("🦀".into())]).unwrap();
+            assert_eq!(cx.number(&exact).unwrap().to_bits(), 42.0_f64.to_bits());
+            assert_eq!(calls.get(), 1);
+            assert_eq!(shared.argument_roots.get(), 0);
+            assert_eq!(shared.local_budget.used(), 0);
+
+            assert_eq!(
+                cx.call(
+                    &function,
+                    &[Value::String("🦀".into()), Value::String("x".into())],
+                )
+                .unwrap_err(),
+                JsError::Runtime(RuntimeError::CallStringDataLimitReached)
             );
             assert_eq!(calls.get(), 1);
             assert_eq!(shared.argument_roots.get(), 0);
