@@ -262,6 +262,53 @@ class SampleTests(unittest.TestCase):
             0,
         )
 
+    def test_batch_quantile_intervals_are_process_scoped(self):
+        samples = balanced_samples()
+        cases = (
+            (
+                "callback_batch_latency",
+                "callback_batches",
+                "rustjsi_experimental",
+                500,
+            ),
+            (
+                "js_call_batch_latency",
+                "js_call_batches",
+                "rustjsi_common_js_call",
+                500,
+            ),
+            (
+                "entry_batch_latency",
+                "entry_batches",
+                "host_gate_admit_and_exit",
+                40,
+            ),
+        )
+        for _, source, metric, outlier in cases:
+            samples[0][source][metric][-11:] = [outlier] * 11
+
+        report = boundary.summarize(samples)
+
+        for section, _, metric, outlier in cases:
+            with self.subTest(section=section, metric=metric):
+                latency = report[section]["metrics"][metric]
+                quantiles = latency["per_process_batch_quantiles"]
+                p99 = quantiles["quantiles"]["p99"]
+                self.assertEqual(
+                    quantiles["sample_kind"],
+                    "per_process_contiguous_batch_quantile",
+                )
+                self.assertEqual(quantiles["independent_unit"], "benchmark_process")
+                self.assertEqual(quantiles["processes"], 12)
+                self.assertEqual(quantiles["batches_per_process"], 1000)
+                self.assertEqual(p99["samples"], 12)
+                self.assertEqual(p99["max"], outlier)
+                self.assertEqual(
+                    p99["confidence_interval"]["independent_unit"],
+                    "benchmark_process",
+                )
+                self.assertNotIn("confidence_interval", latency)
+
     def test_callback_tail_is_a_block_mean_not_an_individual_call_tail(self):
         samples = balanced_samples()
         samples[0]["callback_batches"]["rustjsi_experimental"][-1] = 500
@@ -829,7 +876,7 @@ class ArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {
-                "schema": 10,
+                "schema": boundary.SCHEMA - 1,
                 "benchmark": "boundary",
                 "runs": 12,
                 "source": {"head": "before"},

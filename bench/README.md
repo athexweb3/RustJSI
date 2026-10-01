@@ -111,6 +111,14 @@ individual call or entry latencies. Batching amortizes timestamp reads enough
 to expose scheduler and frequency disturbances without placing a timer around
 every operation. It can hide single-operation spikes inside a block.
 
+Each block-latency metric also reports `per_process_batch_quantiles`. It first
+calculates p50, p95 and p99 from the 1,000 contiguous batch means in each
+process, then summarizes those independent process-local quantile estimates
+with deterministic confidence intervals. This makes the uncertainty scope
+explicit: the intervals describe variation across process-local block
+quantiles. They are not confidence intervals for the pooled block quantile and
+are not individual-call or individual-entry tail intervals.
+
 `js_call_batch_latency` applies the same block-mean model to the direct and
 common scoped-call pair. `js_call_position_effects` reports each workload in
 first and second position. Neither section is an individual-call tail model.
@@ -134,7 +142,8 @@ pairing inside a ratio. These intervals quantify sampling uncertainty for this
 collector; they do not correct uncontrolled power, thermal, scheduler, or
 engine variation, and they do not qualify a performance gate. Block-mean and
 calibration distributions intentionally have no confidence intervals because
-their observations are correlated within a process. No individual-call
+their observations are correlated within a process. The separate process-local
+block-quantile summaries use one estimate from each process. No individual-call
 distribution exists here, so `individual_call_p99` remains absent. JavaScriptCore
 allocation, payload-copy, and regression-gate work also remains open.
 
