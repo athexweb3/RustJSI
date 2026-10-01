@@ -55,7 +55,7 @@ pub use attachment::{Attachment, DetachReport};
 pub use common::{JscBackend, JscBackendFamily, JscRoot, JscScope, JscValue};
 pub use external_buffer::ExternalBuffer;
 pub use host_adapter::{JscAttachedHost, JscEntrySource, JscHostError};
-pub use native_state::NativeObject;
+pub use native_state::{NativeObject, NativeStateInstallError};
 
 /// Creation-time root admission limits for an experimental JSC attachment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,6 +364,8 @@ pub enum RuntimeError {
     ExternalBufferByteLimitReached,
     /// The experimental limit of 4096 retained host functions was reached.
     HostFunctionLimitReached,
+    /// No native-state registration is available within the experimental limit.
+    NativeStateRegistrationLimitReached,
 }
 
 /// A `JavaScriptCore` operation failure.
@@ -1311,6 +1313,7 @@ impl fmt::Display for RuntimeError {
             }
             Self::ExternalBufferByteLimitReached => "external-buffer byte limit reached",
             Self::HostFunctionLimitReached => "host function registration limit reached",
+            Self::NativeStateRegistrationLimitReached => "native-state registration limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
         formatter.write_str(message)

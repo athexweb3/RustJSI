@@ -712,6 +712,9 @@ fn map_runtime_error(error: RuntimeError) -> BackendError {
         RuntimeError::HostFunctionLimitReached => {
             BackendError::Failure("host function registration limit reached")
         }
+        RuntimeError::NativeStateRegistrationLimitReached => {
+            BackendError::Failure("native-state registration limit reached")
+        }
     }
 }
 
