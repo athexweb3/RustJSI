@@ -24,6 +24,8 @@ mod external_buffer;
 #[cfg(test)]
 mod external_buffer_transfer_tests;
 mod host_adapter;
+#[cfg(test)]
+mod inbound_callback_tests;
 mod local_budget;
 #[cfg(test)]
 mod local_budget_tests;
@@ -136,6 +138,47 @@ pub struct ExternalBufferLimits {
     pub allocations: usize,
     /// Maximum live Rust-owned bytes transferred to JSC.
     pub bytes: usize,
+}
+
+/// Data-admission limits for one JavaScript-to-Rust host callback.
+///
+/// The argument limit is checked before the Rust callback is invoked. String
+/// data is charged only after JSC coercion completes and a full UTF-8 string
+/// has been copied into Rust. These limits do not bound JavaScript argument
+/// creation, JSC coercion work or allocation, user callback work, or exception
+/// capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundCallbackLimits {
+    /// Maximum arguments accepted by one host callback invocation.
+    pub arguments: usize,
+    /// Maximum total UTF-8 bytes returned by [`Call::string`] in one callback.
+    pub string_utf8_bytes: usize,
+}
+
+impl Default for InboundCallbackLimits {
+    fn default() -> Self {
+        Self {
+            arguments: 4096,
+            string_utf8_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// Aggregate creation-time limits for an experimental JSC runtime or attachment.
+///
+/// Each field governs a distinct resource direction or lifetime. In particular,
+/// [`Self::outbound_call`] does not govern values read by a Rust host callback;
+/// [`Self::inbound_callback`] governs that separate JavaScript-to-Rust path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JscRuntimeLimits {
+    /// Persistent and scoped JSC root admission limits.
+    pub roots: RootLimits,
+    /// Per-request Rust-to-JavaScript call-data limits.
+    pub outbound_call: CallLimits,
+    /// Live Rust-owned byte-buffer transfer limits.
+    pub external_buffers: ExternalBufferLimits,
+    /// Per-callback JavaScript-to-Rust data limits.
+    pub inbound_callback: InboundCallbackLimits,
 }
 
 impl Default for ExternalBufferLimits {
@@ -252,6 +295,7 @@ pub struct HostFunction {
 pub struct Call<'call> {
     raw_context: NonNull<sys::OpaqueContext>,
     arguments: &'call [sys::ValueRef],
+    string_utf8_bytes_remaining: Cell<usize>,
     _affine: PhantomData<Rc<()>>,
 }
 
@@ -347,6 +391,7 @@ struct Shared {
     roots: RefCell<RootRegistry>,
     local_budget: LocalBudget,
     call_limits: CallLimits,
+    inbound_callback_limits: InboundCallbackLimits,
     host_functions: RefCell<HashMap<usize, HostFunctionEntry>>,
     native_states: RefCell<native_state::NativeRegistry>,
     native_finalizers: Arc<native_state::FinalizerQueue>,
@@ -437,7 +482,7 @@ impl Runtime {
     ///
     /// Returns [`RuntimeError::CreationFailed`] if JSC cannot create the context.
     pub fn new() -> Result<Self, RuntimeError> {
-        Self::new_with_root_limits(RootLimits::default())
+        Self::new_with_jsc_limits(JscRuntimeLimits::default())
     }
 
     /// Creates a runtime with a persistent registry slot limit.
@@ -473,7 +518,10 @@ impl Runtime {
     ///
     /// Returns a creation or runtime-identity error if initialization fails.
     pub fn new_with_root_limits(limits: RootLimits) -> Result<Self, RuntimeError> {
-        Self::new_with_limits(limits, CallLimits::default())
+        Self::new_with_jsc_limits(JscRuntimeLimits {
+            roots: limits,
+            ..JscRuntimeLimits::default()
+        })
     }
 
     /// Creates a runtime with independent root and per-call data limits.
@@ -490,11 +538,11 @@ impl Runtime {
         root_limits: RootLimits,
         call_limits: CallLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_external_buffer_limits(
-            root_limits,
-            call_limits,
-            ExternalBufferLimits::default(),
-        )
+        Self::new_with_jsc_limits(JscRuntimeLimits {
+            roots: root_limits,
+            outbound_call: call_limits,
+            ..JscRuntimeLimits::default()
+        })
     }
 
     /// Creates a runtime with root, call-data, and external-buffer limits.
@@ -512,17 +560,29 @@ impl Runtime {
         call_limits: CallLimits,
         external_buffer_limits: ExternalBufferLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_jsc_limits(JscRuntimeLimits {
+            roots: root_limits,
+            outbound_call: call_limits,
+            external_buffers: external_buffer_limits,
+            ..JscRuntimeLimits::default()
+        })
+    }
+
+    /// Creates a runtime with all currently configurable JSC admission limits.
+    ///
+    /// These limits have distinct directions and ownership boundaries. They do
+    /// not set a JavaScript heap limit, interrupt JavaScript execution, or bound
+    /// work JSC performs while coercing a callback argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns a creation or runtime-identity error if initialization fails.
+    pub fn new_with_jsc_limits(limits: JscRuntimeLimits) -> Result<Self, RuntimeError> {
         let id = Self::allocate_owned_attachment_id()?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
-        Self::from_owned_context(
-            id,
-            root_limits,
-            call_limits,
-            external_buffer_limits,
-            context,
-        )
+        Self::from_owned_context(id, limits, context)
     }
 
     #[cfg(test)]
@@ -534,13 +594,7 @@ impl Runtime {
         // each runtime it creates. A null class requests the default global class.
         let context =
             unsafe { sys::global_context_create_in_group(group.as_ptr(), ptr::null_mut()) };
-        Self::from_owned_context(
-            id,
-            RootLimits::default(),
-            CallLimits::default(),
-            ExternalBufferLimits::default(),
-            context,
-        )
+        Self::from_owned_context(id, JscRuntimeLimits::default(), context)
     }
 
     fn allocate_owned_attachment_id() -> Result<AttachmentId, RuntimeError> {
@@ -553,9 +607,7 @@ impl Runtime {
 
     fn from_owned_context(
         id: AttachmentId,
-        root_limits: RootLimits,
-        call_limits: CallLimits,
-        external_buffer_limits: ExternalBufferLimits,
+        limits: JscRuntimeLimits,
         context: sys::GlobalContextRef,
     ) -> Result<Self, RuntimeError> {
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
@@ -568,13 +620,7 @@ impl Runtime {
         };
 
         Ok(Self {
-            shared: Shared::new(
-                id,
-                FinalEntryPolicy::Guaranteed,
-                root_limits,
-                call_limits,
-                external_buffer_limits,
-            ),
+            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, limits),
             context: Some(context),
             context_group,
         })
@@ -1160,10 +1206,22 @@ impl Call<'_> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the argument is missing or conversion fails.
+    /// Returns an error when the argument is missing, conversion fails, or the
+    /// callback's cumulative copied UTF-8 data would exceed its admission limit.
     pub fn string(&self, index: usize) -> Result<String, HostError> {
-        value_to_string(self.raw_context, self.argument(index)?)
-            .map_err(|error| HostError::from_js(&error))
+        let remaining = self.string_utf8_bytes_remaining.get();
+        match value_to_string_with_inbound_limit(self.raw_context, self.argument(index)?, remaining)
+        {
+            Ok(value) => {
+                self.string_utf8_bytes_remaining
+                    .set(remaining - value.len());
+                Ok(value)
+            }
+            Err(InboundStringError::LimitReached) => {
+                Err(HostError::inbound_callback_string_data_limit_reached())
+            }
+            Err(InboundStringError::Js(error)) => Err(HostError::from_js(&error)),
+        }
     }
 
     fn argument(&self, index: usize) -> Result<sys::ValueRef, HostError> {
@@ -1191,6 +1249,14 @@ impl HostError {
 
     fn from_js(error: &JsError) -> Self {
         Self::new(error.to_string())
+    }
+
+    fn inbound_callback_argument_limit_reached() -> Self {
+        Self::new("inbound callback argument limit reached")
+    }
+
+    fn inbound_callback_string_data_limit_reached() -> Self {
+        Self::new("inbound callback string data limit reached")
     }
 }
 
@@ -1285,17 +1351,16 @@ impl Shared {
     fn new(
         id: AttachmentId,
         final_entry_policy: FinalEntryPolicy,
-        root_limits: RootLimits,
-        call_limits: CallLimits,
-        external_buffer_limits: ExternalBufferLimits,
+        limits: JscRuntimeLimits,
     ) -> Rc<Self> {
         Rc::new(Self {
             id,
             owner: thread::current().id(),
             gate: EntryGate::new(ENTRY_LIMIT, final_entry_policy),
-            roots: RefCell::new(RootRegistry::new(root_limits.persistent_slots)),
-            local_budget: LocalBudget::new(root_limits.local_roots),
-            call_limits,
+            roots: RefCell::new(RootRegistry::new(limits.roots.persistent_slots)),
+            local_budget: LocalBudget::new(limits.roots.local_roots),
+            call_limits: limits.outbound_call,
+            inbound_callback_limits: limits.inbound_callback,
             host_functions: RefCell::new(HashMap::new()),
             native_states: RefCell::new(native_state::NativeRegistry::default()),
             native_finalizers: Arc::new(native_state::FinalizerQueue::new()),
@@ -1308,7 +1373,7 @@ impl Shared {
             #[cfg(test)]
             argument_gc: Cell::new(false),
             external_buffers: Arc::new(external_buffer::ExternalLedger::new(
-                external_buffer_limits,
+                limits.external_buffers,
             )),
         })
     }
@@ -1708,6 +1773,9 @@ unsafe extern "C" fn host_function_callback(
             // synchronous callback frame. `Call` cannot escape the callback.
             unsafe { std::slice::from_raw_parts(arguments, argument_count) }
         };
+        if argument_count > shared.inbound_callback_limits.arguments {
+            return Err(HostError::inbound_callback_argument_limit_reached());
+        }
         let key = function as usize;
         let callback = shared
             .host_functions
@@ -1719,6 +1787,9 @@ unsafe extern "C" fn host_function_callback(
             raw_context: NonNull::new(context.cast_mut())
                 .ok_or_else(|| HostError::new("JSC supplied a null context"))?,
             arguments,
+            string_utf8_bytes_remaining: Cell::new(
+                shared.inbound_callback_limits.string_utf8_bytes,
+            ),
             _affine: PhantomData,
         })
     }));
@@ -1808,12 +1879,37 @@ fn value_to_string(
     if !exception.is_null() {
         return Err(JsError::Exception(exception_to_owned(context, exception)));
     }
-    let string =
-        NonNull::new(string).ok_or(JsError::Backend("JavaScriptCore returned a null string"))?;
-    let result = copy_js_string(string);
-    // SAFETY: `value_to_string_copy` returned one owned string reference.
-    unsafe { sys::string_release(string.as_ptr()) };
-    result
+    let string = JsString(
+        NonNull::new(string).ok_or(JsError::Backend("JavaScriptCore returned a null string"))?,
+    );
+    copy_js_string(string.0)
+}
+
+enum InboundStringError {
+    Js(JsError),
+    LimitReached,
+}
+
+fn value_to_string_with_inbound_limit(
+    context: NonNull<sys::OpaqueContext>,
+    value: sys::ValueRef,
+    remaining_utf8_bytes: usize,
+) -> Result<String, InboundStringError> {
+    let mut exception = ptr::null();
+    // SAFETY: Both handles are live for this synchronous conversion; any JavaScript
+    // exception is captured instead of crossing Rust.
+    let string = unsafe { sys::value_to_string_copy(context.as_ptr(), value, &raw mut exception) };
+    if !exception.is_null() {
+        return Err(InboundStringError::Js(JsError::Exception(
+            exception_to_owned(context, exception),
+        )));
+    }
+    let string = JsString(
+        NonNull::new(string).ok_or(InboundStringError::Js(JsError::Backend(
+            "JavaScriptCore returned a null string",
+        )))?,
+    );
+    copy_js_string_with_limit(string.0, remaining_utf8_bytes)
 }
 
 fn exception_to_owned(
@@ -1862,6 +1958,53 @@ fn copy_js_string(string: NonNull<sys::OpaqueString>) -> Result<String, JsError>
     }
     bytes.truncate(written - 1);
     String::from_utf8(bytes).map_err(|_| JsError::Backend("JSC produced invalid UTF-8"))
+}
+
+fn copy_js_string_with_limit(
+    string: NonNull<sys::OpaqueString>,
+    remaining_utf8_bytes: usize,
+) -> Result<String, InboundStringError> {
+    // SAFETY: `string` is live for both calls below.
+    let maximum = unsafe { sys::string_maximum_utf8_size(string.as_ptr()) };
+    if maximum == 0 {
+        return Err(InboundStringError::Js(JsError::Backend(
+            "JavaScriptCore reported an invalid string size",
+        )));
+    }
+
+    // JSC needs one byte for the terminating NUL. On an unbounded `usize` limit,
+    // use the engine-reported maximum rather than overflowing the extra-byte probe.
+    let capacity = maximum.min(remaining_utf8_bytes.checked_add(1).unwrap_or(maximum));
+    let mut bytes = vec![0_u8; capacity];
+    // SAFETY: The buffer contains `capacity` writable bytes. JSC permits partial
+    // conversion into a smaller buffer and writes a terminating NUL on success.
+    let written =
+        unsafe { sys::string_get_utf8(string.as_ptr(), bytes.as_mut_ptr().cast(), capacity) };
+    if written == 0 || written > capacity {
+        return Err(InboundStringError::Js(JsError::Backend(
+            "JavaScriptCore string conversion failed",
+        )));
+    }
+    bytes.truncate(written - 1);
+    let value = String::from_utf8(bytes)
+        .map_err(|_| InboundStringError::Js(JsError::Backend("JSC produced invalid UTF-8")))?;
+    // SAFETY: The string is live. JSC reports UTF-16 code units, while the copied
+    // Rust string provides the only complete UTF-8 data this callback may observe.
+    let original_units = unsafe { sys::string_length(string.as_ptr()) };
+    let copied_units = if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    };
+    if copied_units < original_units {
+        return Err(InboundStringError::LimitReached);
+    }
+    if value.len() > remaining_utf8_bytes {
+        return Err(InboundStringError::Js(JsError::Backend(
+            "JavaScriptCore exceeded the inbound string data limit",
+        )));
+    }
+    Ok(value)
 }
 
 fn value_to_raw(

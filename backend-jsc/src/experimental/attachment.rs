@@ -2,8 +2,8 @@
 
 use super::local_roots::LocalRoots;
 use super::{
-    ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, RootLimits, RuntimeError, Shared,
-    sys,
+    ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, JscRuntimeLimits, RootLimits,
+    RuntimeError, Shared, sys,
 };
 use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
 use std::ffi::c_void;
@@ -65,12 +65,7 @@ impl Attachment {
         identity: &mut RuntimeIdentity,
         final_entry_policy: FinalEntryPolicy,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_limits(
-            identity,
-            final_entry_policy,
-            RootLimits::default(),
-            CallLimits::default(),
-        )
+        Self::new_with_jsc_limits(identity, final_entry_policy, JscRuntimeLimits::default())
     }
 
     /// Creates attachment state with independent persistent and local root budgets.
@@ -84,7 +79,14 @@ impl Attachment {
         final_entry_policy: FinalEntryPolicy,
         limits: RootLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_limits(identity, final_entry_policy, limits, CallLimits::default())
+        Self::new_with_jsc_limits(
+            identity,
+            final_entry_policy,
+            JscRuntimeLimits {
+                roots: limits,
+                ..JscRuntimeLimits::default()
+            },
+        )
     }
 
     /// Creates attachment state with independent root and per-call data limits.
@@ -98,12 +100,14 @@ impl Attachment {
         root_limits: RootLimits,
         call_limits: CallLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_external_buffer_limits(
+        Self::new_with_jsc_limits(
             identity,
             final_entry_policy,
-            root_limits,
-            call_limits,
-            ExternalBufferLimits::default(),
+            JscRuntimeLimits {
+                roots: root_limits,
+                outbound_call: call_limits,
+                ..JscRuntimeLimits::default()
+            },
         )
     }
 
@@ -123,17 +127,36 @@ impl Attachment {
         call_limits: CallLimits,
         external_buffer_limits: ExternalBufferLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_jsc_limits(
+            identity,
+            final_entry_policy,
+            JscRuntimeLimits {
+                roots: root_limits,
+                outbound_call: call_limits,
+                external_buffers: external_buffer_limits,
+                ..JscRuntimeLimits::default()
+            },
+        )
+    }
+
+    /// Creates attachment state with all currently configurable JSC admission limits.
+    ///
+    /// The host remains responsible for `JavaScriptCore` entry legality and its heap;
+    /// these limits only govern the `RustJSI` resources described by each field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error if the issuer cannot allocate another epoch.
+    pub fn new_with_jsc_limits(
+        identity: &mut RuntimeIdentity,
+        final_entry_policy: FinalEntryPolicy,
+        limits: JscRuntimeLimits,
+    ) -> Result<Self, RuntimeError> {
         let id = identity
             .next_attachment()
             .map_err(|_| RuntimeError::IdentityExhausted)?;
         Ok(Self {
-            shared: Shared::new(
-                id,
-                final_entry_policy,
-                root_limits,
-                call_limits,
-                external_buffer_limits,
-            ),
+            shared: Shared::new(id, final_entry_policy, limits),
         })
     }
 
@@ -520,6 +543,58 @@ mod tests {
                         JsError::Runtime(RuntimeError::CallArgumentLimitReached)
                     );
                     assert_eq!(calls.get(), 0);
+                })
+                .unwrap();
+            let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
+        }
+    }
+
+    #[test]
+    fn foreign_attachment_applies_inbound_callback_limits() {
+        let owner = ForeignContext::new();
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let mut attachment = Attachment::new_with_jsc_limits(
+            &mut identity,
+            FinalEntryPolicy::Guaranteed,
+            JscRuntimeLimits {
+                inbound_callback: super::super::InboundCallbackLimits {
+                    arguments: 1,
+                    string_utf8_bytes: 4,
+                },
+                ..JscRuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        unsafe {
+            attachment
+                .with_context(owner.as_raw(), |cx| {
+                    let callback_observed = Rc::clone(&observed);
+                    cx.install_host_function("attachmentInbound", move |call| {
+                        let value = call.string(0)?;
+                        callback_observed.borrow_mut().push(value.clone());
+                        Ok(Value::String(value))
+                    })
+                    .unwrap();
+
+                    let rejected = cx
+                        .eval("attachmentInbound('🦀x')", "attachment-inbound-limit.js")
+                        .unwrap_err();
+                    assert!(
+                        rejected
+                            .to_string()
+                            .contains("inbound callback string data limit reached")
+                    );
+                    assert!(observed.borrow().is_empty());
+
+                    let accepted = cx
+                        .eval(
+                            "attachmentInbound('🦀')",
+                            "attachment-inbound-after-limit.js",
+                        )
+                        .unwrap();
+                    assert_eq!(cx.string(&accepted).unwrap(), "🦀");
                 })
                 .unwrap();
             let _ = attachment.detach_with_context(owner.as_raw()).unwrap();
