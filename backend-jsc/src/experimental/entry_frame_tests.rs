@@ -10,6 +10,15 @@ impl Drop for DropProbe {
     }
 }
 
+struct PanicDrop(Rc<Cell<usize>>);
+
+impl Drop for PanicDrop {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+        panic!("deferred native-state destructor panic");
+    }
+}
+
 #[test]
 fn active_entry_frame_restores_outer_state_after_nested_entry() {
     let runtime = Runtime::new().unwrap();
@@ -120,6 +129,64 @@ fn outer_exit_drains_a_burst_of_deferred_owned_runtimes() {
     for shared in inner_shared {
         assert_eq!(shared.gate.state(), HostState::Destroyed);
     }
+    assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
+    assert_eq!(
+        take_deferred_owned_drop_drain_observations(),
+        vec![DeferredOwnedDropDrainObservation {
+            outer_active_entries: 0,
+            active_runtime_present: false,
+            active_context_present: false,
+        }]
+    );
+}
+
+#[test]
+fn deferred_teardown_contains_a_drop_panic_and_drains_later_records() {
+    assert!(take_deferred_owned_drop_drain_observations().is_empty());
+    let panicking_drops = Rc::new(Cell::new(0));
+    let later_drops = Rc::new(Cell::new(0));
+    let group = TestContextGroup::new();
+    let mut outer = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let mut panicking = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let mut later = Runtime::new_in_context_group_for_test(group.0).unwrap();
+    let panicking_shared = Rc::clone(&panicking.shared);
+    let later_shared = Rc::clone(&later.shared);
+
+    panicking
+        .with_context({
+            let drops = Rc::clone(&panicking_drops);
+            move |cx| {
+                cx.install_native_state("deferredPanicState", PanicDrop(drops))
+                    .unwrap();
+            }
+        })
+        .unwrap();
+    later
+        .with_context({
+            let drops = Rc::clone(&later_drops);
+            move |cx| {
+                cx.install_native_state("deferredLaterState", DropProbe(drops))
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+    outer
+        .with_context(move |_| {
+            // The queue is LIFO. Drop `later` first so teardown must contain the
+            // panic from `panicking` before it can reclaim `later`.
+            drop(later);
+            drop(panicking);
+            assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 2);
+        })
+        .unwrap();
+
+    assert_eq!(panicking_shared.gate.state(), HostState::Destroyed);
+    assert_eq!(later_shared.gate.state(), HostState::Destroyed);
+    assert_eq!(panicking_drops.get(), 1);
+    assert_eq!(later_drops.get(), 1);
+    assert_eq!(panicking_shared.native_drop_panics.get(), 1);
+    assert_eq!(later_shared.native_drop_panics.get(), 0);
     assert_eq!(DEFERRED_OWNED_DROPS.with(|drops| drops.borrow().len()), 0);
     assert_eq!(
         take_deferred_owned_drop_drain_observations(),
