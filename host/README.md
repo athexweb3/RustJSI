@@ -55,6 +55,16 @@ the host accepts or rejects it, preventing terminal close from taking retained
 work in that interval. It does not create a scheduler, retry policy, or engine
 task.
 
+`DrainRegistration` is the host owner's identity-only selector for
+platform-delivered drain tasks. It represents one logical runtime's current
+attachment as active or closing. Replacement requires closing state, the same
+runtime ID, and a strictly newer epoch. Before any mailbox selection or host
+entry it resolves a task as current, closing, retired, unregistered, or
+foreign. It owns no queue or payload, so beginning close does not replace the
+separate producer-close and terminal-drain protocol of
+`ScheduledWorkMailbox<T>`. The registration remains thread-affine; producers
+post copyable attachment identities and its host owner resolves them.
+
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
 or perform cleanup itself. The source-linked `Host` contract is not the stable C

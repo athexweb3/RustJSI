@@ -34,7 +34,7 @@ If a driver unwinds with an unfinished drain, retained post records remain
 pending for a later deterministic recovery drain. The fixture exposes that
 state but does not create a platform wake-up or retry policy.
 
-`DrainRegistrationModel` represents the host owner's decision about an
+`rustjsi_host::DrainRegistration` represents the host owner's decision about an
 attachment-only drain task for one logical runtime. Its current attachment is
 either active or closing. Replacement requires closing state, the same runtime
 ID, and a strictly newer attachment epoch. Resolution distinguishes current,
