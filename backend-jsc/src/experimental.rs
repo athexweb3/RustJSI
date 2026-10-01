@@ -124,6 +124,29 @@ impl CallLimits {
     }
 }
 
+/// Admission limits for Rust-owned byte buffers transferred to JSC.
+///
+/// The ledger counts live ownership transfers, not JavaScript wrappers, views,
+/// copied engine buffers, or total process memory. A transfer remains live until
+/// JSC invokes its backing-store deallocator. The default permits 4096 live
+/// allocations totalling 64 MiB, preserving the previous experimental policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalBufferLimits {
+    /// Maximum live Rust-owned buffer allocations transferred to JSC.
+    pub allocations: usize,
+    /// Maximum live Rust-owned bytes transferred to JSC.
+    pub bytes: usize,
+}
+
+impl Default for ExternalBufferLimits {
+    fn default() -> Self {
+        Self {
+            allocations: 4096,
+            bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 thread_local! {
     static ACTIVE_RUNTIME: Cell<*const Shared> = const { Cell::new(ptr::null()) };
     static ACTIVE_CONTEXT: Cell<sys::ContextRef> = const { Cell::new(ptr::null()) };
@@ -291,6 +314,10 @@ pub enum RuntimeError {
     CallArgumentLimitReached,
     /// A call exceeds its configured string conversion data limit.
     CallStringDataLimitReached,
+    /// No external-buffer allocation slot is available within the configured limit.
+    ExternalBufferAllocationLimitReached,
+    /// An external buffer would exceed the configured live byte limit.
+    ExternalBufferByteLimitReached,
     /// The experimental limit of 4096 retained host functions was reached.
     HostFunctionLimitReached,
 }
@@ -463,11 +490,39 @@ impl Runtime {
         root_limits: RootLimits,
         call_limits: CallLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_external_buffer_limits(
+            root_limits,
+            call_limits,
+            ExternalBufferLimits::default(),
+        )
+    }
+
+    /// Creates a runtime with root, call-data, and external-buffer limits.
+    ///
+    /// External-buffer limits apply only to Rust-owned boxed byte slices accepted
+    /// by this runtime. They bound live ownership transfers before JSC creation;
+    /// they do not limit JavaScript heap allocation, views, copied engine buffers,
+    /// or process memory outside those transferred slices.
+    ///
+    /// # Errors
+    ///
+    /// Returns a creation or runtime-identity error if initialization fails.
+    pub fn new_with_external_buffer_limits(
+        root_limits: RootLimits,
+        call_limits: CallLimits,
+        external_buffer_limits: ExternalBufferLimits,
+    ) -> Result<Self, RuntimeError> {
         let id = Self::allocate_owned_attachment_id()?;
         // SAFETY: A null class requests JSC's default global object class. The returned
         // context is checked before ownership is placed in `Runtime`.
         let context = unsafe { sys::global_context_create(ptr::null_mut()) };
-        Self::from_owned_context(id, root_limits, call_limits, context)
+        Self::from_owned_context(
+            id,
+            root_limits,
+            call_limits,
+            external_buffer_limits,
+            context,
+        )
     }
 
     #[cfg(test)]
@@ -479,7 +534,13 @@ impl Runtime {
         // each runtime it creates. A null class requests the default global class.
         let context =
             unsafe { sys::global_context_create_in_group(group.as_ptr(), ptr::null_mut()) };
-        Self::from_owned_context(id, RootLimits::default(), CallLimits::default(), context)
+        Self::from_owned_context(
+            id,
+            RootLimits::default(),
+            CallLimits::default(),
+            ExternalBufferLimits::default(),
+            context,
+        )
     }
 
     fn allocate_owned_attachment_id() -> Result<AttachmentId, RuntimeError> {
@@ -494,6 +555,7 @@ impl Runtime {
         id: AttachmentId,
         root_limits: RootLimits,
         call_limits: CallLimits,
+        external_buffer_limits: ExternalBufferLimits,
         context: sys::GlobalContextRef,
     ) -> Result<Self, RuntimeError> {
         let context = NonNull::new(context).ok_or(RuntimeError::CreationFailed)?;
@@ -506,7 +568,13 @@ impl Runtime {
         };
 
         Ok(Self {
-            shared: Shared::new(id, FinalEntryPolicy::Guaranteed, root_limits, call_limits),
+            shared: Shared::new(
+                id,
+                FinalEntryPolicy::Guaranteed,
+                root_limits,
+                call_limits,
+                external_buffer_limits,
+            ),
             context: Some(context),
             context_group,
         })
@@ -1172,6 +1240,10 @@ impl fmt::Display for RuntimeError {
             Self::LocalRootLimitReached => "local result root limit reached",
             Self::CallArgumentLimitReached => "call argument limit reached",
             Self::CallStringDataLimitReached => "call string data limit reached",
+            Self::ExternalBufferAllocationLimitReached => {
+                "external-buffer allocation limit reached"
+            }
+            Self::ExternalBufferByteLimitReached => "external-buffer byte limit reached",
             Self::HostFunctionLimitReached => "host function registration limit reached",
             Self::Host(error) => return error.fmt(formatter),
         };
@@ -1215,6 +1287,7 @@ impl Shared {
         final_entry_policy: FinalEntryPolicy,
         root_limits: RootLimits,
         call_limits: CallLimits,
+        external_buffer_limits: ExternalBufferLimits,
     ) -> Rc<Self> {
         Rc::new(Self {
             id,
@@ -1234,7 +1307,9 @@ impl Shared {
             argument_roots: Cell::new(0),
             #[cfg(test)]
             argument_gc: Cell::new(false),
-            external_buffers: Arc::new(external_buffer::ExternalLedger::new()),
+            external_buffers: Arc::new(external_buffer::ExternalLedger::new(
+                external_buffer_limits,
+            )),
         })
     }
 
