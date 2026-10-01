@@ -65,6 +65,12 @@ separate producer-close and terminal-drain protocol of
 `ScheduledWorkMailbox<T>`. The registration remains thread-affine; producers
 post copyable attachment identities and its host owner resolves them.
 
+`ScheduledWorkMailbox<T>::state` exposes a concurrent lifecycle snapshot for
+host diagnostics. Only its `Closed` state is terminally stable; an owner still
+uses drain leases rather than a snapshot to coordinate payload transfer. The
+`is_terminally_closed` predicate makes the terminal condition explicit for a
+later replacement coordinator without creating one here.
+
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
 or perform cleanup itself. The source-linked `Host` contract is not the stable C
