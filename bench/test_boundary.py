@@ -177,6 +177,28 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(result["sample_cv"], 0)
         self.assertEqual(result["mean_per_operation"], 0)
 
+    def test_process_confidence_intervals_are_deterministic_and_process_scoped(self):
+        values = list(range(1, 13))
+        first = boundary.describe_processes(values, label="test/processes")
+        second = boundary.describe_processes(values, label="test/processes")
+        interval = first["confidence_interval"]
+        self.assertEqual(first, second)
+        self.assertEqual(interval["method"], boundary.BOOTSTRAP_METHOD)
+        self.assertEqual(interval["confidence_level"], 0.95)
+        self.assertEqual(interval["resamples"], boundary.BOOTSTRAP_RESAMPLES)
+        self.assertEqual(interval["independent_unit"], "benchmark_process")
+        for estimate in ("mean", "median"):
+            self.assertLessEqual(interval[estimate]["lower"], first[estimate])
+            self.assertGreaterEqual(interval[estimate]["upper"], first[estimate])
+        self.assertNotIn("confidence_interval", boundary.describe(values))
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            boundary.bootstrap_confidence_intervals(values, "")
+
+    def test_process_confidence_intervals_preserve_exact_constant_observations(self):
+        interval = boundary.bootstrap_confidence_intervals([7, 7], "test/constant")
+        self.assertEqual(interval["mean"], {"lower": 7, "upper": 7})
+        self.assertEqual(interval["median"], {"lower": 7.0, "upper": 7.0})
+
     def test_calibration_accepts_clock_resolution_zeroes(self):
         sample = boundary.parse_sample(SAMPLE.replace("20.0000", "0.0000"))
         self.assertEqual(
@@ -204,6 +226,10 @@ class SampleTests(unittest.TestCase):
         self.assertFalse(report["all_run_mean_cv_at_most_5_percent"])
         self.assertIsNone(report["individual_call_p99"])
         self.assertFalse(report["performance_gate_qualified"])
+        ratio_interval = ratios["confidence_interval"]
+        self.assertEqual(ratio_interval["independent_unit"], "benchmark_process")
+        self.assertLessEqual(ratio_interval["mean"]["lower"], ratios["mean"])
+        self.assertGreaterEqual(ratio_interval["mean"]["upper"], ratios["mean"])
 
     def test_entry_tail_and_allocator_scope_are_explicit(self):
         samples = balanced_samples()
@@ -223,6 +249,13 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(
             allocations["metrics"]["jsc_common_empty_entry"]["allocations"]["mean"],
             0,
+        )
+        allocation_interval = allocations["metrics"]["jsc_common_empty_entry"][
+            "allocations"
+        ]["confidence_interval"]
+        self.assertEqual(allocation_interval["mean"], {"lower": 0.0, "upper": 0.0})
+        self.assertNotIn(
+            "confidence_interval", latency["metrics"]["host_gate_admit_and_exit"]
         )
         self.assertEqual(
             allocations["metrics"]["rustjsi_experimental"]["allocations"]["mean"],
@@ -792,7 +825,7 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source or binary changed"):
                 boundary.read_report(directory)
 
-    def test_scoped_call_analysis_requires_schema_eleven(self):
+    def test_scoped_call_analysis_requires_current_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             metadata = {

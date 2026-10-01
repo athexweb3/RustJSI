@@ -127,10 +127,16 @@ the named measured region and build; it is not evidence of zero engine
 allocation or zero payload copies.
 
 `all_run_mean_cv_at_most_5_percent` is a noise diagnostic, not a performance
-pass. It is not the variability of independently estimated medians. No
-individual-call distribution exists here, so `individual_call_p99` remains
-absent. JavaScriptCore allocation, payload-copy, confidence-interval and
-regression-gate work also remains open.
+pass. The process-level metric means, medians, paired ratios, and Rust allocator
+counters include deterministic 95% percentile-bootstrap confidence intervals.
+Each resample draws whole benchmark processes, preserving the direct/common
+pairing inside a ratio. These intervals quantify sampling uncertainty for this
+collector; they do not correct uncontrolled power, thermal, scheduler, or
+engine variation, and they do not qualify a performance gate. Block-mean and
+calibration distributions intentionally have no confidence intervals because
+their observations are correlated within a process. No individual-call
+distribution exists here, so `individual_call_p99` remains absent. JavaScriptCore
+allocation, payload-copy, and regression-gate work also remains open.
 
 Separate processes do not isolate CPU frequency, thermal state, OS scheduling,
 shared caches or background work. Callback workload order is counterbalanced;
