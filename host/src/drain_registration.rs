@@ -2,37 +2,39 @@
 
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
-use rustjsi_host::{AttachmentId, RuntimeId};
+use crate::{AttachmentId, RuntimeId};
 
-/// Dispatchability state for one host-owned attachment registration.
+/// Dispatchability state of one host-owned attachment registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainRegistrationState {
-    /// The registered attachment may resolve matching drain tasks.
+    /// The registered attachment may accept matching drain tasks.
     Active,
-    /// The registration remains identifiable but rejects matching drain tasks.
+    /// The registered attachment remains identifiable but accepts no new task dispatch.
     Closing,
 }
 
-/// Resolution of an attachment-only scheduler task by its host owner.
+/// Host-owner resolution of an attachment-only drain task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainTaskResolution {
-    /// The task names the current active attachment.
+    /// The task targets the active registered attachment.
     Current,
-    /// The current attachment is closing and cannot dispatch new work.
+    /// The task targets the current attachment while it is closing.
     Closing,
-    /// The task names an earlier attachment for this logical runtime.
+    /// The task targets an earlier attachment of this logical runtime.
     Retired,
-    /// The task names a later or otherwise unregistered attachment epoch.
+    /// The task targets a later or otherwise unregistered attachment epoch.
     UnregisteredAttachment,
-    /// The task names another logical runtime.
+    /// The task targets another logical runtime.
     ForeignRuntime,
 }
 
-/// Failure to replace a host-owned attachment registration.
+/// Failure to replace a host-owned drain registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainRegistrationReplaceError {
-    /// Replacement requires the old registration to begin close first.
+    /// Replacement requires the old registration to begin closing first.
     NotClosing(DrainRegistrationState),
     /// A replacement must remain in the same logical runtime.
     ForeignRuntime,
@@ -40,45 +42,61 @@ pub enum DrainRegistrationReplaceError {
     NotNewer,
 }
 
-/// Deterministic owner model for one logical runtime's drain registration.
+/// Identity-only host registration for future attachment drain tasks.
 ///
-/// It owns identity resolution only. It contains no scheduler queue, host entry,
-/// backend, mailbox payload, platform wake-up, or terminal cleanup policy.
+/// A host owner resolves platform-delivered task identities through this type
+/// before choosing a mailbox or attempting host entry. It owns neither a
+/// scheduler nor a work queue. In particular, beginning close here does not
+/// close producer ingress or settle retained payloads; an owning mailbox keeps
+/// those responsibilities. The registration is thread-affine: producers post
+/// copyable [`AttachmentId`] values, while the host-owner thread resolves them.
+///
+/// ```compile_fail
+/// use rustjsi_host::{DrainRegistration, RuntimeIdentity};
+///
+/// fn requires_send<T: Send>(_: T) {}
+///
+/// let mut identity = RuntimeIdentity::allocate().unwrap();
+/// let attachment = identity.next_attachment().unwrap();
+/// requires_send(DrainRegistration::new(attachment));
+/// ```
 #[derive(Debug)]
-pub struct DrainRegistrationModel {
+pub struct DrainRegistration {
     current: AttachmentId,
     state: DrainRegistrationState,
+    _affine: PhantomData<Rc<()>>,
 }
 
-impl DrainRegistrationModel {
+impl DrainRegistration {
     /// Creates an active registration for an owner-issued attachment.
     #[must_use]
     pub const fn new(attachment: AttachmentId) -> Self {
         Self {
             current: attachment,
             state: DrainRegistrationState::Active,
+            _affine: PhantomData,
         }
     }
 
-    /// Returns the logical runtime this owner models.
+    /// Returns the logical runtime this registration represents.
     #[must_use]
     pub const fn runtime_id(&self) -> RuntimeId {
         self.current.runtime_id()
     }
 
-    /// Returns the attachment currently registered by this owner.
+    /// Returns the attachment currently registered by this host owner.
     #[must_use]
     pub const fn attachment_id(&self) -> AttachmentId {
         self.current
     }
 
-    /// Returns the current registration state.
+    /// Returns the current dispatchability state.
     #[must_use]
     pub const fn state(&self) -> DrainRegistrationState {
         self.state
     }
 
-    /// Stops dispatching new drain tasks for the current attachment.
+    /// Stops accepting new task dispatch for the current attachment.
     pub fn begin_close(&mut self) {
         self.state = DrainRegistrationState::Closing;
     }
@@ -87,7 +105,9 @@ impl DrainRegistrationModel {
     ///
     /// # Errors
     ///
-    /// Rejects foreign, non-monotonic, or still-active replacements.
+    /// Rejects replacement while active, from another runtime, or without a
+    /// monotonic attachment epoch advance. It does not close or drain an
+    /// associated work mailbox.
     pub fn replace(
         &mut self,
         replacement: AttachmentId,
@@ -106,7 +126,7 @@ impl DrainRegistrationModel {
         Ok(())
     }
 
-    /// Resolves one attachment-only task without entering a host or backend.
+    /// Resolves one attachment-only task before mailbox selection or host entry.
     #[must_use]
     pub fn resolve(&self, attachment: AttachmentId) -> DrainTaskResolution {
         if attachment.runtime_id() != self.current.runtime_id() {
@@ -140,26 +160,29 @@ impl Error for DrainRegistrationReplaceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjsi_host::RuntimeIdentity;
+    use crate::RuntimeIdentity;
 
     #[test]
-    fn close_and_replacement_keep_old_tasks_out_of_the_new_attachment() {
+    fn replacement_retires_old_tasks_without_targeting_the_new_attachment() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let first = identity.next_attachment().unwrap();
         let replacement = identity.next_attachment().unwrap();
-        let mut model = DrainRegistrationModel::new(first);
+        let mut registration = DrainRegistration::new(first);
 
-        assert_eq!(model.resolve(first), DrainTaskResolution::Current);
-        model.begin_close();
-        assert_eq!(model.resolve(first), DrainTaskResolution::Closing);
-        model.replace(replacement).unwrap();
+        assert_eq!(registration.resolve(first), DrainTaskResolution::Current);
+        registration.begin_close();
+        assert_eq!(registration.resolve(first), DrainTaskResolution::Closing);
+        registration.replace(replacement).unwrap();
 
-        assert_eq!(model.resolve(first), DrainTaskResolution::Retired);
-        assert_eq!(model.resolve(replacement), DrainTaskResolution::Current);
+        assert_eq!(registration.resolve(first), DrainTaskResolution::Retired);
+        assert_eq!(
+            registration.resolve(replacement),
+            DrainTaskResolution::Current
+        );
     }
 
     #[test]
-    fn replacement_rejects_active_foreign_and_non_monotonic_attachments() {
+    fn replacement_requires_closing_and_monotonic_same_runtime_identity() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let first = identity.next_attachment().unwrap();
         let second = identity.next_attachment().unwrap();
@@ -167,27 +190,27 @@ mod tests {
             .unwrap()
             .next_attachment()
             .unwrap();
-        let mut model = DrainRegistrationModel::new(first);
+        let mut registration = DrainRegistration::new(first);
 
         assert_eq!(
-            model.replace(second),
+            registration.replace(second),
             Err(DrainRegistrationReplaceError::NotClosing(
                 DrainRegistrationState::Active
             ))
         );
-        model.begin_close();
+        registration.begin_close();
         assert_eq!(
-            model.replace(foreign),
+            registration.replace(foreign),
             Err(DrainRegistrationReplaceError::ForeignRuntime)
         );
         assert_eq!(
-            model.replace(first),
+            registration.replace(first),
             Err(DrainRegistrationReplaceError::NotNewer)
         );
     }
 
     #[test]
-    fn foreign_and_future_tasks_never_resolve_as_current() {
+    fn foreign_and_future_tasks_are_never_current() {
         let mut identity = RuntimeIdentity::allocate().unwrap();
         let current = identity.next_attachment().unwrap();
         let future = identity.next_attachment().unwrap();
@@ -195,12 +218,15 @@ mod tests {
             .unwrap()
             .next_attachment()
             .unwrap();
-        let model = DrainRegistrationModel::new(current);
+        let registration = DrainRegistration::new(current);
 
         assert_eq!(
-            model.resolve(future),
+            registration.resolve(future),
             DrainTaskResolution::UnregisteredAttachment
         );
-        assert_eq!(model.resolve(foreign), DrainTaskResolution::ForeignRuntime);
+        assert_eq!(
+            registration.resolve(foreign),
+            DrainTaskResolution::ForeignRuntime
+        );
     }
 }

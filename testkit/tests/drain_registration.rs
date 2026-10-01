@@ -4,11 +4,9 @@
 
 use std::num::NonZeroUsize;
 
-use rustjsi_host::{DrainPoster, RuntimeIdentity};
+use rustjsi_host::{DrainPoster, DrainRegistration, DrainTaskResolution, RuntimeIdentity};
 use rustjsi_runtime::DrainAfter;
-use rustjsi_testkit::{
-    DrainPostAcquire, DrainPostQueue, DrainRegistrationModel, DrainTaskResolution,
-};
+use rustjsi_testkit::{DrainPostAcquire, DrainPostQueue};
 
 #[test]
 fn queued_old_attachment_task_cannot_target_its_replacement() {
@@ -16,7 +14,7 @@ fn queued_old_attachment_task_cannot_target_its_replacement() {
     let old = identity.next_attachment().unwrap();
     let replacement = identity.next_attachment().unwrap();
     let posts = DrainPostQueue::new(NonZeroUsize::new(1).unwrap());
-    let mut registration = DrainRegistrationModel::new(old);
+    let mut registration = DrainRegistration::new(old);
 
     posts.post_drain(old).unwrap();
     registration.begin_close();

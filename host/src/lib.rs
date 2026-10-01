@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod drain_registration;
 mod entry;
 mod identity;
 mod post;
@@ -12,6 +13,9 @@ mod work;
 mod work_mailbox;
 
 pub use contract::Host;
+pub use drain_registration::{
+    DrainRegistration, DrainRegistrationReplaceError, DrainRegistrationState, DrainTaskResolution,
+};
 pub use entry::{
     CleanupGuard, EntryGate, EntryGuard, FinalEntryOutcome, FinalEntryPolicy, GateError, HostState,
 };
