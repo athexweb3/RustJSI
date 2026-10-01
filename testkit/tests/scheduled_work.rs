@@ -13,7 +13,7 @@ use rustjsi_host::{
     ScheduledWorkFinishError, ScheduledWorkMailbox, ScheduledWorkPostError, WorkDispatchError,
 };
 use rustjsi_runtime::{DrainAfter, TerminalAcquireError};
-use rustjsi_testkit::ModelHost;
+use rustjsi_testkit::{DrainPostAcquire, DrainPostQueue, ModelHost};
 
 #[test]
 fn current_attachment_consumes_work_inside_one_host_entry() {
@@ -400,4 +400,100 @@ fn failed_successor_post_keeps_mailbox_pending_for_retry() {
     };
     assert_eq!(retry.pop().unwrap().into_payload(), 2);
     assert_eq!(retry.finish(), DrainAfter::Idle);
+}
+
+#[test]
+fn drain_post_queue_routes_initial_and_successor_work_drains() {
+    let mut host = ModelHost::new().unwrap();
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(2).unwrap());
+    let posts = DrainPostQueue::new(NonZeroUsize::new(2).unwrap());
+
+    let _ = mailbox.enqueue_and_post(&posts, 1_u32).unwrap();
+    let DrainPostAcquire::Acquired(initial_post) = posts.acquire() else {
+        panic!("initial work must retain an attachment-only post");
+    };
+    assert_eq!(initial_post.pop(), Some(attachment));
+    assert_eq!(initial_post.finish(), DrainAfter::Idle);
+
+    let ScheduledWorkAcquire::Acquired(initial_drain) = mailbox.acquire() else {
+        panic!("initial attachment post must make work drainable");
+    };
+    assert_eq!(
+        initial_drain
+            .dispatch_next(&mut host, |_, payload| payload + 1)
+            .unwrap(),
+        Some(2)
+    );
+    assert!(matches!(
+        mailbox.enqueue(2_u32),
+        Ok(rustjsi_runtime::MailboxEnqueue::Coalesced)
+    ));
+    assert_eq!(
+        initial_drain.finish_and_post(&posts).unwrap(),
+        DrainAfter::Pending
+    );
+
+    let DrainPostAcquire::Acquired(successor_post) = posts.acquire() else {
+        panic!("pending work must retain one successor attachment post");
+    };
+    assert_eq!(successor_post.pop(), Some(attachment));
+    assert_eq!(successor_post.finish(), DrainAfter::Idle);
+
+    let ScheduledWorkAcquire::Acquired(successor_drain) = mailbox.acquire() else {
+        panic!("successor attachment post must preserve pending work");
+    };
+    assert_eq!(
+        successor_drain
+            .dispatch_next(&mut host, |_, payload| payload + 1)
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(successor_drain.finish(), DrainAfter::Idle);
+}
+
+#[test]
+fn full_drain_post_queue_preserves_work_for_retry() {
+    let mut host = ModelHost::new().unwrap();
+    let attachment = host.attachment_id();
+    let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(1).unwrap());
+    let posts = DrainPostQueue::new(NonZeroUsize::new(1).unwrap());
+    let mut other_identity = RuntimeIdentity::allocate().unwrap();
+    let other_attachment = other_identity.next_attachment().unwrap();
+
+    posts.post_drain(other_attachment).unwrap();
+    let error = mailbox
+        .enqueue_and_post(&posts, 41_u32)
+        .expect_err("a full attachment-post queue must reject the initial post");
+    assert!(matches!(
+        error,
+        ScheduledWorkPostError::Post {
+            attachment: error_attachment,
+            error,
+        } if error_attachment == attachment && error.attachment_id() == attachment
+    ));
+
+    let DrainPostAcquire::Acquired(blocking_post) = posts.acquire() else {
+        panic!("the earlier attachment post must remain owned by the queue");
+    };
+    assert_eq!(blocking_post.pop(), Some(other_attachment));
+    assert_eq!(blocking_post.finish(), DrainAfter::Idle);
+
+    assert!(mailbox.post_pending(&posts).unwrap());
+    let DrainPostAcquire::Acquired(retry_post) = posts.acquire() else {
+        panic!("retry must retain a fresh attachment post");
+    };
+    assert_eq!(retry_post.pop(), Some(attachment));
+    assert_eq!(retry_post.finish(), DrainAfter::Idle);
+
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("post rejection must retain the queued work for retry");
+    };
+    assert_eq!(
+        drain
+            .dispatch_next(&mut host, |_, payload| payload + 1)
+            .unwrap(),
+        Some(42)
+    );
+    assert_eq!(drain.finish(), DrainAfter::Idle);
 }

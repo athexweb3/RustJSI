@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod conformance;
+mod drain_post_queue;
 mod lifecycle;
 mod model;
 mod model_entry;
@@ -21,6 +22,7 @@ pub use conformance::{
     verify_external_buffer_identity_in_scope, verify_number_root_and_release,
     verify_owned_external_buffer, verify_strong_root_round_trip,
 };
+pub use drain_post_queue::{DrainPostAcquire, DrainPostDrain, DrainPostQueue, DrainPostQueueFull};
 pub use lifecycle::{
     AttachmentId, Entry, Epoch, LifecycleError, LifecycleEvent, LifecycleModel, RuntimeId,
     RuntimeState,

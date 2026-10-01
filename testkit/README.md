@@ -17,6 +17,14 @@ backends. Replacement cycles preserve their logical runtime ID while advancing
 the attachment epoch, so stale work and foreign runtimes exercise one shared
 identity contract rather than test-only integers.
 
+`DrainPostQueue` is a fixed-capacity deterministic `DrainPoster`. Each accepted
+post retains only its `AttachmentId`; it cannot carry a backend borrow, a work
+payload, or a host-entry callback. A test driver pulls a post, chooses the
+matching host mailbox, and separately performs legal dispatch. The queue does
+not deduplicate attachment records, validate lifecycle, create a platform
+wake-up, or establish a host retry policy. Its purpose is to make bounded post
+acceptance, saturation, and retry handoff reproducible.
+
 `tests/host_lifecycle_sequences.rs` drives 100,000 seeded sequences of 24
 steps over three runtimes against an independent reference model. Sequences
 replace engines with new epochs, abandon issued epochs before activation, keep
