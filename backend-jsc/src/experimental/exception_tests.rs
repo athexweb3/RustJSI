@@ -123,6 +123,42 @@ fn callback_exception_snapshots_are_bounded_without_truncating_values() {
 }
 
 #[test]
+fn outbound_host_errors_are_bounded_before_jsc_string_conversion() {
+    let mut runtime = Runtime::new().unwrap();
+    runtime
+        .with_context(|cx| {
+            let suffix = super::exception_message::TRUNCATION_SUFFIX;
+            let prefix_bytes = super::exception_message::MAX_MESSAGE_BYTES - suffix.len();
+            for (name, source, expected) in [
+                (
+                    "fail_ascii",
+                    "x".repeat(512 * 1024),
+                    format!("{}{}", "x".repeat(prefix_bytes), suffix),
+                ),
+                (
+                    "fail_non_bmp",
+                    "😀".repeat(128 * 1024),
+                    format!("{}{}", "😀".repeat(prefix_bytes / 4), suffix),
+                ),
+            ] {
+                cx.install_host_function(name, move |_| Err(HostError::new(source.clone())))
+                    .unwrap();
+                let exposed = cx
+                    .eval(
+                        &format!("try {{ {name}(); }} catch (error) {{ error.message; }}"),
+                        "outbound-host-error.js",
+                    )
+                    .unwrap();
+                let exposed = cx.string(&exposed).unwrap();
+                assert!(exposed.len() <= super::exception_message::MAX_MESSAGE_BYTES);
+                assert_eq!(exposed, expected);
+                assert!(!exposed.contains('\u{fffd}'));
+            }
+        })
+        .unwrap();
+}
+
+#[test]
 fn publication_rollback_preserves_bounded_exception_metadata() {
     let mut runtime = Runtime::new().unwrap();
     runtime.with_context(|cx| {
