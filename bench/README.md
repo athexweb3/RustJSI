@@ -243,6 +243,45 @@ records, and a completion record after source and binary postflight checks.
 This is an ownership and data-movement diagnostic, not a latency benchmark or
 a general zero-copy claim for other engines or buffer modes.
 
+## External-buffer construction profile
+
+On macOS, collect matched construction and publication samples for the owned
+external-buffer route:
+
+```sh
+python3 -B bench/external_buffer_profile.py \
+  --output bench/results/external-buffer-profile-001
+```
+
+The collector builds the executable once with an explicitly selected compiler.
+It runs 0-byte, 1-byte, 4 KiB, and 64 KiB payloads in twelve separate
+processes per size. Process order alternates direct JSC then RustJSI, and the
+reverse. Every process includes twelve warmup blocks and records 128 measured
+block means. A block transfers eight pre-allocated boxed payloads.
+
+The timer covers external `ArrayBuffer` construction and publication to a
+global property. The direct path calls the system JSC constructor and property
+API. The RustJSI path calls `Context::install_external_buffer`, including its
+active-state, quota, observation, backing-origin, exception, and publication
+work. Payload allocation, context startup, property cleanup, runtime teardown,
+and deallocator verification are outside the timer.
+
+After each block, both paths clear their profile properties and destroy the
+matching context. The run fails unless every registered owner has been
+reclaimed at teardown. This is deliberate: system JSC may keep an otherwise
+unreachable external object alive across bounded explicit collection in a
+long-lived context, so the profile does not treat immediate GC reclamation as a
+per-block latency requirement.
+
+The artifact keeps raw stdout and stderr for every process, the binary hash,
+compiler/source/SDK metadata, parsed block means, and a completion record after
+source and binary postflight checks. The parser rejects duplicate, incomplete,
+unknown, non-finite, or wrong-order output. Results remain raw evidence, not a
+performance threshold. They do not measure steady-state long-lived-context
+behavior, GC latency, engine allocation, total allocation, payload copying, or
+application throughput. The ownership probe above remains the only evidence
+for its named backing-origin observation.
+
 ## Native sampling profiles
 
 The `js_calls` benchmark compares prepared scalar calls to a JavaScript
