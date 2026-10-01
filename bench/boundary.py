@@ -85,7 +85,12 @@ JS_CALL_METRICS = {
     "direct": "direct_jsc_js_call",
     "common": "rustjsi_common_js_call",
 }
-SCHEMA = 12
+SCHEMA = 13
+BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_METHOD = "deterministic_percentile_bootstrap"
+BOOTSTRAP_INDEPENDENT_UNIT = "benchmark_process"
+_U64_MASK = (1 << 64) - 1
 HOST_SYSCTL_KEYS = {
     "model": "hw.model",
     "logical_cpus": "hw.logicalcpu",
@@ -304,6 +309,20 @@ def describe_nonnegative(values):
     return result
 
 
+def describe_processes(values, *, label, allow_zero=False):
+    """Describe independent process observations with paired-safe bootstrap CIs."""
+    result = describe_values(values, allow_zero=allow_zero)
+    result["confidence_interval"] = bootstrap_confidence_intervals(values, label)
+    return result
+
+
+def describe_processes_nonnegative(values, *, label):
+    """Describe independent process counters, including an exact zero observation."""
+    result = describe_processes(values, label=label, allow_zero=True)
+    result["mean_per_operation"] = result["mean"] / ITERATIONS
+    return result
+
+
 def describe_values(values, *, allow_zero):
     invalid = (
         (lambda value: value < 0) if allow_zero else (lambda value: value <= 0)
@@ -320,6 +339,68 @@ def describe_values(values, *, allow_zero):
         "max": max(values),
         "sample_cv": statistics.stdev(values) / mean if mean else 0.0,
     }
+
+
+def bootstrap_confidence_intervals(values, label):
+    """Estimate uncertainty from independent process observations only.
+
+    The fixed seed is derived from the reported field name so re-reporting raw
+    data is byte-identical. It is not a replacement for controlled-host runs.
+    """
+    if not isinstance(label, str) or not label:
+        raise ValueError("bootstrap labels must be non-empty strings")
+    if len(values) < 2 or any(not math.isfinite(value) for value in values):
+        raise ValueError("bootstrap requires at least two finite process observations")
+    return {
+        "method": BOOTSTRAP_METHOD,
+        "confidence_level": BOOTSTRAP_CONFIDENCE_LEVEL,
+        "resamples": BOOTSTRAP_RESAMPLES,
+        "independent_unit": BOOTSTRAP_INDEPENDENT_UNIT,
+        "mean": bootstrap_percentile_interval(
+            values, sum_then_divide, f"{label}/mean"
+        ),
+        "median": bootstrap_percentile_interval(
+            values, statistics.median, f"{label}/median"
+        ),
+    }
+
+
+def sum_then_divide(values):
+    return sum(values) / len(values)
+
+
+def bootstrap_percentile_interval(values, estimator, label):
+    """Return a deterministic percentile-bootstrap interval for one estimate."""
+    estimate = estimator(values)
+    if not math.isfinite(estimate):
+        raise ValueError("bootstrap estimator must be finite")
+    if min(values) == max(values):
+        return {"lower": estimate, "upper": estimate}
+    state = int.from_bytes(
+        hashlib.sha256(label.encode("utf-8")).digest()[:8], "big"
+    )
+    count = len(values)
+    estimates = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        resample = []
+        for _ in range(count):
+            state, random_value = splitmix64(state)
+            resample.append(values[(random_value * count) >> 64])
+        estimates.append(estimator(resample))
+    lower_percentile = (1 - BOOTSTRAP_CONFIDENCE_LEVEL) / 2
+    return {
+        "lower": nearest_rank(estimates, lower_percentile),
+        "upper": nearest_rank(estimates, 1 - lower_percentile),
+    }
+
+
+def splitmix64(state):
+    """Advance a small, specified PRNG without depending on Python RNG internals."""
+    state = (state + 0x9E3779B97F4A7C15) & _U64_MASK
+    value = state
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+    return state, value ^ (value >> 31)
 
 
 def nearest_rank(values, percentile):
@@ -362,7 +443,10 @@ def summarize(samples):
     metrics = {
         name: {
             "unit": unit,
-            **describe([sample["metrics"][name] for sample in samples]),
+            **describe_processes(
+                [sample["metrics"][name] for sample in samples],
+                label=f"metrics/{name}",
+            ),
         }
         for name, unit in METRICS.items()
     }
@@ -377,10 +461,13 @@ def summarize(samples):
         "sample_kind": "process_batch_mean",
         "metrics": metrics,
         "paired_ratios": {
-            name: describe([
-                sample["metrics"][top] / sample["metrics"][bottom]
-                for sample in samples
-            ])
+            name: describe_processes(
+                [
+                    sample["metrics"][top] / sample["metrics"][bottom]
+                    for sample in samples
+                ],
+                label=f"paired_ratios/{name}",
+            )
             for name, (top, bottom) in pairs.items()
         },
         "callback_ordering": {
@@ -436,9 +523,13 @@ def summarize(samples):
             "iterations_per_process": ITERATIONS,
             "metrics": {
                 name: {
-                    field: describe_nonnegative([
-                        sample["rust_allocations"][name][field] for sample in samples
-                    ])
+                    field: describe_processes_nonnegative(
+                        [
+                            sample["rust_allocations"][name][field]
+                            for sample in samples
+                        ],
+                        label=f"rust_allocator_activity/{name}/{field}",
+                    )
                     for field in ALLOCATION_FIELDS
                 }
                 for name in ALLOCATION_METRICS
