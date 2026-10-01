@@ -44,10 +44,12 @@ work reject another runtime or an earlier attachment. This allocator is shared
 within one linked `rustjsi-host` domain; an eventual binary Host ABI must define
 its own single identity authority.
 
-`ScheduledWork<T>` is an identity-bound envelope for future host-owned queues.
-It captures an `AttachmentId`, validates it immediately before host entry, and
-returns the original record on stale-attachment or entry rejection. It does not
-create a queue, scheduler, close protocol, retry policy, or engine task.
+`ScheduledWork<T>` is an identity-bound envelope for host-owned queues. It
+captures an `AttachmentId`, validates it immediately before host entry, and
+returns the original record on stale-attachment or entry rejection.
+`ScheduledWorkMailbox<T>` adds fixed-capacity, close-aware retention and a
+single normal drain lease. A drain can dispatch one record through the host at
+a time; it does not create a scheduler, retry policy, or engine task.
 
 Schedulers, cross-thread handles, and attached-engine synchronization adapters
 are not implemented yet. Policy/outcome accounting does not grant engine access
