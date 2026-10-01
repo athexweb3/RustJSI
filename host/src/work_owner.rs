@@ -240,12 +240,30 @@ impl Error for AttachmentWorkReplaceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use rustjsi_runtime::MailboxEnqueue;
 
     use super::*;
-    use crate::{RuntimeIdentity, ScheduledWorkAcquire};
+    use crate::{DrainPoster, RuntimeIdentity, ScheduledWorkAcquire};
+
+    #[derive(Default)]
+    struct CountingPoster {
+        posts: AtomicUsize,
+    }
+
+    impl DrainPoster for CountingPoster {
+        type Error = Infallible;
+
+        fn post_drain(&self, _attachment: AttachmentId) -> Result<(), Self::Error> {
+            self.posts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn requires_send_sync<T: Send + Sync>() {}
 
@@ -310,5 +328,104 @@ mod tests {
         };
         assert_eq!(drain.pop().unwrap().into_payload(), 41);
         assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+    }
+
+    #[test]
+    fn close_racing_producer_posts_preserve_terminal_payload_ownership() {
+        const PRODUCERS: usize = 8;
+        const ROUNDS: usize = if cfg!(miri) { 2 } else { 64 };
+
+        for _ in 0..ROUNDS {
+            let mut identity = RuntimeIdentity::allocate().unwrap();
+            let attachment = identity.next_attachment().unwrap();
+            let replacement = identity.next_attachment().unwrap();
+            let mut owner =
+                AttachmentWorkOwner::new(attachment, NonZeroUsize::new(PRODUCERS).unwrap());
+            let old_sender = owner.sender();
+            let poster = Arc::new(CountingPoster::default());
+            let start = Arc::new(Barrier::new(PRODUCERS + 1));
+            let mut workers = Vec::with_capacity(PRODUCERS);
+
+            for payload in 0..u8::try_from(PRODUCERS).unwrap() {
+                let sender = old_sender.clone();
+                let poster = Arc::clone(&poster);
+                let start = Arc::clone(&start);
+                workers.push(thread::spawn(move || {
+                    start.wait();
+                    (payload, sender.enqueue_and_post(poster.as_ref(), payload))
+                }));
+            }
+
+            start.wait();
+            let _ = owner.begin_close();
+
+            let mut accepted = Vec::with_capacity(PRODUCERS);
+            let mut rejected = Vec::with_capacity(PRODUCERS);
+            let mut scheduled = 0;
+            for worker in workers {
+                let (payload, result) = worker.join().expect("producer must not panic");
+                match result {
+                    Ok(MailboxEnqueue::Scheduled) => {
+                        accepted.push(payload);
+                        scheduled += 1;
+                    }
+                    Ok(MailboxEnqueue::Coalesced) => accepted.push(payload),
+                    Err(ScheduledWorkPostError::Enqueue(ScheduledWorkEnqueueError::Closed(
+                        work,
+                    ))) => {
+                        assert_eq!(work.attachment_id(), attachment);
+                        assert_eq!(work.into_payload(), payload);
+                        rejected.push(payload);
+                    }
+                    Err(ScheduledWorkPostError::Enqueue(ScheduledWorkEnqueueError::Full(work))) => {
+                        panic!("close race must not exhaust producer-sized capacity: {work:?}")
+                    }
+                    Err(ScheduledWorkPostError::Post { error, .. }) => match error {},
+                }
+            }
+
+            assert!(matches!(
+                owner.resolve_drain_task(attachment),
+                AttachmentWorkResolution::Closing
+            ));
+            let terminal = owner.try_begin_terminal_drain().unwrap();
+            let mut terminal_payloads = Vec::with_capacity(PRODUCERS);
+            while let Some(work) = terminal.pop() {
+                assert_eq!(work.attachment_id(), attachment);
+                terminal_payloads.push(work.into_payload());
+            }
+            terminal.finish().unwrap();
+
+            accepted.sort_unstable();
+            rejected.sort_unstable();
+            terminal_payloads.sort_unstable();
+            assert_eq!(terminal_payloads, accepted);
+            let accepted_any = !accepted.is_empty();
+            let mut accounted = accepted;
+            accounted.extend(rejected);
+            accounted.sort_unstable();
+            assert_eq!(
+                accounted,
+                (0..u8::try_from(PRODUCERS).unwrap()).collect::<Vec<_>>()
+            );
+            assert_eq!(scheduled, usize::from(accepted_any));
+            assert_eq!(
+                poster.posts.load(Ordering::Relaxed),
+                usize::from(accepted_any)
+            );
+
+            owner
+                .replace(replacement, NonZeroUsize::new(PRODUCERS).unwrap())
+                .unwrap();
+            let Err(ScheduledWorkEnqueueError::Closed(work)) = old_sender.enqueue(u8::MAX) else {
+                panic!("old sender must remain closed after replacement");
+            };
+            assert_eq!(work.attachment_id(), attachment);
+            assert_eq!(work.into_payload(), u8::MAX);
+            assert!(matches!(
+                owner.resolve_drain_task(attachment),
+                AttachmentWorkResolution::Retired
+            ));
+        }
     }
 }
