@@ -239,6 +239,7 @@ pub struct JscResourceSnapshot {
     pending_persistent_releases: usize,
     host_function_registrations: usize,
     native_state_registrations: usize,
+    pending_native_finalizers: usize,
     external_buffer_allocations: usize,
     external_buffer_bytes: usize,
     callback_drop_panics: usize,
@@ -268,6 +269,16 @@ impl JscResourceSnapshot {
     #[must_use]
     pub const fn native_state_registrations(&self) -> usize {
         self.native_state_registrations
+    }
+
+    /// Returns native finalizer signals awaiting runtime-thread settlement.
+    ///
+    /// A signal may be concurrently publishing, so this is a best-effort
+    /// count rather than an exact linked-list length. It does not count live
+    /// JavaScript wrappers or native-state payload size.
+    #[must_use]
+    pub const fn pending_native_finalizers(&self) -> usize {
+        self.pending_native_finalizers
     }
 
     /// Returns live Rust-owned external-buffer allocations transferred to JSC.
@@ -543,6 +554,8 @@ struct RootRegistry {
     slots: Vec<RootSlot>,
     free: Vec<usize>,
     pending_head: Option<usize>,
+    live: usize,
+    pending: usize,
     limit: usize,
 }
 
@@ -1542,6 +1555,7 @@ impl Shared {
             pending_persistent_releases,
             host_function_registrations: self.host_functions.borrow().len(),
             native_state_registrations: self.native_states.borrow().live_count(),
+            pending_native_finalizers: self.native_finalizers.pending_count(),
             external_buffer_allocations: self.external_buffers.live_allocations(),
             external_buffer_bytes: self.external_buffers.live_bytes(),
             callback_drop_panics: self.callback_drop_panics.get(),
@@ -1665,6 +1679,8 @@ impl RootRegistry {
             slots: Vec::new(),
             free: Vec::new(),
             pending_head: None,
+            live: 0,
+            pending: 0,
             limit,
         }
     }
@@ -1673,6 +1689,7 @@ impl RootRegistry {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot];
             entry.value = Some(value);
+            self.live += 1;
             return Ok(RootId {
                 slot,
                 generation: entry.generation,
@@ -1688,6 +1705,7 @@ impl RootRegistry {
             value: Some(value),
             release: RootRelease::Live,
         });
+        self.live += 1;
         Ok(RootId {
             slot,
             generation: 1,
@@ -1707,6 +1725,7 @@ impl RootRegistry {
             return None;
         }
         let value = slot.value.take()?;
+        self.live -= 1;
         slot.generation = slot.generation.saturating_add(1);
         if slot.generation != u64::MAX {
             self.free.push(id.slot);
@@ -1728,6 +1747,7 @@ impl RootRegistry {
             next: self.pending_head,
         };
         self.pending_head = Some(id.slot);
+        self.pending += 1;
     }
 
     fn take_pending(&mut self) -> Option<NonNull<sys::OpaqueValue>> {
@@ -1738,6 +1758,7 @@ impl RootRegistry {
         };
         self.pending_head = next;
         slot.release = RootRelease::Live;
+        self.pending -= 1;
         let id = RootId {
             slot: index,
             generation: slot.generation,
@@ -1749,6 +1770,8 @@ impl RootRegistry {
         let mut values = Vec::new();
         self.free.clear();
         self.pending_head = None;
+        self.live = 0;
+        self.pending = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             slot.release = RootRelease::Live;
             if let Some(value) = slot.value.take() {
@@ -1763,12 +1786,7 @@ impl RootRegistry {
     }
 
     fn counts(&self) -> (usize, usize) {
-        self.slots.iter().fold((0, 0), |(live, pending), slot| {
-            let live = live + usize::from(slot.value.is_some());
-            let pending =
-                pending + usize::from(matches!(slot.release, RootRelease::Pending { .. }));
-            (live, pending)
-        })
+        (self.live, self.pending)
     }
 }
 

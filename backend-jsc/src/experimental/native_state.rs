@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// A typed handle to Rust state owned by a JavaScript wrapper.
 ///
@@ -102,6 +102,7 @@ impl<T: 'static> Drop for NativeLease<'_, T> {
 
 pub(super) struct FinalizerQueue {
     head: AtomicPtr<FinalizerToken>,
+    pending: AtomicUsize,
 }
 
 pub(super) struct FinalizerToken {
@@ -153,7 +154,17 @@ impl FinalizerQueue {
     pub(super) fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
+            pending: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns finalizer signals handed to this queue but not yet settled.
+    ///
+    /// A producer increments before publication, so this can briefly include a
+    /// token racing to link into the stack. Detached lists remain counted until
+    /// their owner reclaims or discards every token.
+    pub(super) fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
     }
 
     pub(super) fn take(&self) -> *mut FinalizerToken {
@@ -182,6 +193,9 @@ impl FinalizerQueue {
     }
 
     unsafe fn push(&self, token: *mut FinalizerToken) {
+        // Account before publication so a consumer cannot reclaim an otherwise
+        // uncounted token. This may briefly include an in-flight producer.
+        self.pending.fetch_add(1, Ordering::AcqRel);
         loop {
             let head = self.head.load(Ordering::Acquire);
             if head == closed_sentinel() {
@@ -189,6 +203,7 @@ impl FinalizerQueue {
                 // method. A closed queue has no consumer, and the token contains no
                 // user state or engine handle.
                 drop(unsafe { Box::from_raw(token) });
+                self.settle_pending();
                 return;
             }
 
@@ -200,6 +215,27 @@ impl FinalizerQueue {
                 .is_ok()
             {
                 return;
+            }
+        }
+    }
+
+    fn settle_pending(&self) {
+        let mut observed = self.pending.load(Ordering::Acquire);
+        loop {
+            let Some(next) = observed.checked_sub(1) else {
+                // A finalizer callback must not panic because a diagnostic
+                // counter is inconsistent. The counter is an observation, not
+                // a lifecycle authority.
+                return;
+            };
+            match self.pending.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
             }
         }
     }
@@ -513,6 +549,7 @@ pub(super) fn reclaim_finalized(shared: &Shared, mut token: *mut FinalizerToken)
         let boxed = unsafe { Box::from_raw(current.as_ptr()) };
         token = boxed.next.load(Ordering::Relaxed);
         let state = shared.native_states.borrow_mut().remove(boxed.id);
+        boxed.queue.settle_pending();
         drop(boxed);
         retired += usize::from(state.is_some());
         drop_state(shared, state);
@@ -588,6 +625,7 @@ mod tests {
             // helper. Each node is removed from the list before it is dropped.
             let boxed = unsafe { Box::from_raw(current.as_ptr()) };
             token = boxed.next.load(Ordering::Relaxed);
+            boxed.queue.settle_pending();
             drop(boxed);
             count += 1;
         }
@@ -650,7 +688,22 @@ mod tests {
 
         assert_eq!(reclaimed, PRODUCERS * TOKENS_PER_PRODUCER);
         assert!(queue.take().is_null());
+        assert_eq!(queue.pending_count(), 0);
         assert_eq!(Arc::strong_count(&queue), 1);
+    }
+
+    #[test]
+    fn finalizer_queue_counts_detached_signals_until_settled() {
+        let queue = Arc::new(FinalizerQueue::new());
+        // SAFETY: This test transfers one uniquely-owned token to the queue.
+        unsafe { queue.push(test_finalizer_token(&queue, 0)) };
+        assert_eq!(queue.pending_count(), 1);
+
+        let detached = queue.take();
+        assert_eq!(queue.pending_count(), 1);
+        // SAFETY: `take` transferred sole ownership of this token list.
+        assert_eq!(unsafe { drop_test_finalizer_tokens(detached) }, 1);
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
@@ -682,6 +735,7 @@ mod tests {
 
             assert!(queue.take().is_null());
             assert!(queue.close().is_null());
+            assert_eq!(queue.pending_count(), 0, "round {slot}");
             assert_eq!(Arc::strong_count(&queue), 1, "round {slot}");
         }
     }
@@ -995,7 +1049,21 @@ mod tests {
                     })
                     .join()
                     .unwrap();
+                    assert_eq!(
+                        shared
+                            .resource_snapshot()
+                            .unwrap()
+                            .pending_native_finalizers(),
+                        1
+                    );
                     shared.drain_native_finalizers();
+                    assert_eq!(
+                        shared
+                            .resource_snapshot()
+                            .unwrap()
+                            .pending_native_finalizers(),
+                        0
+                    );
                     assert_eq!(shared.native_states.borrow().live, 0);
                     assert_eq!(drops.get(), 0);
                     assert_eq!(state.value, 42);

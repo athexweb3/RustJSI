@@ -76,6 +76,37 @@ fn lease_clones_share_capacity_but_last_drop_does_not_release_it_early() {
 }
 
 #[test]
+fn root_counts_track_pending_release_and_slot_reuse() {
+    let mut runtime = Runtime::new_with_persistent_root_limit(1).unwrap();
+    let shared = Rc::clone(&runtime.shared);
+    let root = runtime
+        .with_context(|cx| {
+            let local = cx.eval("({})", "root-count.js").unwrap();
+            cx.persist(&local).unwrap()
+        })
+        .unwrap();
+    assert_eq!(shared.roots.borrow().counts(), (1, 0));
+
+    drop(root);
+    assert_eq!(shared.roots.borrow().counts(), (1, 1));
+
+    runtime.with_context(|_| {}).unwrap();
+    assert_eq!(shared.roots.borrow().counts(), (0, 0));
+
+    let replacement = runtime
+        .with_context(|cx| {
+            let local = cx.eval("({})", "root-count-reuse.js").unwrap();
+            cx.persist(&local).unwrap()
+        })
+        .unwrap();
+    assert_eq!(shared.roots.borrow().counts(), (1, 0));
+
+    drop(replacement);
+    runtime.invalidate().unwrap();
+    assert_eq!(shared.roots.borrow().counts(), (0, 0));
+}
+
+#[test]
 fn full_pending_budget_survives_unwind_and_is_recovered_on_next_entry() {
     let mut runtime = Runtime::new_with_persistent_root_limit(2).unwrap();
     let shared = Rc::clone(&runtime.shared);
