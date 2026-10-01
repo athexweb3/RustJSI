@@ -282,6 +282,15 @@ behavior, GC latency, engine allocation, total allocation, payload copying, or
 application throughput. The ownership probe above remains the only evidence
 for its named backing-origin observation.
 
+For each payload size, the collector also runs a separate allocation probe once.
+It snapshots the Rust global allocator only around the same eight construction
+and publication operations used by the timing profile. Payload allocation,
+runtime/context setup, property cleanup, context teardown, and deallocator work
+stay outside that snapshot. Its record is written to `allocation-records.json`;
+the raw process output and a separate executable hash are retained alongside the
+timing artifact. These counters do not observe JavaScriptCore, system, or total
+process allocation, and they are not a payload-copy measurement.
+
 ## Native sampling profiles
 
 The `js_calls` benchmark compares prepared scalar calls to a JavaScript
