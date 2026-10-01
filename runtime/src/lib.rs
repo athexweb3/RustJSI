@@ -4,10 +4,15 @@
 
 #![forbid(unsafe_code)]
 
+mod closable_mailbox;
 mod drain;
 mod ingress;
 mod mailbox;
 
+pub use closable_mailbox::{
+    ClosableMailbox, ClosableMailboxAcquire, ClosableMailboxDrain, ClosableMailboxEnqueueError,
+    ClosableMailboxState, TerminalAcquireError, TerminalDrainFinishError, TerminalMailboxDrain,
+};
 pub use drain::{
     DrainAcquire, DrainAfter, DrainClose, DrainPermit, DrainRequest, DrainSignal, DrainState,
 };
