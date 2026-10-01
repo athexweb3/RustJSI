@@ -481,6 +481,86 @@ mod tests {
     }
 
     #[test]
+    fn byte_quota_checked_add_overflow_preserves_existing_reservation() {
+        let ledger = ExternalLedger::new(ExternalBufferLimits {
+            allocations: 2,
+            bytes: usize::MAX,
+        });
+        ledger.reserve(usize::MAX).unwrap();
+        assert_eq!(
+            ledger.reserve(1),
+            Err(RuntimeError::ExternalBufferByteLimitReached)
+        );
+        assert_eq!(ledger.live_allocations(), 1);
+        assert_eq!(ledger.live_bytes(), usize::MAX);
+        ledger.release(usize::MAX);
+        assert_eq!(ledger.live_allocations(), 0);
+        assert_eq!(ledger.live_bytes(), 0);
+    }
+
+    fn contend_for_one_byte(
+        limits: ExternalBufferLimits,
+    ) -> (Arc<ExternalLedger>, Vec<Result<(), RuntimeError>>) {
+        const WORKERS: usize = 16;
+        let ledger = Arc::new(ExternalLedger::new(limits));
+        let start = Arc::new(std::sync::Barrier::new(WORKERS));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let ledger = Arc::clone(&ledger);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    ledger.reserve(1)
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        (ledger, outcomes)
+    }
+
+    #[test]
+    fn concurrent_allocation_admission_never_overcommits_the_limit() {
+        for _ in 0..64 {
+            let (ledger, outcomes) = contend_for_one_byte(ExternalBufferLimits {
+                allocations: 1,
+                bytes: 16,
+            });
+            assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+            assert!(outcomes.iter().all(|outcome| {
+                outcome.is_ok()
+                    || *outcome == Err(RuntimeError::ExternalBufferAllocationLimitReached)
+            }));
+            assert_eq!(ledger.live_allocations(), 1);
+            assert_eq!(ledger.live_bytes(), 1);
+            ledger.release(1);
+            assert_eq!(ledger.live_allocations(), 0);
+            assert_eq!(ledger.live_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_byte_admission_never_overcommits_the_limit() {
+        for _ in 0..64 {
+            let (ledger, outcomes) = contend_for_one_byte(ExternalBufferLimits {
+                allocations: 16,
+                bytes: 1,
+            });
+            assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+            assert!(outcomes.iter().all(|outcome| {
+                outcome.is_ok() || *outcome == Err(RuntimeError::ExternalBufferByteLimitReached)
+            }));
+            assert_eq!(ledger.live_allocations(), 1);
+            assert_eq!(ledger.live_bytes(), 1);
+            ledger.release(1);
+            assert_eq!(ledger.live_allocations(), 0);
+            assert_eq!(ledger.live_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn observation_handle_is_send_and_sync() {
         fn require_send_sync<T: Send + Sync>() {}
         require_send_sync::<ExternalBuffer>();
