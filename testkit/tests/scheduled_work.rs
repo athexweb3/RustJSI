@@ -94,7 +94,7 @@ fn draining_host_rejects_matching_work_without_consuming_payload() {
 }
 
 #[test]
-fn mailbox_delivery_preserves_attachment_check_before_host_entry() {
+fn mailbox_drain_dispatches_one_record_through_the_host() {
     let mut host = ModelHost::new().unwrap();
     let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
     let _ = mailbox.enqueue(host.attachment_id(), 41_u32).unwrap();
@@ -102,11 +102,45 @@ fn mailbox_delivery_preserves_attachment_check_before_host_entry() {
     let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
         panic!("queued work must acquire a normal drain");
     };
-    let work = drain.pop().expect("one work record must be retained");
-    assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+    let value = drain
+        .dispatch_next(&mut host, |_, payload| payload + 1)
+        .unwrap();
+    assert_eq!(value, Some(42));
 
-    let value = work.dispatch(&mut host, |_, payload| payload + 1).unwrap();
-    assert_eq!(value, 42);
+    let called = Cell::new(false);
+    assert_eq!(
+        drain
+            .dispatch_next(&mut host, |_, _| {
+                called.set(true);
+            })
+            .unwrap(),
+        None
+    );
+    assert!(!called.get());
+    assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
+}
+
+#[test]
+fn mailbox_drain_returns_stale_work_without_host_entry() {
+    let mut identity = RuntimeIdentity::allocate().unwrap();
+    let stale = identity.next_attachment().unwrap();
+    let current = identity.next_attachment().unwrap();
+    let mailbox = ScheduledWorkMailbox::new(NonZeroUsize::new(1).unwrap());
+    let _ = mailbox.enqueue(stale, String::from("stale")).unwrap();
+    let mut host = ModelHost::for_attachment(current);
+
+    let ScheduledWorkAcquire::Acquired(drain) = mailbox.acquire() else {
+        panic!("queued stale work must acquire a normal drain");
+    };
+    let error = drain
+        .dispatch_next(&mut host, |_, _| panic!("stale work must not enter"))
+        .expect_err("stale attachment must reject before host entry");
+    let work = error
+        .into_work()
+        .expect("attachment rejection must retain queued work");
+    assert_eq!(work.attachment_id(), stale);
+    assert_eq!(work.into_payload(), "stale");
+    assert_eq!(drain.finish(), rustjsi_runtime::DrainAfter::Idle);
 }
 
 #[test]
