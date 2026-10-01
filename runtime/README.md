@@ -11,3 +11,8 @@ ownership, a closable mailbox, task cancellation, or engine integration.
 owner prevent later producer reservations and wait for earlier reservations to
 settle without blocking. It does not retain payloads, run a scheduler, or claim
 terminal ownership of queued work.
+
+`ClosableMailbox<T>` is the experimental close-aware companion. It keeps
+producer admission and normal-drain admission separate, then transfers residual
+payloads through an affine terminal drain. It does not schedule retries, enter
+a runtime, validate a host attachment, or execute engine/resource cleanup.
