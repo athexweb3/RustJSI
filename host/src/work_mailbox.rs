@@ -5,8 +5,8 @@ use std::num::NonZeroUsize;
 use rustjsi_backend::BackendFamily;
 use rustjsi_runtime::{
     ClosableMailbox, ClosableMailboxAcquire, ClosableMailboxDrain, ClosableMailboxEnqueueError,
-    ClosableMailboxPostError, DrainAfter, IngressClose, MailboxEnqueue, TerminalAcquireError,
-    TerminalDrainFinishError, TerminalMailboxDrain,
+    ClosableMailboxPostError, ClosableMailboxState, DrainAfter, IngressClose, MailboxEnqueue,
+    TerminalAcquireError, TerminalDrainFinishError, TerminalMailboxDrain,
 };
 
 use crate::DrainPoster;
@@ -100,6 +100,24 @@ impl<T> ScheduledWorkMailbox<T> {
     #[must_use]
     pub const fn attachment_id(&self) -> AttachmentId {
         self.attachment
+    }
+
+    /// Returns a concurrent snapshot of the mailbox lifecycle.
+    ///
+    /// The snapshot is diagnostic except for [`ClosableMailboxState::Closed`],
+    /// which is terminal. Callers must use normal or terminal drain ownership
+    /// rather than a snapshot to coordinate work transfer.
+    #[must_use]
+    pub fn state(&self) -> ClosableMailboxState {
+        self.mailbox.state()
+    }
+
+    /// Returns whether terminal ownership completed with no retained work.
+    ///
+    /// Once this returns `true`, later calls continue returning `true`.
+    #[must_use]
+    pub fn is_terminally_closed(&self) -> bool {
+        self.state() == ClosableMailboxState::Closed
     }
 
     /// Enqueues payload captured for this mailbox's attachment epoch.
@@ -285,5 +303,36 @@ impl<T> TerminalScheduledWorkDrain<'_, T> {
     /// Returns typed residual ownership information instead of dropping work.
     pub fn finish(self) -> Result<(), TerminalDrainFinishError> {
         self.drain.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use rustjsi_runtime::ClosableMailboxState;
+
+    use super::*;
+    use crate::RuntimeIdentity;
+
+    #[test]
+    fn terminal_closed_observation_is_monotonic_after_payload_transfer() {
+        let mut identity = RuntimeIdentity::allocate().unwrap();
+        let attachment = identity.next_attachment().unwrap();
+        let mailbox = ScheduledWorkMailbox::new(attachment, NonZeroUsize::new(1).unwrap());
+
+        assert_eq!(mailbox.state(), ClosableMailboxState::Open);
+        assert!(!mailbox.is_terminally_closed());
+
+        let _ = mailbox.enqueue(7_u8).unwrap();
+        let _ = mailbox.begin_close();
+        let terminal = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(mailbox.state(), ClosableMailboxState::TerminalDraining);
+        assert!(!mailbox.is_terminally_closed());
+        assert_eq!(terminal.pop().unwrap().into_payload(), 7);
+        terminal.finish().unwrap();
+
+        assert_eq!(mailbox.state(), ClosableMailboxState::Closed);
+        assert!(mailbox.is_terminally_closed());
     }
 }
