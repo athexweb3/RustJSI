@@ -9,6 +9,7 @@ mod drain_registration;
 mod entry;
 mod identity;
 mod post;
+mod resource;
 mod work;
 mod work_mailbox;
 mod work_owner;
@@ -22,6 +23,7 @@ pub use entry::{
 };
 pub use identity::{AttachmentEpoch, AttachmentId, IdentityError, RuntimeId, RuntimeIdentity};
 pub use post::DrainPoster;
+pub use resource::{ResourceLedger, TerminalResourceReport};
 pub use work::{ScheduledWork, WorkDispatchError};
 pub use work_mailbox::{
     ScheduledWorkAcquire, ScheduledWorkDrain, ScheduledWorkEnqueueError, ScheduledWorkFinishError,
