@@ -12,6 +12,10 @@ pub enum WorkQueueState {
     Open,
     /// New reservations are rejected while issued reservations and drains settle.
     Closing,
+    /// The close owner must acquire or resume terminal payload ownership.
+    TerminalPending,
+    /// One close owner is transferring residual payloads one at a time.
+    TerminalDraining,
     /// All queue state has reached terminal ownership.
     Closed,
 }
@@ -31,6 +35,16 @@ pub struct SubmitReservation {
 /// can move residual payloads into terminal ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DrainLease {
+    sequence: NonZeroU64,
+}
+
+/// One close-owner lease for terminal payload transfer in a [`WorkQueueModel`].
+///
+/// A terminal lease transfers residual payloads one at a time. It must either
+/// drain every payload before finishing or be released back to
+/// [`WorkQueueState::TerminalPending`]; it never silently discards work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalDrainLease {
     sequence: NonZeroU64,
 }
 
@@ -68,31 +82,31 @@ pub enum DrainError {
     Busy,
     /// Closing is complete and no further drain is legal.
     Closed,
+    /// Terminal ownership has begun, so ordinary draining cannot resume.
+    TerminalOwnership,
     /// The supplied lease was already finished or was never issued.
     StaleLease,
     /// The model cannot issue another unique drain lease safely.
     LeaseSpaceExhausted,
 }
 
-/// Why [`WorkQueueModel::finish_close`] cannot yet transfer terminal ownership.
+/// Why [`WorkQueueModel::begin_terminal_drain`] cannot yet transfer terminal ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CloseError {
-    /// Close has not begun, or it completed already.
+pub enum TerminalDrainError {
+    /// The queue lifecycle does not permit a terminal drain.
     InvalidState(WorkQueueState),
     /// A producer admitted before close still must publish or abandon work.
     ReservationsRemain(usize),
     /// One consumer drain still owns the queue.
     DrainActive,
-}
-
-/// Terminal result of attempting to finish a close.
-#[derive(Debug, Eq, PartialEq)]
-#[must_use]
-pub enum CloseOutcome<T> {
-    /// Closing completed and transferred every residual payload to the caller.
-    Closed(Vec<T>),
-    /// A previous call already completed close and transferred residual payloads.
-    AlreadyClosed,
+    /// A terminal drain is already active.
+    TerminalDrainActive,
+    /// The model cannot issue another unique terminal lease safely.
+    LeaseSpaceExhausted,
+    /// The supplied terminal lease was already finished, released, or unknown.
+    StaleLease,
+    /// The terminal owner must transfer or explicitly release the residual work.
+    PayloadsRemain(usize),
 }
 
 /// Pure model of bounded work admission, drain, and terminal ownership.
@@ -101,7 +115,7 @@ pub enum CloseOutcome<T> {
 /// future implementation must preserve these rules while allowing multiple
 /// producers: close rejects later reservations, waits for earlier reservations
 /// and the active drain, then transfers at most `capacity` residual payloads to
-/// its close owner.
+/// its close owner one at a time.
 #[derive(Debug)]
 pub struct WorkQueueModel<T> {
     capacity: NonZeroUsize,
@@ -109,8 +123,10 @@ pub struct WorkQueueModel<T> {
     queue: VecDeque<T>,
     reservations: BTreeSet<NonZeroU64>,
     active_drain: Option<NonZeroU64>,
+    active_terminal_drain: Option<NonZeroU64>,
     next_reservation: Option<NonZeroU64>,
     next_lease: Option<NonZeroU64>,
+    next_terminal_lease: Option<NonZeroU64>,
 }
 
 impl<T> WorkQueueModel<T> {
@@ -123,8 +139,10 @@ impl<T> WorkQueueModel<T> {
             queue: VecDeque::with_capacity(capacity.get()),
             reservations: BTreeSet::new(),
             active_drain: None,
+            active_terminal_drain: None,
             next_reservation: NonZeroU64::new(1),
             next_lease: NonZeroU64::new(1),
+            next_terminal_lease: NonZeroU64::new(1),
         }
     }
 
@@ -233,11 +251,16 @@ impl<T> WorkQueueModel<T> {
     ///
     /// Returns [`DrainError::Empty`] when no payload exists,
     /// [`DrainError::Busy`] while another lease is active,
-    /// [`DrainError::Closed`] after terminal close, or
+    /// [`DrainError::Closed`] after terminal close,
+    /// [`DrainError::TerminalOwnership`] after terminal transfer starts, or
     /// [`DrainError::LeaseSpaceExhausted`] instead of recycling a lease ID.
     pub fn begin_drain(&mut self) -> Result<DrainLease, DrainError> {
-        if self.state == WorkQueueState::Closed {
-            return Err(DrainError::Closed);
+        match self.state {
+            WorkQueueState::Closed => return Err(DrainError::Closed),
+            WorkQueueState::TerminalPending | WorkQueueState::TerminalDraining => {
+                return Err(DrainError::TerminalOwnership);
+            }
+            WorkQueueState::Open | WorkQueueState::Closing => {}
         }
         if self.active_drain.is_some() {
             return Err(DrainError::Busy);
@@ -274,31 +297,94 @@ impl<T> WorkQueueModel<T> {
         Ok(())
     }
 
-    /// Completes close after all pre-close producers and drains have settled.
-    ///
-    /// The returned payloads have terminal caller ownership. The queue does not
-    /// execute them, invoke an engine, or choose a release policy.
+    /// Begins or resumes terminal payload transfer after close has quiesced.
     ///
     /// # Errors
     ///
-    /// Returns [`CloseError::ReservationsRemain`] or [`CloseError::DrainActive`]
-    /// while publication or draining is still possible, and
-    /// [`CloseError::InvalidState`] when close has not begun.
-    pub fn finish_close(&mut self) -> Result<CloseOutcome<T>, CloseError> {
+    /// Returns [`TerminalDrainError::ReservationsRemain`] or
+    /// [`TerminalDrainError::DrainActive`] while publication or ordinary
+    /// draining is still possible. Once terminal ownership begins, normal
+    /// draining can never resume.
+    pub fn begin_terminal_drain(&mut self) -> Result<TerminalDrainLease, TerminalDrainError> {
         match self.state {
-            WorkQueueState::Open => return Err(CloseError::InvalidState(self.state)),
-            WorkQueueState::Closed => return Ok(CloseOutcome::AlreadyClosed),
-            WorkQueueState::Closing => {}
+            WorkQueueState::Open | WorkQueueState::Closed => {
+                return Err(TerminalDrainError::InvalidState(self.state));
+            }
+            WorkQueueState::TerminalDraining => {
+                return Err(TerminalDrainError::TerminalDrainActive);
+            }
+            WorkQueueState::Closing | WorkQueueState::TerminalPending => {}
         }
-        if !self.reservations.is_empty() {
-            return Err(CloseError::ReservationsRemain(self.reservations.len()));
-        }
-        if self.active_drain.is_some() {
-            return Err(CloseError::DrainActive);
+        if self.state == WorkQueueState::Closing {
+            if !self.reservations.is_empty() {
+                return Err(TerminalDrainError::ReservationsRemain(
+                    self.reservations.len(),
+                ));
+            }
+            if self.active_drain.is_some() {
+                return Err(TerminalDrainError::DrainActive);
+            }
         }
 
+        let sequence = self
+            .next_terminal_lease
+            .ok_or(TerminalDrainError::LeaseSpaceExhausted)?;
+        self.next_terminal_lease = sequence.get().checked_add(1).and_then(NonZeroU64::new);
+        self.active_terminal_drain = Some(sequence);
+        self.state = WorkQueueState::TerminalDraining;
+        Ok(TerminalDrainLease { sequence })
+    }
+
+    /// Removes the next residual payload through an active terminal lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalDrainError::StaleLease`] unless `lease` is currently
+    /// responsible for terminal payload ownership.
+    pub fn pop_terminal(
+        &mut self,
+        lease: TerminalDrainLease,
+    ) -> Result<Option<T>, TerminalDrainError> {
+        self.require_active_terminal_drain(lease)?;
+        Ok(self.queue.pop_front())
+    }
+
+    /// Completes terminal close only after every residual payload was transferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalDrainError::PayloadsRemain`] rather than discarding
+    /// residual payloads when the owner finishes early.
+    pub fn finish_terminal_drain(
+        &mut self,
+        lease: TerminalDrainLease,
+    ) -> Result<(), TerminalDrainError> {
+        self.require_active_terminal_drain(lease)?;
+        if !self.queue.is_empty() {
+            return Err(TerminalDrainError::PayloadsRemain(self.queue.len()));
+        }
+        self.active_terminal_drain = None;
         self.state = WorkQueueState::Closed;
-        Ok(CloseOutcome::Closed(self.queue.drain(..).collect()))
+        Ok(())
+    }
+
+    /// Releases an unfinished terminal lease while preserving terminal ownership.
+    ///
+    /// No ordinary producer or drain becomes legal after this transition. A
+    /// close owner must acquire another terminal lease to continue transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalDrainError::StaleLease`] unless `lease` is currently
+    /// responsible for terminal payload ownership.
+    pub fn release_terminal_drain(
+        &mut self,
+        lease: TerminalDrainLease,
+    ) -> Result<(), TerminalDrainError> {
+        self.require_active_terminal_drain(lease)?;
+        self.active_terminal_drain = None;
+        self.state = WorkQueueState::TerminalPending;
+        Ok(())
     }
 
     fn require_active_drain(&self, lease: DrainLease) -> Result<(), DrainError> {
@@ -306,6 +392,17 @@ impl<T> WorkQueueModel<T> {
             Ok(())
         } else {
             Err(DrainError::StaleLease)
+        }
+    }
+
+    fn require_active_terminal_drain(
+        &self,
+        lease: TerminalDrainLease,
+    ) -> Result<(), TerminalDrainError> {
+        if self.active_terminal_drain == Some(lease.sequence) {
+            Ok(())
+        } else {
+            Err(TerminalDrainError::StaleLease)
         }
     }
 }
@@ -340,18 +437,27 @@ impl fmt::Display for DrainError {
             Self::Empty => formatter.write_str("bounded work queue is empty"),
             Self::Busy => formatter.write_str("a work drain is already active"),
             Self::Closed => formatter.write_str("bounded work queue is closed"),
+            Self::TerminalOwnership => {
+                formatter.write_str("terminal work ownership prevents ordinary draining")
+            }
             Self::StaleLease => formatter.write_str("work drain lease is stale"),
             Self::LeaseSpaceExhausted => formatter.write_str("drain lease space exhausted"),
         }
     }
 }
 
-impl fmt::Display for CloseError {
+impl fmt::Display for TerminalDrainError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidState(state) => write!(formatter, "cannot finish close from {state:?}"),
+            Self::InvalidState(state) => {
+                write!(formatter, "cannot begin terminal drain from {state:?}")
+            }
             Self::ReservationsRemain(count) => write!(formatter, "{count} reservations remain"),
             Self::DrainActive => formatter.write_str("a work drain remains active"),
+            Self::TerminalDrainActive => formatter.write_str("a terminal drain remains active"),
+            Self::LeaseSpaceExhausted => formatter.write_str("terminal lease space exhausted"),
+            Self::StaleLease => formatter.write_str("terminal drain lease is stale"),
+            Self::PayloadsRemain(count) => write!(formatter, "{count} terminal payloads remain"),
         }
     }
 }
@@ -364,7 +470,7 @@ impl Error for AbandonError {}
 
 impl Error for DrainError {}
 
-impl Error for CloseError {}
+impl Error for TerminalDrainError {}
 
 #[cfg(test)]
 mod tests {
@@ -375,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn close_rejects_later_reservations_and_returns_residual_payloads() {
+    fn terminal_drain_transfers_residual_payloads_one_at_a_time() {
         let mut queue = WorkQueueModel::new(capacity(2));
         let reservation = queue.reserve().unwrap();
         queue
@@ -389,12 +495,19 @@ mod tests {
             Err(ReserveError::NotOpen(WorkQueueState::Closing))
         );
 
+        let terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.state(), WorkQueueState::TerminalDraining);
         assert_eq!(
-            queue.finish_close(),
-            Ok(CloseOutcome::Closed(vec![String::from("retained")]))
+            queue.pop_terminal(terminal),
+            Ok(Some(String::from("retained")))
         );
+        assert_eq!(queue.pop_terminal(terminal), Ok(None));
+        queue.finish_terminal_drain(terminal).unwrap();
         assert_eq!(queue.state(), WorkQueueState::Closed);
-        assert_eq!(queue.finish_close(), Ok(CloseOutcome::AlreadyClosed));
+        assert_eq!(
+            queue.begin_terminal_drain(),
+            Err(TerminalDrainError::InvalidState(WorkQueueState::Closed))
+        );
     }
 
     #[test]
@@ -403,10 +516,15 @@ mod tests {
         let reservation = queue.reserve().unwrap();
         queue.begin_close();
 
-        assert_eq!(queue.finish_close(), Err(CloseError::ReservationsRemain(1)));
+        assert_eq!(
+            queue.begin_terminal_drain(),
+            Err(TerminalDrainError::ReservationsRemain(1))
+        );
         queue.publish(reservation, 7_u32).unwrap();
         assert_eq!(queue.in_flight_reservations(), 0);
-        assert_eq!(queue.finish_close(), Ok(CloseOutcome::Closed(vec![7])));
+        let terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(terminal), Ok(Some(7)));
+        queue.finish_terminal_drain(terminal).unwrap();
     }
 
     #[test]
@@ -415,13 +533,18 @@ mod tests {
         let reservation = queue.reserve().unwrap();
         queue.begin_close();
 
-        assert_eq!(queue.finish_close(), Err(CloseError::ReservationsRemain(1)));
+        assert_eq!(
+            queue.begin_terminal_drain(),
+            Err(TerminalDrainError::ReservationsRemain(1))
+        );
         queue.abandon(reservation).unwrap();
-        assert_eq!(queue.finish_close(), Ok(CloseOutcome::Closed(vec![])));
+        let terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(terminal), Ok(None));
+        queue.finish_terminal_drain(terminal).unwrap();
     }
 
     #[test]
-    fn active_drain_blocks_close_and_residual_payloads_remain_owned_once() {
+    fn active_drain_blocks_terminal_ownership_until_it_settles() {
         let mut queue = WorkQueueModel::new(capacity(3));
         for payload in [1_u32, 2, 3] {
             let reservation = queue.reserve().unwrap();
@@ -431,9 +554,15 @@ mod tests {
         assert_eq!(queue.pop(drain), Ok(Some(1)));
         queue.begin_close();
 
-        assert_eq!(queue.finish_close(), Err(CloseError::DrainActive));
+        assert_eq!(
+            queue.begin_terminal_drain(),
+            Err(TerminalDrainError::DrainActive)
+        );
         queue.finish_drain(drain).unwrap();
-        assert_eq!(queue.finish_close(), Ok(CloseOutcome::Closed(vec![2, 3])));
+        let terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(terminal), Ok(Some(2)));
+        assert_eq!(queue.pop_terminal(terminal), Ok(Some(3)));
+        queue.finish_terminal_drain(terminal).unwrap();
         assert_eq!(queue.len(), 0);
     }
 
@@ -450,10 +579,9 @@ mod tests {
         );
         assert_eq!(queue.in_flight_reservations(), 0);
         queue.begin_close();
-        assert_eq!(
-            queue.finish_close(),
-            Ok(CloseOutcome::Closed(vec![String::from("kept")]))
-        );
+        let terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(terminal), Ok(Some(String::from("kept"))));
+        queue.finish_terminal_drain(terminal).unwrap();
     }
 
     #[test]
@@ -472,5 +600,32 @@ mod tests {
         );
         assert_eq!(queue.len(), 0);
         assert_eq!(queue.in_flight_reservations(), 0);
+    }
+
+    #[test]
+    fn unfinished_terminal_owner_preserves_payloads_without_reopening_normal_drain() {
+        let mut queue = WorkQueueModel::new(capacity(3));
+        for payload in [1_u32, 2, 3] {
+            let reservation = queue.reserve().unwrap();
+            queue.publish(reservation, payload).unwrap();
+        }
+        queue.begin_close();
+
+        let first_terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(first_terminal), Ok(Some(1)));
+        assert_eq!(
+            queue.finish_terminal_drain(first_terminal),
+            Err(TerminalDrainError::PayloadsRemain(2))
+        );
+        queue.release_terminal_drain(first_terminal).unwrap();
+        assert_eq!(queue.state(), WorkQueueState::TerminalPending);
+        assert_eq!(queue.begin_drain(), Err(DrainError::TerminalOwnership));
+
+        let second_terminal = queue.begin_terminal_drain().unwrap();
+        assert_eq!(queue.pop_terminal(second_terminal), Ok(Some(2)));
+        assert_eq!(queue.pop_terminal(second_terminal), Ok(Some(3)));
+        assert_eq!(queue.pop_terminal(second_terminal), Ok(None));
+        queue.finish_terminal_drain(second_terminal).unwrap();
+        assert_eq!(queue.state(), WorkQueueState::Closed);
     }
 }
