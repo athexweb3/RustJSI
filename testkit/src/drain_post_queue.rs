@@ -43,6 +43,12 @@ pub enum DrainPostAcquire<'queue> {
 }
 
 /// Affine ownership of one active [`DrainPostQueue`] drain.
+///
+/// ```compile_fail
+/// use rustjsi_testkit::DrainPostDrain;
+/// fn require_send<T: Send>() {}
+/// require_send::<DrainPostDrain<'static>>();
+/// ```
 #[derive(Debug)]
 #[must_use = "finish the drain after consuming the chosen post records"]
 pub struct DrainPostDrain<'queue> {
@@ -148,6 +154,10 @@ mod tests {
     use super::*;
     use crate::ModelHost;
     use rustjsi_host::Host;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn require_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn fixed_capacity_returns_the_rejected_attachment() {
@@ -186,5 +196,45 @@ mod tests {
         assert_eq!(successor.pop(), Some(second));
         assert_eq!(successor.finish(), DrainAfter::Idle);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn producer_threads_share_inert_posts_without_host_entry() {
+        const PRODUCERS: usize = 8;
+
+        require_send_sync::<DrainPostQueue>();
+
+        let attachment = ModelHost::new().unwrap().attachment_id();
+        let queue = Arc::new(DrainPostQueue::new(NonZeroUsize::new(PRODUCERS).unwrap()));
+        let barrier = Arc::new(Barrier::new(PRODUCERS + 1));
+        let mut workers = Vec::with_capacity(PRODUCERS);
+
+        for _ in 0..PRODUCERS {
+            let queue = Arc::clone(&queue);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                queue.post_drain(attachment)
+            }));
+        }
+
+        barrier.wait();
+        for worker in workers {
+            worker
+                .join()
+                .expect("producer must not panic")
+                .expect("fixed capacity must retain every producer post");
+        }
+
+        let DrainPostAcquire::Acquired(drain) = queue.acquire() else {
+            panic!("accepted producer posts must acquire one drain");
+        };
+        let mut accepted = 0;
+        while let Some(posted_attachment) = drain.pop() {
+            assert_eq!(posted_attachment, attachment);
+            accepted += 1;
+        }
+        assert_eq!(accepted, PRODUCERS);
+        assert_eq!(drain.finish(), DrainAfter::Idle);
     }
 }
