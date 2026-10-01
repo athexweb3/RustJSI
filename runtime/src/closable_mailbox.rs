@@ -166,6 +166,34 @@ impl<T> ClosableMailbox<T> {
         self.signal.state() == DrainState::Pending
     }
 
+    /// Attempts a host retry post while terminal close remains excluded.
+    ///
+    /// The callback runs only when this method observes a pending normal drain.
+    /// Its normal-drain admission remains live through that callback, so a
+    /// terminal ownership that starts after admission cannot claim retained
+    /// payloads between the pending observation and host-post acceptance. If
+    /// terminal ownership started first, this returns `Ok(false)` without
+    /// invoking `post`.
+    ///
+    /// This does not reserve a unique host post. Another consumer can acquire
+    /// the pending signal after this method observes it, and concurrent callers
+    /// can each attempt a retry. The host still owns post coalescing and stale
+    /// task handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host callback error while preserving the pending mailbox.
+    pub fn post_pending_with<E>(&self, post: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
+        let Ok(_admission) = self.normal_drain_gate.reserve() else {
+            return Ok(false);
+        };
+        if self.signal.state() != DrainState::Pending {
+            return Ok(false);
+        }
+        post()?;
+        Ok(true)
+    }
+
     /// Returns the current mailbox lifecycle snapshot.
     #[must_use]
     pub fn state(&self) -> ClosableMailboxState {
@@ -500,6 +528,43 @@ mod tests {
         assert!(matches!(outcome, Ok(MailboxEnqueue::Scheduled)));
 
         let terminal = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(terminal.pop(), Some(7));
+        terminal.finish().unwrap();
+    }
+
+    #[test]
+    fn retry_post_runs_before_terminal_can_claim_pending_work() {
+        let mailbox = ClosableMailbox::new(capacity(1));
+        assert_eq!(mailbox.enqueue(7), Ok(MailboxEnqueue::Scheduled));
+
+        let posted = mailbox.post_pending_with(|| {
+            let _ = mailbox.begin_close();
+            assert!(matches!(
+                mailbox.try_begin_terminal_drain(),
+                Err(TerminalAcquireError::NormalDrainReservationsRemain(count)) if count.get() == 1
+            ));
+            Ok::<_, ()>(())
+        });
+        assert_eq!(posted, Ok(true));
+
+        let terminal = mailbox.try_begin_terminal_drain().unwrap();
+        assert_eq!(terminal.pop(), Some(7));
+        terminal.finish().unwrap();
+    }
+
+    #[test]
+    fn retry_post_does_not_run_after_terminal_ownership_starts() {
+        let mailbox = ClosableMailbox::new(capacity(1));
+        assert_eq!(mailbox.enqueue(7), Ok(MailboxEnqueue::Scheduled));
+        let _ = mailbox.begin_close();
+
+        let terminal = mailbox.try_begin_terminal_drain().unwrap();
+
+        let posted = mailbox.post_pending_with(|| -> Result<(), ()> {
+            panic!("terminal ownership must reject a later retry post")
+        });
+        assert_eq!(posted, Ok(false));
+
         assert_eq!(terminal.pop(), Some(7));
         terminal.finish().unwrap();
     }
