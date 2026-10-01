@@ -5,7 +5,10 @@ use super::{
     ActiveEntryFrame, CallLimits, Context, ExternalBufferLimits, JscResourceSnapshot,
     JscRuntimeLimits, RootLimits, RuntimeError, Shared, sys,
 };
-use rustjsi_host::{AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, RuntimeIdentity};
+use rustjsi_host::{
+    AttachmentId, FinalEntryOutcome, FinalEntryPolicy, HostState, ResourceLedger, RuntimeIdentity,
+    TerminalResourceReport,
+};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -40,14 +43,7 @@ pub struct Attachment {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct DetachReport {
-    final_entry: FinalEntryOutcome,
-    released_persistent_roots: usize,
-    unresolved_persistent_roots: usize,
-    released_host_functions: usize,
-    unresolved_host_functions: usize,
-    retired_native_states: usize,
-    remaining_external_allocations: usize,
-    remaining_external_bytes: usize,
+    resources: TerminalResourceReport,
     callback_drop_panics: usize,
     native_state_drop_panics: usize,
 }
@@ -249,11 +245,14 @@ impl Attachment {
 
         Ok(self.report(
             final_entry,
-            released_persistent_roots,
-            0,
-            released_host_functions,
-            0,
-            retired_native_states,
+            ResourceLedger::new(
+                released_persistent_roots,
+                released_host_functions,
+                retired_native_states,
+                0,
+                0,
+            ),
+            ResourceLedger::default(),
         ))
     }
 
@@ -289,11 +288,14 @@ impl Attachment {
 
         Ok(self.report(
             final_entry,
-            0,
-            unresolved_persistent_roots,
-            0,
-            unresolved_host_functions,
-            retired_native_states,
+            ResourceLedger::new(0, 0, retired_native_states, 0, 0),
+            ResourceLedger::new(
+                unresolved_persistent_roots,
+                unresolved_host_functions,
+                0,
+                0,
+                0,
+            ),
         ))
     }
 
@@ -327,32 +329,30 @@ impl Attachment {
                 .gate
                 .final_entry_outcome()
                 .unwrap_or(FinalEntryOutcome::Unavailable),
-            0,
-            0,
-            0,
-            0,
-            0,
+            ResourceLedger::default(),
+            ResourceLedger::default(),
         )
     }
 
     fn report(
         &self,
         final_entry: FinalEntryOutcome,
-        released_persistent_roots: usize,
-        unresolved_persistent_roots: usize,
-        released_host_functions: usize,
-        unresolved_host_functions: usize,
-        retired_native_states: usize,
+        settled: ResourceLedger,
+        unresolved: ResourceLedger,
     ) -> DetachReport {
         DetachReport {
-            final_entry,
-            released_persistent_roots,
-            unresolved_persistent_roots,
-            released_host_functions,
-            unresolved_host_functions,
-            retired_native_states,
-            remaining_external_allocations: self.shared.external_buffers.live_allocations(),
-            remaining_external_bytes: self.shared.external_buffers.live_bytes(),
+            resources: TerminalResourceReport::new(
+                final_entry,
+                settled,
+                unresolved,
+                ResourceLedger::new(
+                    0,
+                    0,
+                    0,
+                    self.shared.external_buffers.live_allocations(),
+                    self.shared.external_buffers.live_bytes(),
+                ),
+            ),
             callback_drop_panics: self.shared.callback_drop_panics.get(),
             native_state_drop_panics: self.shared.native_drop_panics.get(),
         }
@@ -380,53 +380,63 @@ impl Drop for Attachment {
 }
 
 impl DetachReport {
+    /// Returns bounded terminal accounting for the tracked attachment resources.
+    ///
+    /// This is not a JavaScriptCore heap or total-process allocation report.
+    /// `remaining` records external buffer storage that remains owned by the
+    /// foreign JavaScriptCore context after this detach operation.
+    #[must_use]
+    pub const fn resources(&self) -> TerminalResourceReport {
+        self.resources
+    }
+
     /// Returns whether host-authorized final engine cleanup completed.
     #[must_use]
     pub const fn final_entry(&self) -> FinalEntryOutcome {
-        self.final_entry
+        self.resources.final_entry()
     }
 
     /// Returns persistent roots successfully unprotected during final entry.
     #[must_use]
     pub const fn released_persistent_roots(&self) -> usize {
-        self.released_persistent_roots
+        self.resources.settled().persistent_roots()
     }
 
     /// Returns persistent protections left for context destruction to reclaim.
     #[must_use]
     pub const fn unresolved_persistent_roots(&self) -> usize {
-        self.unresolved_persistent_roots
+        self.resources.unresolved().persistent_roots()
     }
 
     /// Returns host-function roots successfully unprotected during final entry.
     #[must_use]
     pub const fn released_host_functions(&self) -> usize {
-        self.released_host_functions
+        self.resources.settled().callback_registrations()
     }
 
     /// Returns host-function protections left for context destruction to reclaim.
     #[must_use]
     pub const fn unresolved_host_functions(&self) -> usize {
-        self.unresolved_host_functions
+        self.resources.unresolved().callback_registrations()
     }
 
     /// Returns native Rust state payloads retired from queued finalizers or the
     /// live registry during detach.
     #[must_use]
     pub const fn retired_native_states(&self) -> usize {
-        self.retired_native_states
+        self.resources.settled().native_states()
     }
 
     /// Returns JSC-owned external allocations still live after detach.
     #[must_use]
     pub const fn remaining_external_allocations(&self) -> usize {
-        self.remaining_external_allocations
+        self.resources.remaining().external_buffer_allocations()
     }
 
     /// Returns bytes in JSC-owned external allocations still live after detach.
     #[must_use]
     pub const fn remaining_external_bytes(&self) -> usize {
-        self.remaining_external_bytes
+        self.resources.remaining().external_buffer_bytes()
     }
 
     /// Returns callback-capture destructor panics contained during this attachment.
