@@ -20,4 +20,7 @@ a runtime, validate a host attachment, or execute engine/resource cleanup.
 Its normal drain can settle signal state while keeping normal admission until a
 small caller action completes, which permits a host to post a successor before
 terminal close can take ownership. Its initial enqueue-and-post path likewise
-keeps producer admission through post acceptance.
+keeps producer admission through post acceptance. A pending-post retry holds
+normal admission through host-post acceptance, so terminal close cannot claim
+retained work between the retry's pending observation and its post callback.
+It does not reserve a unique host post or provide scheduler policy.
