@@ -86,9 +86,10 @@ pub struct DrainSignal {
 
 /// Affine ownership of one active [`DrainSignal`] drain.
 ///
-/// Dropping an unfinished permit restores a non-draining state so unwind cannot
-/// strand the signal. The host must keep runtime-thread authority for the full
-/// permit lifetime.
+/// Dropping an unfinished permit restores a non-draining state. If a request
+/// arrived while the permit was live, the signal becomes pending; the host's
+/// unwind boundary must inspect that state and post the successor drain. The
+/// host must keep runtime-thread authority for the full permit lifetime.
 ///
 /// ```compile_fail
 /// use rustjsi_runtime::DrainPermit;
@@ -257,6 +258,10 @@ impl Default for DrainSignal {
 impl DrainPermit<'_> {
     /// Completes this drain and reports whether another request arrived.
     pub fn finish(mut self) -> DrainAfter {
+        self.finish_in_place()
+    }
+
+    pub(crate) fn finish_in_place(&mut self) -> DrainAfter {
         let after = self.signal.finish_drain();
         self.finished = true;
         after
@@ -333,6 +338,19 @@ mod tests {
         drop(permit);
         assert_eq!(signal.state(), DrainState::Idle);
         assert_eq!(signal.request(), DrainRequest::Scheduled);
+    }
+
+    #[test]
+    fn dropped_permit_preserves_a_request_that_arrived_during_drain() {
+        let signal = DrainSignal::new();
+        assert_eq!(signal.request(), DrainRequest::Scheduled);
+        let DrainAcquire::Acquired(permit) = signal.acquire() else {
+            panic!("pending signal must provide a permit");
+        };
+        assert_eq!(signal.request(), DrainRequest::Coalesced);
+
+        drop(permit);
+        assert_eq!(signal.state(), DrainState::Pending);
     }
 
     #[test]
