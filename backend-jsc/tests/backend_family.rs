@@ -204,6 +204,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(initial.pending_persistent_releases(), 0);
     assert_eq!(initial.host_function_registrations(), 0);
     assert_eq!(initial.native_state_registrations(), 0);
+    assert_eq!(initial.pending_native_finalizers(), 0);
     assert_eq!(initial.external_buffer_allocations(), 0);
     assert_eq!(initial.external_buffer_bytes(), 0);
     assert_eq!(initial.callback_drop_panics(), 0);
@@ -230,6 +231,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(retained.pending_persistent_releases(), 0);
     assert_eq!(retained.host_function_registrations(), 1);
     assert_eq!(retained.native_state_registrations(), 1);
+    assert_eq!(retained.pending_native_finalizers(), 0);
     assert_eq!(retained.external_buffer_allocations(), 1);
     assert_eq!(retained.external_buffer_bytes(), 3);
 
@@ -237,6 +239,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     let pending = runtime.resource_snapshot().unwrap();
     assert_eq!(pending.persistent_roots(), 1);
     assert_eq!(pending.pending_persistent_releases(), 1);
+    assert_eq!(pending.pending_native_finalizers(), 0);
 
     runtime.with_context(|_| {}).unwrap();
     let released = runtime.resource_snapshot().unwrap();
@@ -244,6 +247,7 @@ fn public_resource_snapshot_tracks_long_lived_resources_and_pending_release() {
     assert_eq!(released.pending_persistent_releases(), 0);
     assert_eq!(released.host_function_registrations(), 1);
     assert_eq!(released.native_state_registrations(), 1);
+    assert_eq!(released.pending_native_finalizers(), 0);
     assert_eq!(released.external_buffer_allocations(), 1);
     assert_eq!(released.external_buffer_bytes(), 3);
 }
